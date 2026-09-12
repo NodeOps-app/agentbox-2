@@ -85,6 +85,27 @@ and adoption from the PC.
 
 ---
 
+## Where a backend method goes
+
+`apps/hub/lib/hub-backend.ts` is the one implementation (rule 3 above), but it is not one FILE any
+more. It had reached 3800 lines because every feature appended its methods there, so new domains now
+live in `apps/hub/lib/backend/<domain>.ts` as a factory:
+
+```ts
+export function createWorkspaceBackend(deps: BackendDeps): WorkspaceBackend { … }
+```
+
+`BackendDeps` (`lib/backend/deps.ts`) is the narrow set of seams a slice gets — today `notify()`,
+`liveBoxIds()` and `jobs()` — instead of the whole relay handle. `createHubBackend` builds it once
+and spreads each slice into the object it returns; `HubBackend extends <Domain>Backend`, so every
+caller still sees one object and nothing about the API surface changes. The payoff is that a slice is
+unit-testable without a relay (`apps/hub/test/backend-workspaces.test.ts` drives one with three
+stubs) and reviewable without the provider code around it.
+
+Workspaces/tasks/manager is the worked example. Boxes, projects, fleet ops and the open-in launchers
+are still in the monolith; the four `// ── … ──` banners there mark the seams. When you touch one of
+those areas substantially, move it rather than growing the file.
+
 ## Step 0 — Foundation: make the local hub an API target ✅ done
 
 The blocking prerequisite. Nothing else can be converted until `HubApiClient` works in both modes.
