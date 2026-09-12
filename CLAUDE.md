@@ -78,8 +78,10 @@ the hub, open each box's Web/VNC, start/stop, per-box git ops (`pull`/`push`/`pu
 `checkout`/`branch`), restart services, and answer host-action approvals — without a terminal. It
 updates live over the hub's SSE stream and falls back to polling.
 
-It has **no build-time coupling** to this repo — it's a Swift Package Manager / AppKit app (Swift
-5.10, no Xcode, no external deps) that drives the two public surfaces:
+It has **no build-time coupling** to this repo — it's a Swift Package Manager / AppKit app (no
+Xcode) that drives the two public surfaces. Its one external dependency is `libghostty-spm`, the
+terminal engine embedded in the **Manager window** (the workspace's task list plus its manager's tmux
+session); building it needs a Swift 6 toolchain:
 
 - **Boxes + actions** via the local **Control Hub** REST API at `127.0.0.1:8787`: `GET /api/v1/boxes`
   (which carries the raw host-side fields — `state`, `projectRoot`, endpoint URLs, session titles —

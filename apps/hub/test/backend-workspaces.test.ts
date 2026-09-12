@@ -220,14 +220,28 @@ describe('manager', () => {
   });
 
   it('rejects a session resume for an agent whose format we cannot resume', async () => {
-    const backend = createWorkspaceBackend(makeDeps());
+    // The exec seam is stubbed on purpose: if the resumable guard ever regresses,
+    // this test would otherwise fall through to a real `tmux new-session` and
+    // leave a coding agent running on whoever's machine ran the suite.
+    const spawned: string[][] = [];
+    const backend = createWorkspaceBackend({
+      ...makeDeps(),
+      managerExec: async (_file: string, args: string[]) => {
+        spawned.push(args);
+        return { exitCode: 0 };
+      },
+    });
     const root = await makeFolder();
     const added = await backend.addWorkspace({ path: root });
     if (!added.ok) throw new Error(added.error);
-    const res = await backend.startManager(added.workspace.id, { agent: 'codex', sessionId: 's1' });
+    const res = await backend.startManager(added.workspace.id, {
+      agent: 'opencode',
+      sessionId: 's1',
+    });
     expect(res).toMatchObject({
       ok: false,
-      error: expect.stringContaining('only supported for claude'),
+      error: expect.stringContaining('only supported for claude, codex'),
     });
+    expect(spawned).toEqual([]);
   });
 });

@@ -1170,6 +1170,9 @@ export interface ManagerStartInput {
  * a shell on the control box — every other exec this API exposes runs inside a
  * box. An agent the hub already knows is the only thing it will start.
  */
+/** A session id as both agent stores write it: a UUID. Never a flag. */
+export const SESSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+
 export function parseManagerStart(
   body: unknown,
   allowedAgents: readonly string[] = MANAGER_AGENT_NAMES,
@@ -1181,6 +1184,14 @@ export function parseManagerStart(
   }
   const parsedSession = optionalString(sessionId, 'sessionId');
   if (!parsedSession.ok) return parsedSession;
+  // A session id goes into the agent's argv on the HUB'S OWN machine, so it must
+  // not be able to look like a flag: `sessionId: '--dangerously-skip-permissions'`
+  // would otherwise start the manager with its approval gate off, which is the
+  // same escalation the absent `argv` field exists to prevent. Both stores use
+  // UUIDs, so anything outside this shape is already not a session.
+  if (parsedSession.value !== undefined && !SESSION_ID_RE.test(parsedSession.value)) {
+    return { ok: false, message: 'sessionId must be alphanumeric with - or _' };
+  }
   const parsedRestart = optionalBool(restart, 'restart');
   if (!parsedRestart.ok) return parsedRestart;
   return {
