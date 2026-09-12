@@ -67,8 +67,28 @@ function ago(iso: string): string {
   return hours < 48 ? `${String(hours)}h ago` : `${String(Math.round(hours / 24))}d ago`;
 }
 
+/**
+ * True when the hub this command is talking to runs on THIS machine.
+ *
+ * The manager's tmux session lives on the hub's host, so attaching to it is only
+ * a local `tmux attach` when the hub is local. Against a control box the session
+ * is on the VPS, and running tmux here would fail with a bare non-zero exit that
+ * reads as a broken manager.
+ */
+async function hubIsLocal(): Promise<boolean> {
+  const { resolveHubTarget } = await import('./hub.js');
+  const target = await resolveHubTarget(undefined, { preferLocal: true });
+  return target?.onThisMachine ?? true;
+}
+
 /** Attach to the manager's tmux session in this terminal (or a new pane). */
 async function attachToSession(m: HubApiManager, openIn?: AttachOpenIn): Promise<boolean> {
+  if (!(await hubIsLocal())) {
+    log.error(
+      `the manager runs on the hub's machine, not this one. Reach its session there with:\n  ${m.attachCommand}`,
+    );
+    return false;
+  }
   // `=` is tmux's exact-match prefix: without it a session whose name merely
   // starts with this one would match.
   const target = `=${m.tmuxSession}`;

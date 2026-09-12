@@ -1492,21 +1492,21 @@ export function buildOpenApi(): Record<string, unknown> {
                 schema: {
                   type: 'object',
                   properties: {
-                    agent: { type: 'string', enum: ['claude', 'codex', 'opencode', 'pi'] },
+                    agent: {
+                      type: 'string',
+                      description:
+                        'An agent this hub knows (GET /agents); the built-ins are claude, codex, opencode and pi.',
+                    },
                     sessionId: {
                       type: 'string',
                       description: 'Resume this session (claude only).',
-                    },
-                    argv: {
-                      type: 'array',
-                      items: { type: 'string' },
-                      description: 'Custom command instead of a known agent.',
                     },
                     restart: {
                       type: 'boolean',
                       description: 'Replace a running manager instead of refusing.',
                     },
                   },
+                  required: ['agent'],
                 },
               },
             },

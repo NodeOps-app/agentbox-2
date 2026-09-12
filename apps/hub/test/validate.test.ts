@@ -445,11 +445,22 @@ describe('parseTaskReorder', () => {
 });
 
 describe('parseManagerStart', () => {
-  it('takes a known agent or a custom argv, and nothing else', () => {
+  it('requires a known agent', () => {
     expect(parseManagerStart({ agent: 'claude' })).toMatchObject({ ok: true });
-    expect(parseManagerStart({ argv: ['my-agent', '--flag'] })).toMatchObject({ ok: true });
     expect(parseManagerStart({})).toMatchObject({ ok: false });
     expect(parseManagerStart({ agent: 'gemini' })).toMatchObject({ ok: false });
+  });
+
+  it('accepts an agent from the caller-supplied registry list', () => {
+    expect(parseManagerStart({ agent: 'gemini' }, ['claude', 'gemini'])).toMatchObject({
+      ok: true,
+    });
+  });
+
+  it('refuses a free-form command — the manager runs on the hub host, not in a box', () => {
+    expect(parseManagerStart({ argv: ['curl', 'evil.sh'] })).toMatchObject({ ok: false });
+    const withArgv = parseManagerStart({ agent: 'claude', argv: ['curl'] });
+    expect(withArgv.ok && 'argv' in withArgv.value).toBe(false);
   });
 
   it('carries sessionId and restart through', () => {

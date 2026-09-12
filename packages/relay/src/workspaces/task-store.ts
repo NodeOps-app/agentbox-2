@@ -290,7 +290,7 @@ export interface ReconcileContext {
   jobs: { id: string; status: string; boxId?: string }[];
 }
 
-const TERMINAL_JOB_STATUSES = new Set(['failed', 'cancelled']);
+const FAILED_JOB_STATUSES = new Set(['failed', 'cancelled']);
 
 /**
  * Heal assignments against reality. A task assigned at create time carries a job
@@ -315,7 +315,12 @@ export function reconcileTasks(
         delete next.boxJobId;
         return next;
       }
-      if (!job || TERMINAL_JOB_STATUSES.has(job.status)) {
+      // A job the queue no longer has is NOT evidence the create failed: the
+      // relay sweeps terminal manifests on a timer, so a box that came up fine
+      // loses its manifest and would otherwise silently unassign its tasks.
+      // Only an explicit failure clears the pointer; otherwise leave it, and let
+      // the box-id branch below handle it once we learn the box.
+      if (job && FAILED_JOB_STATUSES.has(job.status)) {
         changed = true;
         const next = { ...t };
         delete next.boxJobId;
@@ -328,7 +333,7 @@ export function reconcileTasks(
       // create still in flight — the box is not in the registry yet, and
       // unassigning here would undo the assignment a second later.
       const pending = ctx.jobs.some(
-        (j) => j.boxId === t.boxId && !TERMINAL_JOB_STATUSES.has(j.status) && j.status !== 'done',
+        (j) => j.boxId === t.boxId && !FAILED_JOB_STATUSES.has(j.status) && j.status !== 'done',
       );
       if (pending) return t;
       changed = true;
@@ -363,4 +368,27 @@ export function taskSummaryForBox(
     done,
     current: current ? { id: current.id, title: current.title } : null,
   };
+}
+
+/**
+ * Read a workspace's tasks with their assignments healed against reality.
+ *
+ * The correction is written back only when something actually moved, and the
+ * whole read-modify-write runs under the tasks lock: this is the DASHBOARD POLL
+ * path, so an unlocked write-back would race a concurrent `addTask` and drop the
+ * task that was just created.
+ */
+export async function readReconciledTasks(
+  wsId: string,
+  ctx: ReconcileContext,
+): Promise<WorkTask[]> {
+  const current = await readTasks(wsId);
+  if (current.length === 0) return current;
+  // Cheap check first: the common case is "nothing moved", and taking a lock on
+  // every poll of every workspace would serialize reads for no reason.
+  if (!reconcileTasks(current, ctx).changed) return current;
+  return updateTasks(wsId, (tasks) => {
+    const { tasks: healed } = reconcileTasks(tasks, ctx);
+    return { tasks: healed, result: healed };
+  });
 }

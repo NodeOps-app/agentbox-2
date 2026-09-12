@@ -197,19 +197,30 @@ export async function addWorkspace(
   const projectPaths = await scanWorkspaceProjects(root);
   await Promise.all(projectPaths.map((p) => register(p).catch(() => {})));
   const projectIds = projectPaths.map((p) => hashProjectPath(p));
-  const now = new Date().toISOString();
-  const existing = await readWorkspace(id);
-  const rec: WorkspaceRecord = {
-    id,
-    name: opts.name ?? existing?.name ?? basename(root),
-    root,
-    projectIds,
-    taskCounter: existing?.taskCounter ?? 0,
-    createdAt: existing?.createdAt ?? now,
-    updatedAt: now,
-  };
-  await writeWorkspace(rec);
-  return rec;
+  // Locked, and the existing record is read INSIDE the lock: a rescan that read
+  // `taskCounter` outside it would write a stale value back over a task create
+  // that bumped it meanwhile, and the next task would be minted with an id
+  // already in use. `updatedAt` is stamped here, so the shared writer does not.
+  const dir = (await resolveWorkspaceDir(id)) ?? workspaceDir(id, root);
+  return withFileLock(
+    workspaceFile(dir),
+    async () => {
+      const now = new Date().toISOString();
+      const existing = await readWorkspace(id);
+      const rec: WorkspaceRecord = {
+        id,
+        name: opts.name ?? existing?.name ?? basename(root),
+        root,
+        projectIds,
+        taskCounter: existing?.taskCounter ?? 0,
+        createdAt: existing?.createdAt ?? now,
+        updatedAt: now,
+      };
+      await writeWorkspace(rec);
+      return rec;
+    },
+    WORKSPACE_LOCK,
+  );
 }
 
 /** Re-run project discovery for a registered workspace. */

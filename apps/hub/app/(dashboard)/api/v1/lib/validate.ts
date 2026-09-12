@@ -926,7 +926,6 @@ export const TASK_ID_RE = /^T-\d+$/;
 // AGENTS/PROVIDERS above are: importing @agentbox/* would pull it into the Next
 // bundle.
 export const MANAGER_AGENT_NAMES = ['claude', 'codex', 'opencode', 'pi'] as const;
-export type ManagerAgentName = (typeof MANAGER_AGENT_NAMES)[number];
 
 export function isTaskStatus(v: unknown): v is TaskStatusValue {
   return typeof v === 'string' && (TASK_STATUSES as readonly string[]).includes(v);
@@ -1157,25 +1156,28 @@ export function parseTaskReorder(body: unknown): Parsed<{ ids: string[] }> {
 }
 
 export interface ManagerStartInput {
-  agent?: ManagerAgentName;
+  agent: string;
   sessionId?: string;
-  argv?: string[];
   restart?: boolean;
 }
 
-export function parseManagerStart(body: unknown): Parsed<ManagerStartInput> {
+/**
+ * `allowedAgents` is the accept-list for `agent`, defaulting to the built-ins so
+ * this stays a pure, import-free function; the route passes the live registry ids.
+ *
+ * There is deliberately NO free-form `argv`: the manager runs as a login-shell
+ * command on the HUB'S OWN machine, so accepting one would turn an API token into
+ * a shell on the control box — every other exec this API exposes runs inside a
+ * box. An agent the hub already knows is the only thing it will start.
+ */
+export function parseManagerStart(
+  body: unknown,
+  allowedAgents: readonly string[] = MANAGER_AGENT_NAMES,
+): Parsed<ManagerStartInput> {
   if (!isObject(body)) return { ok: false, message: 'body must be a JSON object' };
-  const { agent, sessionId, argv, restart } = body;
-  const parsedArgv = optionalStringArray(argv, 'argv');
-  if (!parsedArgv.ok) return parsedArgv;
-  if (
-    agent !== undefined &&
-    !(MANAGER_AGENT_NAMES as readonly string[]).includes(agent as string)
-  ) {
-    return { ok: false, message: `agent must be one of ${MANAGER_AGENT_NAMES.join(', ')}` };
-  }
-  if (agent === undefined && !parsedArgv.value) {
-    return { ok: false, message: 'agent or argv is required' };
+  const { agent, sessionId, restart } = body;
+  if (typeof agent !== 'string' || !allowedAgents.includes(agent)) {
+    return { ok: false, message: `agent must be one of ${allowedAgents.join(', ')}` };
   }
   const parsedSession = optionalString(sessionId, 'sessionId');
   if (!parsedSession.ok) return parsedSession;
@@ -1184,9 +1186,8 @@ export function parseManagerStart(body: unknown): Parsed<ManagerStartInput> {
   return {
     ok: true,
     value: {
-      ...(agent ? { agent: agent as ManagerAgentName } : {}),
+      agent,
       ...(parsedSession.value ? { sessionId: parsedSession.value } : {}),
-      ...(parsedArgv.value ? { argv: parsedArgv.value } : {}),
       ...(parsedRestart.value !== undefined ? { restart: parsedRestart.value } : {}),
     },
   };

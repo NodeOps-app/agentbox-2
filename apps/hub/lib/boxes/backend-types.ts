@@ -9,7 +9,6 @@ import type { AgentId } from '@agentbox/core';
 import type {
   BoxTaskSummary,
   HostSession,
-  ManagerAgent,
   WorkTask,
   WorkTaskExternalRef,
   WorkTaskStatus,
@@ -998,10 +997,10 @@ export interface UpdateTaskInput {
 export type AssignTarget = { boxId: string } | { boxJobId: string };
 
 export interface StartManagerInput {
-  agent?: ManagerAgent;
+  /** An agent the hub's registry knows. There is no free-form command: the
+   *  manager runs on the HUB'S machine, not inside a box. */
+  agent: string;
   sessionId?: string;
-  /** A custom command instead of a known agent (wins over `agent`). */
-  argv?: string[];
   /** Kill a running manager and start this one, instead of refusing. */
   restart?: boolean;
 }

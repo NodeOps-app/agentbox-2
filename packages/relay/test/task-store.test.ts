@@ -8,7 +8,9 @@ import {
   addWorkspace,
   assignTasks,
   patchTask,
+  readReconciledTasks,
   readTasks,
+  readWorkspace,
   reconcileTasks,
   removeTask,
   reorderTasks,
@@ -176,18 +178,27 @@ describe('reconcileTasks', () => {
     expect(r.tasks[0]?.boxJobId).toBeUndefined();
   });
 
-  it('clears a job id whose job is gone or failed', () => {
-    const gone = reconcileTasks([task({ id: 'T-1', boxJobId: 'j1' })], {
-      liveBoxIds: live(),
+  it('clears a job id whose job failed or was cancelled', () => {
+    for (const status of ['failed', 'cancelled']) {
+      const r = reconcileTasks([task({ id: 'T-1', boxJobId: 'j1' })], {
+        liveBoxIds: live(),
+        jobs: [{ id: 'j1', status }],
+      });
+      expect(r.changed).toBe(true);
+      expect(r.tasks[0]?.boxJobId).toBeUndefined();
+    }
+  });
+
+  it('keeps a job id whose manifest the queue has swept', () => {
+    // The relay deletes terminal manifests on a timer, so a MISSING job is not
+    // evidence the create failed — unassigning here would drop the tasks of a
+    // box that came up fine.
+    const r = reconcileTasks([task({ id: 'T-1', boxJobId: 'j1' })], {
+      liveBoxIds: live('b1'),
       jobs: [],
     });
-    expect(gone.changed).toBe(true);
-    expect(gone.tasks[0]?.boxJobId).toBeUndefined();
-    const failed = reconcileTasks([task({ id: 'T-1', boxJobId: 'j1' })], {
-      liveBoxIds: live(),
-      jobs: [{ id: 'j1', status: 'failed' }],
-    });
-    expect(failed.tasks[0]?.boxJobId).toBeUndefined();
+    expect(r.changed).toBe(false);
+    expect(r.tasks[0]?.boxJobId).toBe('j1');
   });
 
   it('keeps a job id while the create is still queued', () => {
@@ -258,5 +269,42 @@ describe('taskSummaryForBox', () => {
     expect(taskSummaryForBox(tasks, { boxId: 'nope' })).toBeUndefined();
     const pending = [task({ id: 'T-1', boxJobId: 'j1' })];
     expect(taskSummaryForBox(pending, { boxJobId: 'j1' })?.total).toBe(1);
+  });
+});
+
+describe('readReconciledTasks', () => {
+  it('heals and persists the correction', async () => {
+    const ws = await makeWorkspace();
+    await addTask(ws, { title: 'a', boxJobId: 'j1' });
+    const healed = await readReconciledTasks(ws, {
+      liveBoxIds: new Set(['b1']),
+      jobs: [{ id: 'j1', status: 'done', boxId: 'b1' }],
+    });
+    expect(healed[0]).toMatchObject({ boxId: 'b1' });
+    // Persisted, not just returned — the next read must not redo the work.
+    expect((await readTasks(ws))[0]).toMatchObject({ boxId: 'b1' });
+  });
+
+  it('writes nothing when nothing moved', async () => {
+    const ws = await makeWorkspace();
+    await addTask(ws, { title: 'a', boxId: 'b1' });
+    const before = (await readTasks(ws))[0]!.updatedAt;
+    await readReconciledTasks(ws, { liveBoxIds: new Set(['b1']), jobs: [] });
+    // This runs on every dashboard poll; a write per poll would be a write storm.
+    expect((await readTasks(ws))[0]!.updatedAt).toBe(before);
+  });
+});
+
+describe('the task-id counter survives a rescan', () => {
+  it('re-registering a workspace keeps the counter, so ids are never reused', async () => {
+    const ws = await makeWorkspace();
+    const root = (await readWorkspace(ws))!.root;
+    await addTask(ws, { title: 'first' });
+    await addTask(ws, { title: 'second' });
+    // `POST /workspaces` on a known root rescans it, rewriting the whole record.
+    // Dropping the counter here would hand `T-2` out twice.
+    await addWorkspace(root, {}, noRegister);
+    expect((await addTask(ws, { title: 'third' })).id).toBe('T-3');
+    expect(new Set((await readTasks(ws)).map((t) => t.id)).size).toBe(3);
   });
 });

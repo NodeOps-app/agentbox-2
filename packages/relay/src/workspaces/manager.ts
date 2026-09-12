@@ -161,7 +161,14 @@ export async function managerView(
   const record = await readManager(wsId);
   if (!record) return { ...base, status: 'never' };
   const running = await tmuxSessionExists(session, exec);
-  if (running) return { ...base, ...record, status: 'running' };
+  if (running) {
+    // Drop any previous run's ending rather than reporting a LIVE session with a
+    // `stoppedAt` next to it, which a UI would render as contradictory state.
+    const live = { ...record };
+    delete live.stoppedAt;
+    delete live.lastExit;
+    return { ...base, ...live, status: 'running' };
+  }
   const lastExit = record.lastExit ?? (await readLastExit(wsId));
   return {
     ...base,
@@ -174,7 +181,7 @@ export async function managerView(
 export interface StartManagerSessionInput {
   wsId: string;
   root: string;
-  agent: ManagerAgent | 'custom';
+  agent: ManagerAgent;
   argv: string[];
   sessionId?: string;
   exec?: ManagerExec;

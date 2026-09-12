@@ -491,9 +491,8 @@ export interface HubApiManager {
 }
 
 export interface HubApiManagerStart {
-  agent?: string;
+  agent: string;
   sessionId?: string;
-  argv?: string[];
   restart?: boolean;
 }
 

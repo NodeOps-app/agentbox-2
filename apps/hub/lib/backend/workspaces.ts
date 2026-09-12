@@ -15,9 +15,8 @@ import {
   managerSessionName,
   managerView,
   patchTask,
-  readTasks,
+  readReconciledTasks,
   readWorkspace,
-  reconcileTasks,
   removeTask,
   removeWorkspace,
   renameWorkspace,
@@ -31,10 +30,9 @@ import {
   tmuxSessionExists,
   toWorkspaceView,
   unassignTasks,
-  writeTasks,
   RESUMABLE_MANAGER_AGENT,
   type BoxTaskSummary,
-  type ManagerAgent,
+  type ReconcileContext,
   type Workspace,
   type WorkTask,
 } from '@agentbox/relay';
@@ -69,32 +67,39 @@ function unknownWorkspace(id: string): { ok: false; error: string } {
 
 export function createWorkspaceBackend(deps: BackendDeps): WorkspaceBackend {
   /**
-   * Read a workspace's tasks with assignments healed against reality, writing
-   * the correction back only when something actually moved — this runs on the
-   * dashboard poll path, and an unconditional write would be a write storm.
+   * The box/job facts reconciliation needs. Both are whole-fleet listings (a
+   * docker inspect per box, plus every queue manifest), so a call that reconciles
+   * several workspaces resolves them ONCE and hands the same snapshot down —
+   * `getData()` does exactly that on every dashboard poll.
    */
-  async function tasksOf(wsId: string): Promise<WorkTask[]> {
-    const raw = await readTasks(wsId);
-    if (raw.length === 0) return raw;
+  async function reconcileContext(): Promise<ReconcileContext> {
     const [liveBoxIds, jobs] = await Promise.all([deps.liveBoxIds(), deps.jobs()]);
-    const { tasks, changed } = reconcileTasks(raw, {
+    return {
       liveBoxIds,
       jobs: jobs.map((j) => ({
         id: j.id,
         status: j.status,
         ...(j.boxId ? { boxId: j.boxId } : {}),
       })),
-    });
-    if (changed) await writeTasks(wsId, tasks).catch(() => {});
-    return tasks;
+    };
+  }
+
+  /**
+   * A workspace's tasks with their assignments healed against reality. The
+   * write-back is locked and change-gated inside the store — this is the poll
+   * path, and racing a concurrent `addTask` would drop the new task.
+   */
+  async function tasksOf(wsId: string, ctx?: ReconcileContext): Promise<WorkTask[]> {
+    return readReconciledTasks(wsId, ctx ?? (await reconcileContext()));
   }
 
   /** Workspace + the derived counts a list row shows. */
   async function viewOf(
     rec: Awaited<ReturnType<typeof readWorkspace>>,
+    ctx?: ReconcileContext,
   ): Promise<WorkspaceView | null> {
     if (!rec) return null;
-    const [tasks, manager] = await Promise.all([tasksOf(rec.id), managerView(rec.id)]);
+    const [tasks, manager] = await Promise.all([tasksOf(rec.id, ctx), managerView(rec.id)]);
     const base: Workspace = toWorkspaceView(rec);
     return {
       ...base,
@@ -126,7 +131,9 @@ export function createWorkspaceBackend(deps: BackendDeps): WorkspaceBackend {
   return {
     async listWorkspaces(): Promise<WorkspaceView[]> {
       const recs = await listWorkspaces();
-      const views = await Promise.all(recs.map((r) => viewOf(r)));
+      if (recs.length === 0) return [];
+      const ctx = await reconcileContext();
+      const views = await Promise.all(recs.map((r) => viewOf(r, ctx)));
       return views.filter((v): v is WorkspaceView => v !== null);
     },
 
@@ -187,8 +194,10 @@ export function createWorkspaceBackend(deps: BackendDeps): WorkspaceBackend {
     async listAllTasks(filter?: TaskFilter & { workspaceId?: string }): Promise<WorkTask[]> {
       const recs = await listWorkspaces();
       const wanted = filter?.workspaceId ? recs.filter((r) => r.id === filter.workspaceId) : recs;
+      if (wanted.length === 0) return [];
+      const ctx = await reconcileContext();
       const lists = await Promise.all(
-        wanted.map(async (r) => filterTasks(await tasksOf(r.id), filter)),
+        wanted.map(async (r) => filterTasks(await tasksOf(r.id, ctx), filter)),
       );
       return lists.flat();
     },
@@ -294,21 +303,13 @@ export function createWorkspaceBackend(deps: BackendDeps): WorkspaceBackend {
       // The route validator is the accept-list for `agent`; here we only need the
       // one rule it cannot express — a session can be resumed for exactly one
       // agent, and starting a FRESH agent that looks resumed is worse than a 400.
-      let agent: ManagerAgent;
-      let argv: string[];
-      if (input.argv?.length) {
-        agent = 'custom';
-        argv = input.argv;
-      } else {
-        if (!input.agent) return err('agent or argv is required');
-        if (input.sessionId && input.agent !== RESUMABLE_MANAGER_AGENT) {
-          return err(
-            `session resume is only supported for ${RESUMABLE_MANAGER_AGENT}, not ${input.agent}`,
-          );
-        }
-        agent = input.agent;
-        argv = buildManagerArgv(input.agent, input.sessionId);
+      if (input.sessionId && input.agent !== RESUMABLE_MANAGER_AGENT) {
+        return err(
+          `session resume is only supported for ${RESUMABLE_MANAGER_AGENT}, not ${input.agent}`,
+        );
       }
+      const agent = input.agent;
+      const argv = buildManagerArgv(agent, input.sessionId);
       try {
         await startManagerSession({
           wsId,
@@ -353,8 +354,11 @@ export function createWorkspaceBackend(deps: BackendDeps): WorkspaceBackend {
     }> {
       const byBox = new Map<string, BoxTaskSummary>();
       const byJob = new Map<string, BoxTaskSummary>();
-      for (const ws of await listWorkspaces()) {
-        const tasks = await tasksOf(ws.id);
+      const recs = await listWorkspaces();
+      if (recs.length === 0) return { byBox, byJob };
+      const ctx = await reconcileContext();
+      for (const ws of recs) {
+        const tasks = await tasksOf(ws.id, ctx);
         for (const boxId of new Set(
           tasks.map((t) => t.boxId).filter((b): b is string => Boolean(b)),
         )) {

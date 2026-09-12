@@ -422,6 +422,7 @@ export async function runAgentCreate(
             1,
           );
         }
+        if (res.boxId) await assignTasks({ boxId: res.boxId });
         outro(`${a.id} is running on the control plane: box ${res.boxId ?? '(id pending)'}`);
         cmdLog.close();
         return;
@@ -661,6 +662,7 @@ export async function runAgentCreate(
         { verbose: opts.verbose === true },
       );
       if (adopted) {
+        await assignTasks({ boxId: adopted.id });
         await cloudAgentAttach({
           box: adopted,
           binary: a.spec.binary,
