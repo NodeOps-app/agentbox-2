@@ -10,6 +10,7 @@ import {
   assignTasks,
   buildManagerArgv,
   filterTasks,
+  isResumableManagerAgent,
   listResumableHostSessions,
   listWorkspaces,
   managerSessionName,
@@ -30,7 +31,7 @@ import {
   tmuxSessionExists,
   toWorkspaceView,
   unassignTasks,
-  RESUMABLE_MANAGER_AGENT,
+  RESUMABLE_MANAGER_AGENTS,
   type BoxTaskSummary,
   type ReconcileContext,
   type Workspace,
@@ -301,11 +302,11 @@ export function createWorkspaceBackend(deps: BackendDeps): WorkspaceBackend {
       if (running) await stopManagerSession(wsId);
 
       // The route validator is the accept-list for `agent`; here we only need the
-      // one rule it cannot express — a session can be resumed for exactly one
-      // agent, and starting a FRESH agent that looks resumed is worse than a 400.
-      if (input.sessionId && input.agent !== RESUMABLE_MANAGER_AGENT) {
+      // one rule it cannot express — only some agents can be resumed, and
+      // starting a FRESH agent that looks resumed is worse than a 400.
+      if (input.sessionId && !isResumableManagerAgent(input.agent)) {
         return err(
-          `session resume is only supported for ${RESUMABLE_MANAGER_AGENT}, not ${input.agent}`,
+          `session resume is only supported for ${RESUMABLE_MANAGER_AGENTS.join(', ')}, not ${input.agent}`,
         );
       }
       const agent = input.agent;

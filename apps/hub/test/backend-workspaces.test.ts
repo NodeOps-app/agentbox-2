@@ -224,10 +224,13 @@ describe('manager', () => {
     const root = await makeFolder();
     const added = await backend.addWorkspace({ path: root });
     if (!added.ok) throw new Error(added.error);
-    const res = await backend.startManager(added.workspace.id, { agent: 'codex', sessionId: 's1' });
+    const res = await backend.startManager(added.workspace.id, {
+      agent: 'opencode',
+      sessionId: 's1',
+    });
     expect(res).toMatchObject({
       ok: false,
-      error: expect.stringContaining('only supported for claude'),
+      error: expect.stringContaining('only supported for claude, codex'),
     });
   });
 });

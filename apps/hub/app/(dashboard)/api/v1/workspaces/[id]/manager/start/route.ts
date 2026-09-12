@@ -4,7 +4,7 @@
 // one rather than the hub proxying a PTY.
 import { backendOrNull } from '../../../../lib/backend';
 import { fail, failFromAction, ok } from '../../../../lib/envelope';
-import { parseManagerStart, readJson } from '../../../../lib/validate';
+import { MANAGER_AGENT_NAMES, parseManagerStart, readJson } from '../../../../lib/validate';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -19,7 +19,13 @@ export async function POST(
 
   const parsedBody = await readJson(req);
   if (!parsedBody.ok) return fail('invalid_request', parsedBody.message);
-  const parsed = parseManagerStart(parsedBody.value);
+  // Accept whatever the registry actually knows (plugin agents included) rather
+  // than the compiled-in list — GET /api/v1/agents offers them, so refusing one
+  // here would advertise a manager the start path rejects. Falls back to the
+  // built-ins when the seam is absent (the plane path has no registry).
+  const sys = globalThis.__AGENTBOX_HUB_SYSTEM;
+  const allowedAgents = sys ? sys.agents().map((a) => a.id) : MANAGER_AGENT_NAMES;
+  const parsed = parseManagerStart(parsedBody.value, allowedAgents);
   if (!parsed.ok) return fail('invalid_request', parsed.message);
 
   const res = await backend.startManager(id, parsed.value);

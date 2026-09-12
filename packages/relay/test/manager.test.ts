@@ -7,12 +7,14 @@ import {
   addWorkspace,
   buildManagerArgv,
   buildManagerShellScript,
+  isResumableManagerAgent,
   listResumableHostSessions,
   loginShell,
   managerAttachCommand,
   managerSessionName,
   managerView,
   readManager,
+  RESUMABLE_MANAGER_AGENTS,
   startManagerSession,
   stopManagerSession,
   tmuxAvailable,
@@ -58,11 +60,22 @@ describe('session naming', () => {
 });
 
 describe('buildManagerArgv', () => {
-  it('resumes a claude session by id and otherwise runs the bare agent', () => {
+  it('uses each resumable agent OWN resume spelling and otherwise runs the bare agent', () => {
     expect(buildManagerArgv('claude')).toEqual(['claude']);
     expect(buildManagerArgv('claude', 's1')).toEqual(['claude', '--resume', 's1']);
+    // codex has no --resume flag: resuming is a subcommand.
     expect(buildManagerArgv('codex')).toEqual(['codex']);
+    expect(buildManagerArgv('codex', 's1')).toEqual(['codex', 'resume', 's1']);
+    // An agent with no verified spelling never gets a guessed one.
     expect(buildManagerArgv('opencode')).toEqual(['opencode']);
+    expect(buildManagerArgv('opencode', 's1')).toEqual(['opencode']);
+  });
+
+  it('names the agents whose session store and resume argv are verified', () => {
+    expect([...RESUMABLE_MANAGER_AGENTS]).toEqual(['claude', 'codex']);
+    expect(isResumableManagerAgent('claude')).toBe(true);
+    expect(isResumableManagerAgent('codex')).toBe(true);
+    expect(isResumableManagerAgent('opencode')).toBe(false);
   });
 });
 
@@ -137,6 +150,15 @@ describe('startManagerSession', () => {
     // A hub started from inside tmux must not make tmux refuse to nest.
     expect(calls[0]!.env).not.toHaveProperty('TMUX');
     expect(calls[0]!.env).not.toHaveProperty('TMUX_PANE');
+    // Two clients (the tray pane and a terminal) must not clamp the grid to the
+    // smaller one, which is tmux's default.
+    expect(calls[1]?.args).toEqual([
+      'set-option',
+      '-t',
+      `=agentbox-manager-${id}`,
+      'window-size',
+      'latest',
+    ]);
     expect(rec.cwd).toBe(root);
     expect(await readManager(id)).toMatchObject({ agent: 'claude', tmuxSession: rec.tmuxSession });
   });
@@ -173,7 +195,7 @@ describe('stopManagerSession', () => {
     const { calls, exec } = fakeExec();
     await startManagerSession({ wsId: id, root, agent: 'claude', argv: ['claude'], exec });
     const rec = await stopManagerSession(id, exec);
-    expect(calls[1]?.args).toEqual(['kill-session', '-t', `=agentbox-manager-${id}`]);
+    expect(calls.at(-1)?.args).toEqual(['kill-session', '-t', `=agentbox-manager-${id}`]);
     expect(rec?.stoppedAt).toBeTruthy();
     expect(rec?.agent).toBe('claude');
   });
@@ -232,9 +254,105 @@ describe('listResumableHostSessions', () => {
 
   it('declares the other agents unsupported rather than guessing', async () => {
     const { home, root } = await seedSessions();
-    expect(await listResumableHostSessions(root, 'codex', home)).toEqual({
-      agent: 'codex',
+    expect(await listResumableHostSessions(root, 'opencode', home)).toEqual({
+      agent: 'opencode',
       supported: false,
+      sessions: [],
+    });
+  });
+});
+
+describe('listResumableHostSessions (flat rollout store)', () => {
+  const MINE = '11111111-2222-4333-8444-555555555555';
+  const OTHER = '99999999-8888-4777-8666-555555555555';
+  const NAMED = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+
+  function rollout(cwd: string, lines: unknown[] = []): string {
+    return (
+      [
+        JSON.stringify({ type: 'session_meta', payload: { cwd } }),
+        ...lines.map((l) => JSON.stringify(l)),
+      ].join('\n') + '\n'
+    );
+  }
+
+  /** A rollout store holding one session in `root` and one in another folder. */
+  async function seedRollouts(opts: { index?: string } = {}): Promise<{
+    home: string;
+    root: string;
+  }> {
+    const home = await realpath(await mkdtemp(join(tmpdir(), 'agentbox-home-')));
+    const root = await realpath(await mkdtemp(join(tmpdir(), 'agentbox-ws-')));
+    const dir = join(home, '.codex', 'sessions', '2026', '09', '07');
+    await mkdir(dir, { recursive: true });
+    await writeFile(
+      join(dir, `rollout-2026-09-07T09-34-40-${MINE}.jsonl`),
+      rollout(root, [
+        { payload: { type: 'message', role: 'developer', content: [{ text: 'system brief' }] } },
+        {
+          payload: { type: 'message', role: 'user', content: [{ text: '<recommended_plugins>' }] },
+        },
+        { payload: { type: 'message', role: 'user', content: [{ text: 'split   the\nbacklog' }] } },
+      ]),
+    );
+    await writeFile(
+      join(dir, `rollout-2026-09-07T09-38-53-${OTHER}.jsonl`),
+      rollout('/somewhere/else', [
+        { payload: { type: 'message', role: 'user', content: [{ text: 'not this one' }] } },
+      ]),
+    );
+    await writeFile(
+      join(dir, `rollout-2026-09-07T09-40-01-${NAMED}.jsonl`),
+      rollout(root, [
+        { payload: { type: 'message', role: 'user', content: [{ text: 'scraped title' }] } },
+      ]),
+    );
+    // Neither a rollout nor a session id — both must be skipped, not crash.
+    await writeFile(join(dir, 'rollout-2026-09-07T09-41-01-nope.jsonl'), '{}\n');
+    await writeFile(join(dir, 'notes.txt'), 'ignored');
+    if (opts.index !== undefined) {
+      await writeFile(join(home, '.codex', 'session_index.jsonl'), opts.index);
+    }
+    const old = new Date(Date.now() - 86_400_000);
+    await utimes(join(dir, `rollout-2026-09-07T09-40-01-${NAMED}.jsonl`), old, old);
+    return { home, root };
+  }
+
+  it('keeps only the sessions whose recorded cwd is the workspace root', async () => {
+    const { home, root } = await seedRollouts();
+    const res = await listResumableHostSessions(root, 'codex', home);
+    expect(res.supported).toBe(true);
+    // The id is the TRAILING uuid, not the timestamp prefix; newest first.
+    expect(res.sessions.map((s) => s.id)).toEqual([MINE, NAMED]);
+    expect(res.sessions.every((s) => s.agent === 'codex')).toBe(true);
+  });
+
+  it('scrapes the first real user turn when the store has no name for it', async () => {
+    const { home, root } = await seedRollouts();
+    const res = await listResumableHostSessions(root, 'codex', home);
+    // The `<recommended_plugins>` wrapper is not what the user typed.
+    expect(res.sessions[0]?.title).toBe('split the backlog');
+    expect(res.sessions[1]?.title).toBe('scraped title');
+  });
+
+  it('prefers the name the agent indexed, unless it is a command', async () => {
+    const { home, root } = await seedRollouts({
+      index:
+        [
+          JSON.stringify({ id: MINE, thread_name: 'group the flaky tests' }),
+          JSON.stringify({ id: NAMED, thread_name: '<command-name>/clear</command-name>' }),
+        ].join('\n') + '\n',
+    });
+    const res = await listResumableHostSessions(root, 'codex', home);
+    expect(res.sessions[0]?.title).toBe('group the flaky tests');
+    expect(res.sessions[1]?.title).toBe('scraped title');
+  });
+
+  it('is supported-but-empty for a folder the agent never ran in', async () => {
+    const { home } = await seedRollouts();
+    expect(await listResumableHostSessions('/nowhere', 'codex', home)).toEqual({
+      agent: 'codex',
+      supported: true,
       sessions: [],
     });
   });

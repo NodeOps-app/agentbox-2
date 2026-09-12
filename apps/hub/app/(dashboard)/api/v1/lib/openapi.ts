@@ -1475,7 +1475,7 @@ export function buildOpenApi(): Record<string, unknown> {
           tags: ['Manager'],
           summary: 'Start the manager agent',
           description:
-            'Runs a coding agent LOCALLY in the workspace folder, in a detached tmux session the hub owns, with AGENTBOX_WORKSPACE set. Clients attach to that session rather than the hub proxying a terminal. Send `agent` (with an optional `sessionId` to resume — claude only) or a custom `argv`. 503 when the hub host has no tmux.',
+            'Runs a coding agent LOCALLY in the workspace folder, in a detached tmux session the hub owns, with AGENTBOX_WORKSPACE set. Clients attach to that session rather than the hub proxying a terminal. Send `agent`, optionally with a `sessionId` to resume (claude and codex only). There is deliberately no free-form command: this runs on the hub host, not in a box. 503 when the hub host has no tmux.',
           parameters: [
             {
               name: 'id',
@@ -1499,7 +1499,8 @@ export function buildOpenApi(): Record<string, unknown> {
                     },
                     sessionId: {
                       type: 'string',
-                      description: 'Resume this session (claude only).',
+                      description:
+                        'Resume this session (claude and codex only; refused for any other agent).',
                     },
                     restart: {
                       type: 'boolean',
@@ -1555,7 +1556,7 @@ export function buildOpenApi(): Record<string, unknown> {
           tags: ['Manager'],
           summary: 'Resumable agent sessions for the workspace folder',
           description:
-            'Read from the agent\'s own on-disk store, for the "resume a session" picker. `supported: false` means this agent\'s session format is not one we can resume — not an error.',
+            'Read from the agent\'s own on-disk store, for the "resume a session" picker, newest first. Only claude and codex are readable today; for anything else `supported: false` means that agent\'s session format is not one we can resume — not an error.',
           parameters: [
             {
               name: 'id',

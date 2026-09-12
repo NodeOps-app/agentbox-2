@@ -21,6 +21,7 @@ import type {
 } from '../control-plane/hub-api-client.js';
 import type { AttachOpenIn } from '@agentbox/config';
 import { visibleAgentSpecs } from '@agentbox/agent-registry';
+import { RESUMABLE_MANAGER_AGENTS } from '@agentbox/relay';
 
 /**
  * Agents a manager can be. Registry-driven, so an agent added with
@@ -140,7 +141,10 @@ const startCommand = new Command('start')
   .description('Start the manager agent in the workspace folder')
   .option('-w, --workspace <ref>', 'workspace id or path (default: the one containing the cwd)')
   .option('--agent <agent>', `which agent to run (${managerAgents().join(' | ')})`, 'claude')
-  .option('--session <id>', 'resume this agent session (claude only)')
+  .option(
+    '--session <id>',
+    `resume this agent session (${RESUMABLE_MANAGER_AGENTS.join(' | ')} only)`,
+  )
   .option('--new', 'start a fresh session without asking which to resume')
   .option('--restart', 'replace a manager that is already running')
   .option('--attach', 'attach to the session once it is up')

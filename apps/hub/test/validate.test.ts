@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   parseCheckpointCreate,
@@ -469,5 +471,33 @@ describe('parseManagerStart', () => {
       value: { agent: 'claude', sessionId: 's1', restart: true },
     });
     expect(parseManagerStart({ agent: 'claude', restart: 'yes' })).toMatchObject({ ok: false });
+  });
+
+  /**
+   * The default list is the compiled-in one, so a route that forgets to pass the
+   * registry's ids 400s on an agent `GET /api/v1/agents` offers — which is what
+   * the manager-start route did. Asserted at the source, because the route is a
+   * Next handler with no test harness here.
+   */
+  it('is wired to the live registry by the manager-start route', () => {
+    const route = readFileSync(
+      join(
+        __dirname,
+        '..',
+        'app',
+        '(dashboard)',
+        'api',
+        'v1',
+        'workspaces',
+        '[id]',
+        'manager',
+        'start',
+        'route.ts',
+      ),
+      'utf8',
+    );
+    expect(route).toContain('globalThis.__AGENTBOX_HUB_SYSTEM');
+    expect(route).toMatch(/parseManagerStart\(parsedBody\.value,\s*allowedAgents\)/);
+    expect(route).toMatch(/sys\.agents\(\)\.map\(\(a\) => a\.id\)/);
   });
 });

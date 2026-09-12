@@ -48,7 +48,7 @@ the manager's own instructions come after.
 | 2 | Hub: `WorkspaceBackend` slice + `/api/v1/workspaces`, `/api/v1/tasks` | **done** |
 | 3 | CLI: `workspace`, `tasks`, `manager`, and `--tasks` on create | **done** |
 | 4 | The manager's brief: what it is told to do with the task list | planned |
-| 5 | Tray: the Manager window (task list + terminal pane) | planned |
+| 5 | Tray: the Manager window (task list + terminal pane) | **in progress** |
 | 6 | Hub web UI: workspace + task views | planned |
 | 7 | Linear import: one ticket → several local tasks | planned |
 
@@ -57,7 +57,10 @@ the manager's own instructions come after.
 - **The manager has no instructions yet.** Phase 1 starts a plain agent in the folder with
   `AGENTBOX_WORKSPACE` set and the `agentbox tasks` CLI available. What it should *do* with them (the
   file-overlap grouping, the `box.merged` follow-up) is Phase 4.
-- **Only claude can resume a session.** The other agents' on-disk session formats are unverified, so
+- **Only claude and codex can resume a session.** Each has its own spelling — `claude --resume <id>`
+  against `~/.claude/projects/<encoded-root>/<id>.jsonl`, and the SUBCOMMAND `codex resume <id>`
+  against the flat `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` store, which records the folder
+  inside each file rather than in its path. The remaining agents' on-disk formats are unverified, so
   `GET …/manager/sessions` answers `supported: false` for them and a `sessionId` is refused rather
   than silently starting a fresh agent that looks resumed.
 - **A remote hub's manager runs on the remote machine.** That is correct but currently unhelpful:
@@ -66,7 +69,9 @@ the manager's own instructions come after.
   open-in launchers should each move to `lib/backend/<domain>.ts`; the four `// ── … ──` banners in
   `hub-backend.ts` mark the seams.
 - **tmux is a new soft dependency** of the hub host, for the manager only. `agentbox doctor` warns
-  when it is missing and `manager start` answers 503 with an install hint.
+  when it is missing and `manager start` answers 503 with an install hint. The session is created
+  with `window-size latest` (best-effort), so a tray pane and a terminal attached at the same time
+  size to the most recent client instead of both being clamped to the smaller grid.
 
 ---
 

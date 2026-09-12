@@ -475,16 +475,22 @@ backlog with their progress intact.
 ```bash
 # The manager: an agent running locally in the workspace folder
 agentbox manager start --agent claude       # offers to resume a session in that folder
-agentbox manager start --agent codex --new
+agentbox manager start --agent codex --new  # --new skips the resume picker
 agentbox manager status
 agentbox manager attach                     # or --attach-in split|window|tab
-agentbox manager sessions
+agentbox manager sessions --agent codex     # resumable sessions in this folder
 agentbox manager stop
 ```
 
 The manager runs in a tmux session the hub owns, so the CLI, the tray and a plain
-`tmux attach` all reach the same running agent. It needs `tmux` on the machine running the hub;
-`agentbox doctor` tells you if it is missing.
+`tmux attach` all reach the same running agent (the session is sized to the most recently active
+client, so two attached at once do not clamp each other). It needs `tmux` on the machine running the
+hub; `agentbox doctor` tells you if it is missing.
+
+`manager sessions` lists the sessions in the workspace folder a manager could pick up, read from the
+agent's own store; `--session <id>` on `start` resumes one. Only `claude` and `codex` are resumable —
+each with its own spelling (`claude --resume <id>`, `codex resume <id>`) — and the rest report that
+they are unsupported rather than quietly starting a fresh agent that looks resumed.
 
 ## Providers
 
