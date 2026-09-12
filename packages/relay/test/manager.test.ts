@@ -151,11 +151,14 @@ describe('startManagerSession', () => {
     expect(calls[0]!.env).not.toHaveProperty('TMUX');
     expect(calls[0]!.env).not.toHaveProperty('TMUX_PANE');
     // Two clients (the tray pane and a terminal) must not clamp the grid to the
-    // smaller one, which is tmux's default.
+    // smaller one. `window-size` is a window option, so the target carries the
+    // `:` that selects the session's current window — a bare session target is
+    // rejected with "no such window" and the setting is silently lost.
     expect(calls[1]?.args).toEqual([
       'set-option',
+      '-w',
       '-t',
-      `=agentbox-manager-${id}`,
+      `=agentbox-manager-${id}:`,
       'window-size',
       'latest',
     ]);

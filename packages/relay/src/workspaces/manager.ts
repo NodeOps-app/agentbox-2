@@ -260,14 +260,19 @@ export async function startManagerSession(input: StartManagerSessionInput): Prom
     ['new-session', '-d', '-s', session, '-c', input.root, '--', loginShell(env), '-lc', script],
     { env },
   );
-  // tmux sizes a session to its SMALLEST attached client by default, so a tray
-  // pane and a terminal attached at once would clamp the agent's TUI to the
-  // lesser grid (and redraw it on every attach). `latest` sizes to the most
-  // recently active client instead. Best-effort: an old tmux without the option
-  // must not fail a start that already succeeded.
-  await exec('tmux', ['set-option', '-t', exactTarget(session), 'window-size', 'latest'], {
-    env,
-  }).catch(() => {});
+  // `latest` sizes the window to the most recently active client, so a tray pane
+  // and a terminal attached at once don't clamp the agent's TUI to the lesser
+  // grid. It is tmux's own default, but a user config may set `smallest`, and
+  // this session is shared by design. `window-size` is a WINDOW option, so the
+  // target must be a window (`<session>:` = that session's current window) — a
+  // bare session target answers "no such window" and the call is lost.
+  // Best-effort: an old tmux without the option must not fail a start that
+  // already succeeded.
+  await exec(
+    'tmux',
+    ['set-option', '-w', '-t', `${exactTarget(session)}:`, 'window-size', 'latest'],
+    { env },
+  ).catch(() => {});
   const record: ManagerRecord = {
     agent: input.agent,
     argv: input.argv,
