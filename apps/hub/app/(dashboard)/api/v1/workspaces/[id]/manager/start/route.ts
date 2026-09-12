@@ -27,11 +27,17 @@ export async function POST(
   // A `service` agent is excluded: it is a daemon a box hosts, with no session to
   // attach to, so running one as the manager would produce a tmux session nobody
   // can use. `agentbox manager start` filters the same way.
+  //
+  // `installed === false` is refused too, which is the opposite of the box path:
+  // a box installs its agent on demand, but the manager runs on the hub's own
+  // host, where nothing will. Without this the start answers 200 and the session
+  // dies a second later with exit 127. Absent means unknown, so only an explicit
+  // false is a refusal.
   const sys = globalThis.__AGENTBOX_HUB_SYSTEM;
   const allowedAgents = sys
     ? sys
         .agents()
-        .filter((a) => a.surface !== 'service')
+        .filter((a) => a.surface !== 'service' && a.installed !== false)
         .map((a) => a.id)
     : MANAGER_AGENT_NAMES;
   const parsed = parseManagerStart(parsedBody.value, allowedAgents);

@@ -1475,7 +1475,7 @@ export function buildOpenApi(): Record<string, unknown> {
           tags: ['Manager'],
           summary: 'Start the manager agent',
           description:
-            'Runs a coding agent LOCALLY in the workspace folder, in a detached tmux session the hub owns, with AGENTBOX_WORKSPACE set. Clients attach to that session rather than the hub proxying a terminal. Send `agent`, optionally with a `sessionId` to resume (claude and codex only). There is deliberately no free-form command: this runs on the hub host, not in a box. 503 when the hub host has no tmux.',
+            'Runs a coding agent LOCALLY in the workspace folder, in a detached tmux session the hub owns, with AGENTBOX_WORKSPACE set. Clients attach to that session rather than the hub proxying a terminal. Send `agent` — one this hub knows, has installed, and can attach to (a `service` agent is a daemon and is refused) — optionally with a `sessionId` to resume (claude and codex only). There is deliberately no free-form command, and `sessionId` must look like an id: this runs on the hub host, not in a box. 503 when the hub host has no tmux.',
           parameters: [
             {
               name: 'id',

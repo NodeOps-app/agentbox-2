@@ -1,3 +1,4 @@
+import type { ManagerExec } from '@agentbox/relay';
 // The seams a domain backend slice is built from.
 //
 // `lib/hub-backend.ts` had grown past 3800 lines because every feature appended
@@ -7,6 +8,14 @@
 import type { QueueJob } from '@agentbox/relay';
 
 export interface BackendDeps {
+  /**
+   * How the manager's tmux commands are run. Present only so a test can drive
+   * the start path without spawning anything: a guard regression in
+   * `startManager` would otherwise launch a real coding agent on whoever's
+   * machine is running the suite. Production leaves it unset and the relay uses
+   * execa.
+   */
+  managerExec?: ManagerExec;
   /**
    * Fire the hub's live-update fan-out (`/api/events` emits `change`). Called
    * after every mutation so an open UI refetches instead of waiting for its

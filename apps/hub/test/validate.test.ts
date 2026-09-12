@@ -465,6 +465,26 @@ describe('parseManagerStart', () => {
     expect(withArgv.ok && 'argv' in withArgv.value).toBe(false);
   });
 
+  it('refuses a sessionId that would read as a flag to the agent', () => {
+    // The id lands in the agent's argv on the hub's OWN host, where both agents
+    // expose a flag that drops their approval gate. Shell quoting does not help:
+    // the agent's own parser is what reads it.
+    for (const sessionId of [
+      '--dangerously-skip-permissions',
+      '--dangerously-bypass-approvals-and-sandbox',
+      '-c',
+      '--config=x',
+      'has space',
+      '../../etc/passwd',
+    ]) {
+      expect(parseManagerStart({ agent: 'claude', sessionId })).toMatchObject({ ok: false });
+    }
+    // A real id from either store still passes.
+    expect(
+      parseManagerStart({ agent: 'codex', sessionId: '01a07b01-5831-7302-b856-b0adfbfccad9' }),
+    ).toMatchObject({ ok: true });
+  });
+
   it('carries sessionId and restart through', () => {
     expect(parseManagerStart({ agent: 'claude', sessionId: 's1', restart: true })).toMatchObject({
       ok: true,

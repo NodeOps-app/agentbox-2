@@ -318,6 +318,7 @@ export function createWorkspaceBackend(deps: BackendDeps): WorkspaceBackend {
           agent,
           argv,
           ...(input.sessionId ? { sessionId: input.sessionId } : {}),
+          ...(deps.managerExec ? { exec: deps.managerExec } : {}),
         });
       } catch (e) {
         return err(`could not start the manager: ${e instanceof Error ? e.message : String(e)}`);

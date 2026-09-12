@@ -31,19 +31,43 @@ export type ManagerExec = (
 const defaultExec: ManagerExec = (file, args, opts) => execa(file, args, opts);
 
 /** Read at most this much of a transcript when scraping its first user turn. */
-const SESSION_HEAD_BYTES = 64 * 1024;
+const SESSION_HEAD_BYTES = 256 * 1024;
+
+/**
+ * A rollout's first record can be enormous — its `session_meta` carries the
+ * agent's base instructions and every configured tool, measured at 49 KB on a
+ * plain setup and growing with each MCP server. The folder sits ~200 bytes into
+ * it, but the line only parses whole, so the reader follows the line rather than
+ * a fixed head. The cap is a bound on a pathological file, not on a normal one.
+ */
+const SESSION_FIRST_LINE_MAX = 4 * 1024 * 1024;
 const SESSION_TITLE_MAX = 120;
 const SESSION_LIST_MAX = 50;
 const UNTITLED_SESSION = '(untitled)';
 
-/** Read at most this much of a session-title index (it grows without bound). */
+/**
+ * Read at most this much of a session-title index. It is append-only, so the
+ * rows a picker needs are the NEWEST ones — read the tail, not the head.
+ */
 const SESSION_INDEX_BYTES = 1024 * 1024;
 
 /**
  * How many session files one listing may open. A store that is flat across every
  * project holds years of other folders' sessions, and the picker shows 50.
+ *
+ * The candidates are ranked by mtime BEFORE this cap applies: a session created
+ * weeks ago and resumed yesterday keeps writing to its original file, so cutting
+ * by filename (creation time) would drop exactly the sessions a user is still
+ * working in. Measured drift between the two on a real store: 22 hours.
  */
 const ROLLOUT_SCAN_MAX = 200;
+
+/**
+ * How many files one listing may `stat` to rank them. Ten times the read budget:
+ * a stat is cheap where opening and parsing a multi-megabyte record is not, and
+ * this is the outer bound on a store that has grown for years.
+ */
+const ROLLOUT_STAT_MAX = 2000;
 
 /**
  * `rollout-YYYY-MM-DDTHH-MM-SS-<uuid>.jsonl` — the id is the TRAILING 36-char
@@ -99,6 +123,11 @@ export function managerAttachCommand(wsId: string): string {
  */
 export function buildManagerArgv(agent: ManagerAgent, sessionId?: string): string[] {
   if (!sessionId) return [agent];
+  // Last line before the id becomes argv on this machine: a value that reads as
+  // an option would be parsed by the AGENT, not by us, and both agents expose
+  // flags that drop their approval gate. The API refuses this shape too; the
+  // check is here as well because this function is the one that builds argv.
+  if (!/^[A-Za-z0-9][A-Za-z0-9_-]*$/u.test(sessionId)) return [agent];
   const resume = RESUME_ARGV[agent];
   return resume ? [agent, ...resume(sessionId)] : [agent];
 }
@@ -272,7 +301,14 @@ export async function startManagerSession(input: StartManagerSessionInput): Prom
     'tmux',
     ['set-option', '-w', '-t', `${exactTarget(session)}:`, 'window-size', 'latest'],
     { env },
-  ).catch(() => {});
+  ).catch((err: unknown) => {
+    // Best-effort, but not silent: swallowing this whole is how a wrong target
+    // form shipped once already, invisible to everything but a unit test that
+    // could only assert the argv we sent, never what tmux made of it.
+    console.warn(
+      `[manager] could not pin the tmux window size: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  });
   const record: ManagerRecord = {
     agent: input.agent,
     argv: input.argv,
@@ -305,12 +341,63 @@ export async function stopManagerSession(
 }
 
 /** Read at most `bytes` from the start of a file; `null` when it cannot be read. */
-async function readHead(file: string, bytes: number): Promise<string | null> {
+/**
+ * The file's first line, however long it is (bounded against a pathological one).
+ * Reading a fixed head instead would silently drop every session whose opening
+ * record outgrew the buffer, and that record is the only place the folder is
+ * recorded.
+ */
+async function readFirstLine(file: string): Promise<string | null> {
+  try {
+    const fh = await open(file, 'r');
+    try {
+      const chunk = Buffer.alloc(64 * 1024);
+      let text = '';
+      let pos = 0;
+      while (pos < SESSION_FIRST_LINE_MAX) {
+        const { bytesRead } = await fh.read(chunk, 0, chunk.length, pos);
+        if (bytesRead === 0) return text;
+        pos += bytesRead;
+        text += chunk.subarray(0, bytesRead).toString('utf8');
+        const nl = text.indexOf('\n');
+        if (nl !== -1) return text.slice(0, nl);
+      }
+      return null;
+    } finally {
+      await fh.close();
+    }
+  } catch {
+    return null;
+  }
+}
+
+/** The LAST `bytes` of a file, with any partial leading line dropped. */
+async function readTail(file: string, bytes: number): Promise<string | null> {
+  try {
+    const fh = await open(file, 'r');
+    try {
+      const { size } = await fh.stat();
+      const start = Math.max(0, size - bytes);
+      const buf = Buffer.alloc(size - start);
+      const { bytesRead } = await fh.read(buf, 0, buf.length, start);
+      const text = buf.subarray(0, bytesRead).toString('utf8');
+      if (start === 0) return text;
+      const nl = text.indexOf('\n');
+      return nl === -1 ? '' : text.slice(nl + 1);
+    } finally {
+      await fh.close();
+    }
+  } catch {
+    return null;
+  }
+}
+
+async function readHead(file: string, bytes: number, start = 0): Promise<string | null> {
   try {
     const fh = await open(file, 'r');
     try {
       const buf = Buffer.alloc(bytes);
-      const { bytesRead } = await fh.read(buf, 0, bytes, 0);
+      const { bytesRead } = await fh.read(buf, 0, bytes, start);
       return buf.subarray(0, bytesRead).toString('utf8');
     } finally {
       await fh.close();
@@ -326,13 +413,38 @@ async function readHead(file: string, bytes: number): Promise<string | null> {
  * `skipSlash` is for a name the agent DERIVED from a turn: a session whose first
  * turn was `/clear` is indexed under that literal, which names nothing.
  */
-function asTitle(text: string, opts: { skipSlash?: boolean } = {}): string | null {
+function asTitle(
+  text: string,
+  opts: { skipSlash?: boolean; skipInjected?: boolean } = {},
+): string | null {
   const flat = text.replace(/\s+/g, ' ').trim();
   // Command wrappers and system reminders are not what the user typed.
   if (!flat || flat.startsWith('<')) return null;
   if (opts.skipSlash && flat.startsWith('/')) return null;
+  if (opts.skipInjected && isInjectedContext(flat)) return null;
   return flat.length > SESSION_TITLE_MAX ? `${flat.slice(0, SESSION_TITLE_MAX - 1)}…` : flat;
 }
+
+/**
+ * Context an agent injects as if the user had typed it.
+ *
+ * A rollout's early `role: 'user'` records are not all turns: the repo's
+ * instructions file and the harness's own preambles arrive the same way, so
+ * scraping blindly names every session in a repo after its AGENTS.md. Measured
+ * on a real store: 8 of 8 sessions in one folder shared one assessor preamble.
+ */
+function isInjectedContext(flat: string): boolean {
+  if (flat.startsWith('#')) return true;
+  return INJECTED_PREFIXES.some((p) => flat.startsWith(p));
+}
+
+const INJECTED_PREFIXES = [
+  'The following is the',
+  'AGENTS.md',
+  'You are ',
+  'Caveat:',
+  'This session is being continued',
+];
 
 /** The first `text` block of a content array, whatever the block type is called. */
 function firstTextBlock(content: unknown): string | null {
@@ -364,7 +476,7 @@ function titleFromTranscript(head: string): string {
     const rec = row as { type?: string; message?: { content?: unknown } };
     if (rec.type !== 'user') continue;
     const text = firstTextBlock(rec.message?.content);
-    const title = text === null ? null : asTitle(text);
+    const title = text === null ? null : asTitle(text, { skipInjected: true });
     if (title) return title;
   }
   return UNTITLED_SESSION;
@@ -377,6 +489,10 @@ function titleFromTranscript(head: string): string {
  * message (`payload.role`, `payload.content[].text`), and older writers emit an
  * `event_msg` / `user_message` instead — both are read here because a session
  * listing that silently shows "(untitled)" is indistinguishable from a bug.
+ *
+ * Both record shapes are accepted because the store mixes writers across agent
+ * versions; only the `role: 'user'` form appears in a store written by a current
+ * one, so the other branch is a compatibility path, not the common case.
  */
 function titleFromRollout(head: string): string {
   for (const row of jsonlRows(head)) {
@@ -390,7 +506,7 @@ function titleFromRollout(head: string): string {
     else if (payload.type === 'user_message' && typeof payload.message === 'string') {
       text = payload.message;
     }
-    const title = text === null ? null : asTitle(text);
+    const title = text === null ? null : asTitle(text, { skipInjected: true });
     if (title) return title;
   }
   return UNTITLED_SESSION;
@@ -449,37 +565,56 @@ async function listRolloutSessions(
   agent: string,
   home: string,
 ): Promise<HostSession[]> {
-  const candidates = await findRolloutFiles(join(home, '.codex', 'sessions'));
+  const candidates = await rolloutCandidates(join(home, '.codex', 'sessions'));
   if (candidates.length === 0) return [];
   const wanted = await canonicalPath(root);
   const titles = await readThreadNames(join(home, '.codex', 'session_index.jsonl'));
   const rows: { session: HostSession; mtime: number }[] = [];
-  for (const { file, id } of candidates) {
-    const head = await readHead(file, SESSION_HEAD_BYTES);
-    if (head === null) continue;
-    const cwd = cwdFromRollout(head);
+  for (const { file, id, mtime } of candidates) {
+    const first = await readFirstLine(file);
+    if (first === null) continue;
+    const cwd = cwdFromRollout(first);
     if (cwd === null) continue;
     if (cwd !== root && (await canonicalPath(cwd)) !== wanted) continue;
-    let mtime: number;
-    try {
-      mtime = (await stat(file)).mtimeMs;
-    } catch {
-      continue;
-    }
     const indexed = titles.get(id);
+    // Scrape AFTER the opening record: it alone can be hundreds of kilobytes, so
+    // a head read from byte zero would spend its whole budget on the metadata and
+    // never reach a turn. `first` is already in hand and holds no user text.
+    const indexedTitle = indexed === undefined ? null : asTitle(indexed, { skipSlash: true });
+    const title =
+      indexedTitle ??
+      titleFromRollout(
+        (await readHead(file, SESSION_HEAD_BYTES, Buffer.byteLength(first, 'utf8') + 1)) ?? '',
+      );
     rows.push({
-      session: {
-        id,
-        agent,
-        title:
-          (indexed === undefined ? null : asTitle(indexed, { skipSlash: true })) ??
-          titleFromRollout(head),
-        updatedAt: new Date(mtime).toISOString(),
-      },
+      session: { id, agent, title, updatedAt: new Date(mtime).toISOString() },
       mtime,
     });
   }
   return sortAndCap(rows);
+}
+
+/**
+ * Every rollout in the store, newest-ACTIVITY first and capped.
+ *
+ * Ranking by mtime before the cap is what makes the cap honest: the filename
+ * carries creation time, but a resumed session keeps appending to its original
+ * file, so a name-ordered cut drops the sessions someone is still working in.
+ */
+async function rolloutCandidates(
+  sessionsRoot: string,
+): Promise<{ file: string; id: string; mtime: number }[]> {
+  const files = await findRolloutFiles(sessionsRoot);
+  const dated: { file: string; id: string; mtime: number }[] = [];
+  for (const { file, id } of files) {
+    try {
+      dated.push({ file, id, mtime: (await stat(file)).mtimeMs });
+    } catch {
+      /* vanished between readdir and stat */
+    }
+  }
+  dated.sort((a, b) => b.mtime - a.mtime);
+  return dated.slice(0, ROLLOUT_SCAN_MAX);
 }
 
 function sortAndCap(rows: { session: HostSession; mtime: number }[]): HostSession[] {
@@ -509,8 +644,9 @@ async function safeReaddir(dir: string): Promise<string[]> {
  *
  * No recursion and no globbing: the depth is part of the format. Names sort
  * chronologically at every level (`YYYY`, `MM`, `DD`, then a timestamped
- * filename), so descending order visits the most recent sessions first — which
- * is what makes the scan cap keep the ones a picker would actually show.
+ * filename), so descending order visits the most recently CREATED sessions
+ * first. That is not the same as most recently used, which is why the caller
+ * ranks by mtime before applying the read budget.
  */
 async function findRolloutFiles(sessionsRoot: string): Promise<{ file: string; id: string }[]> {
   const out: { file: string; id: string }[] = [];
@@ -526,7 +662,7 @@ async function findRolloutFiles(sessionsRoot: string): Promise<{ file: string; i
           const id = ROLLOUT_UUID_RE.exec(name)?.[1];
           if (id === undefined) continue;
           out.push({ file: join(dDir, name), id });
-          if (out.length >= ROLLOUT_SCAN_MAX) return out;
+          if (out.length >= ROLLOUT_STAT_MAX) return out;
         }
       }
     }
@@ -534,15 +670,29 @@ async function findRolloutFiles(sessionsRoot: string): Promise<{ file: string; i
   return out;
 }
 
-/** The folder a rollout ran in, from its first record. */
+/**
+ * The folder a rollout ran in, from its opening record — and `null` for a
+ * session no human started.
+ *
+ * The store holds the agent's own internal threads alongside real ones: a
+ * `guardian_review` thread assessing a command, a `subagent` thread doing part
+ * of a task. On one real store those were 49 of 71 files. They have no user turn
+ * to name them and resuming one puts the user inside the agent's plumbing, so
+ * they are skipped here exactly as claude's `agent-*.jsonl` transcripts are.
+ * An absent marker means a writer too old to record one: kept, not guessed at.
+ */
 function cwdFromRollout(head: string): string | null {
   const nl = head.indexOf('\n');
   const first = nl === -1 ? head : head.slice(0, nl);
   try {
-    const parsed = JSON.parse(first) as { type?: string; payload?: { cwd?: unknown } };
-    if (parsed.type === 'session_meta' && typeof parsed.payload?.cwd === 'string') {
-      return parsed.payload.cwd;
-    }
+    const parsed = JSON.parse(first) as {
+      type?: string;
+      payload?: { cwd?: unknown; thread_source?: unknown };
+    };
+    if (parsed.type !== 'session_meta' || typeof parsed.payload?.cwd !== 'string') return null;
+    const source = parsed.payload.thread_source;
+    if (typeof source === 'string' && source !== 'user') return null;
+    return parsed.payload.cwd;
   } catch {
     /* not a session_meta line: treat the file as unattributable */
   }
@@ -552,9 +702,9 @@ function cwdFromRollout(head: string): string | null {
 /** `{id, thread_name}` rows the agent maintains next to its rollouts, if any. */
 async function readThreadNames(file: string): Promise<Map<string, string>> {
   const out = new Map<string, string>();
-  const head = await readHead(file, SESSION_INDEX_BYTES);
-  if (head === null) return out;
-  for (const row of jsonlRows(head)) {
+  const tail = await readTail(file, SESSION_INDEX_BYTES);
+  if (tail === null) return out;
+  for (const row of jsonlRows(tail)) {
     const rec = row as { id?: unknown; thread_name?: unknown };
     if (typeof rec.id === 'string' && typeof rec.thread_name === 'string') {
       out.set(rec.id, rec.thread_name);
