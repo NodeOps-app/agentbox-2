@@ -23,8 +23,17 @@ export async function POST(
   // than the compiled-in list — GET /api/v1/agents offers them, so refusing one
   // here would advertise a manager the start path rejects. Falls back to the
   // built-ins when the seam is absent (the plane path has no registry).
+  //
+  // A `service` agent is excluded: it is a daemon a box hosts, with no session to
+  // attach to, so running one as the manager would produce a tmux session nobody
+  // can use. `agentbox manager start` filters the same way.
   const sys = globalThis.__AGENTBOX_HUB_SYSTEM;
-  const allowedAgents = sys ? sys.agents().map((a) => a.id) : MANAGER_AGENT_NAMES;
+  const allowedAgents = sys
+    ? sys
+        .agents()
+        .filter((a) => a.surface !== 'service')
+        .map((a) => a.id)
+    : MANAGER_AGENT_NAMES;
   const parsed = parseManagerStart(parsedBody.value, allowedAgents);
   if (!parsed.ok) return fail('invalid_request', parsed.message);
 

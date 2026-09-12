@@ -152,7 +152,15 @@ declare global {
         // The agents a picker should offer, and whether this machine is set up
         // for each (host config dir or a saved AgentBox login). Registry-driven,
         // so it includes agents registered by `agentbox agent add`.
-        agents(): { id: string; label: string; installed: boolean }[];
+        // `surface` says what shape the agent is: a 'tui' agent is a session you
+        // attach to, a 'service' agent is a daemon a box hosts. A picker that
+        // launches an interactive session (the manager) must exclude 'service'.
+        agents(): {
+          id: string;
+          label: string;
+          installed: boolean;
+          surface?: 'tui' | 'service';
+        }[];
         // Box-image resolution facts: which published tag this host asks for and
         // what it last stamped. The things a "why didn't it pull the prebuilt
         // image?" investigation otherwise reconstructs by hand.

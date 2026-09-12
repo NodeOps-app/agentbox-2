@@ -498,6 +498,11 @@ describe('parseManagerStart', () => {
     );
     expect(route).toContain('globalThis.__AGENTBOX_HUB_SYSTEM');
     expect(route).toMatch(/parseManagerStart\(parsedBody\.value,\s*allowedAgents\)/);
-    expect(route).toMatch(/sys\.agents\(\)\.map\(\(a\) => a\.id\)/);
+    // The accept-list comes from the registry, minus the daemon-shaped agents:
+    // a `service` agent has no session to attach to, so a manager started on one
+    // would be a tmux session nobody can use.
+    expect(route).toMatch(/sys[\s\S]{0,80}\.agents\(\)/);
+    expect(route).toMatch(/surface\s*!==\s*'service'/);
+    expect(route).toMatch(/\.map\(\(a\)\s*=>\s*a\.id\)/);
   });
 });
