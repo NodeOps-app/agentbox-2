@@ -1,5 +1,19 @@
-import type { HubState, ProviderOption, ProviderSizeCheck } from './types';
+import type {
+  HubState,
+  ManagerView,
+  ProviderOption,
+  ProviderSizeCheck,
+  WorkspaceView,
+} from './types';
 import type { AgentId } from '@agentbox/core';
+import type {
+  BoxTaskSummary,
+  HostSession,
+  ManagerAgent,
+  WorkTask,
+  WorkTaskExternalRef,
+  WorkTaskStatus,
+} from '@agentbox/relay';
 
 // Result of a lifecycle server action.
 export type ActionResult = { ok: true } | { ok: false; error: string };
@@ -485,7 +499,7 @@ export type BoxLogAttachSpec =
 // actions.ts) reaches it ONLY through that global, so the heavy Node/docker
 // packages never enter Next's bundle. This is a pure-type module (no runtime
 // imports) so both the implementation and the ambient global can share it.
-export interface HubBackend {
+export interface HubBackend extends WorkspaceBackend {
   // authMode is an env-derived concern layered on by source.ts, not the host
   // backend — so the backend produces everything else. `live` (opt-in, expensive
   // — mirrors providers' `?freshness=1`) refreshes each cloud box's `state` with
@@ -936,4 +950,100 @@ export interface RemoteDockerHostView {
    * shared with it rather than registered from its own `~/.ssh/config`.
    */
   managedKey?: boolean;
+}
+
+// ── workspaces / tasks / manager ──
+
+export type WorkspaceResult = { ok: true; workspace: WorkspaceView } | { ok: false; error: string };
+export type TaskResult = { ok: true; task: WorkTask } | { ok: false; error: string };
+export type TasksResult = { ok: true; tasks: WorkTask[] } | { ok: false; error: string };
+export type ManagerResult = { ok: true; manager: ManagerView } | { ok: false; error: string };
+
+/** What `listResumableHostSessions` answers: the picker's rows, plus whether this agent has any. */
+export interface ManagerSessionsResult {
+  agent: string;
+  /** False when this agent's on-disk session format is not one we can resume. */
+  supported: boolean;
+  sessions: HostSession[];
+}
+
+export interface TaskFilter {
+  projectId?: string;
+  boxId?: string;
+  status?: WorkTaskStatus;
+}
+
+export interface AddTaskInput {
+  title: string;
+  description?: string;
+  projectId?: string;
+  dependsOn?: string[];
+  createdBy?: WorkTask['createdBy'];
+  externalRef?: WorkTaskExternalRef;
+  boxId?: string;
+  boxJobId?: string;
+}
+
+export interface UpdateTaskInput {
+  title?: string;
+  description?: string;
+  status?: WorkTaskStatus;
+  /** `null` clears the project scope; `undefined` leaves it as it was. */
+  projectId?: string | null;
+  dependsOn?: string[];
+  externalRef?: WorkTaskExternalRef;
+}
+
+/** A box that exists, or the create job that will become one. */
+export type AssignTarget = { boxId: string } | { boxJobId: string };
+
+export interface StartManagerInput {
+  agent?: ManagerAgent;
+  sessionId?: string;
+  /** A custom command instead of a known agent (wins over `agent`). */
+  argv?: string[];
+  /** Kill a running manager and start this one, instead of refusing. */
+  restart?: boolean;
+}
+
+/**
+ * The workspace domain slice (`lib/backend/workspaces.ts`). Split out of the
+ * monolithic backend so new domains land in their own file; `HubBackend`
+ * extends it, so callers still see one object.
+ */
+export interface WorkspaceBackend {
+  listWorkspaces(): Promise<WorkspaceView[]>;
+  getWorkspace(id: string): Promise<WorkspaceView | null>;
+  /** Register a folder (absolute, on the hub's machine) and its projects. Idempotent. */
+  addWorkspace(input: { path: string; name?: string }): Promise<WorkspaceResult>;
+  rescanWorkspace(id: string): Promise<WorkspaceResult>;
+  renameWorkspace(id: string, name: string): Promise<WorkspaceResult>;
+  /** Unregister. The folder, its projects and their boxes are untouched. */
+  removeWorkspace(id: string): Promise<ActionResult>;
+
+  /** `null` = unknown workspace (so a route can answer 404 rather than an empty list). */
+  listTasks(wsId: string, filter?: TaskFilter): Promise<WorkTask[] | null>;
+  listAllTasks(filter?: TaskFilter & { workspaceId?: string }): Promise<WorkTask[]>;
+  getTask(wsId: string, taskId: string): Promise<WorkTask | null>;
+  addTask(wsId: string, input: AddTaskInput): Promise<TaskResult>;
+  updateTask(wsId: string, taskId: string, patch: UpdateTaskInput): Promise<TaskResult>;
+  completeTask(wsId: string, taskId: string): Promise<TaskResult>;
+  removeTask(wsId: string, taskId: string): Promise<ActionResult>;
+  assignTasks(wsId: string, ids: string[], target: AssignTarget): Promise<TasksResult>;
+  unassignTasks(wsId: string, ids: string[]): Promise<TasksResult>;
+  /** `ids` must be an exact permutation of the workspace's tasks. */
+  reorderTasks(wsId: string, ids: string[]): Promise<TasksResult>;
+
+  getManager(wsId: string): Promise<ManagerView | null>;
+  startManager(wsId: string, input: StartManagerInput): Promise<ManagerResult>;
+  stopManager(wsId: string): Promise<ManagerResult>;
+  listManagerSessions(wsId: string, agent?: string): Promise<ManagerSessionsResult | null>;
+
+  /** projectId -> workspaceId, for `Project.workspaceId` in getData(). */
+  workspaceIdByProject(): Promise<Map<string, string>>;
+  /** Task roll-ups for `Box.tasks`, keyed by box id and by pending create-job id. */
+  taskSummaries(): Promise<{
+    byBox: Map<string, BoxTaskSummary>;
+    byJob: Map<string, BoxTaskSummary>;
+  }>;
 }

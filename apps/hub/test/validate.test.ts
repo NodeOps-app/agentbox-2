@@ -6,6 +6,12 @@ import {
   parseHostUpsert,
   parseProject,
   parsePrune,
+  parseManagerStart,
+  parseTaskAssign,
+  parseTaskCreate,
+  parseTaskReorder,
+  parseTaskUpdate,
+  parseWorkspaceAdd,
 } from '../app/(dashboard)/api/v1/lib/validate';
 
 describe('parseProject', () => {
@@ -344,5 +350,113 @@ describe('parseCloneBox', () => {
     expect(parseCloneBox({ persistent: 'yes' }).ok).toBe(false);
     expect(parseCloneBox({ includeNodeModules: 1 }).ok).toBe(false);
     expect(parseCloneBox('nope').ok).toBe(false);
+  });
+});
+
+describe('parseWorkspaceAdd', () => {
+  it('requires an absolute path and caps the name', () => {
+    expect(parseWorkspaceAdd({ path: '/Users/me/code' })).toMatchObject({
+      ok: true,
+      value: { path: '/Users/me/code' },
+    });
+    expect(parseWorkspaceAdd({ path: 'code' })).toMatchObject({ ok: false });
+    expect(parseWorkspaceAdd({})).toMatchObject({ ok: false });
+    expect(parseWorkspaceAdd({ path: '/a', name: 'x'.repeat(61) })).toMatchObject({ ok: false });
+    expect(parseWorkspaceAdd({ path: '/a', name: '   ' })).toMatchObject({ ok: false });
+  });
+});
+
+describe('parseTaskCreate', () => {
+  it('requires a non-empty title and trims it', () => {
+    expect(parseTaskCreate({ title: '  ship it  ' })).toMatchObject({
+      ok: true,
+      value: { title: 'ship it' },
+    });
+    expect(parseTaskCreate({ title: '   ' })).toMatchObject({ ok: false });
+    expect(parseTaskCreate({})).toMatchObject({ ok: false });
+  });
+
+  it('validates dependsOn ids, createdBy and the external ref', () => {
+    expect(parseTaskCreate({ title: 'a', dependsOn: ['T-1', 'T-2'] })).toMatchObject({ ok: true });
+    expect(parseTaskCreate({ title: 'a', dependsOn: ['nope'] })).toMatchObject({ ok: false });
+    expect(parseTaskCreate({ title: 'a', createdBy: 'robot' })).toMatchObject({ ok: false });
+    expect(parseTaskCreate({ title: 'a', externalRef: { kind: 'linear' } })).toMatchObject({
+      ok: false,
+    });
+    expect(
+      parseTaskCreate({ title: 'a', externalRef: { kind: 'linear', id: 'ENG-1' } }),
+    ).toMatchObject({ ok: true });
+  });
+
+  it('refuses a task assigned to a box AND a job', () => {
+    expect(parseTaskCreate({ title: 'a', boxId: 'b', boxJobId: 'j' })).toMatchObject({ ok: false });
+  });
+});
+
+describe('parseTaskUpdate', () => {
+  it('distinguishes a cleared project from an untouched one', () => {
+    expect(parseTaskUpdate({ projectId: null })).toMatchObject({
+      ok: true,
+      value: { projectId: null },
+    });
+    const untouched = parseTaskUpdate({ title: 'x' });
+    expect(untouched.ok && 'projectId' in untouched.value).toBe(false);
+  });
+
+  it('validates the status and refuses an empty patch', () => {
+    expect(parseTaskUpdate({ status: 'done' })).toMatchObject({ ok: true });
+    expect(parseTaskUpdate({ status: 'nope' })).toMatchObject({ ok: false });
+    expect(parseTaskUpdate({})).toMatchObject({ ok: false });
+  });
+
+  it('accepts an empty dependsOn as "clear the dependencies"', () => {
+    expect(parseTaskUpdate({ dependsOn: [] })).toMatchObject({
+      ok: true,
+      value: { dependsOn: [] },
+    });
+  });
+});
+
+describe('parseTaskAssign', () => {
+  it('needs exactly one target', () => {
+    expect(parseTaskAssign({ boxId: 'b' })).toMatchObject({ ok: true });
+    expect(parseTaskAssign({ boxJobId: 'j' })).toMatchObject({ ok: true });
+    expect(parseTaskAssign({})).toMatchObject({ ok: false });
+    expect(parseTaskAssign({ boxId: 'b', boxJobId: 'j' })).toMatchObject({ ok: false });
+  });
+
+  it('requires task ids on the bulk form only', () => {
+    expect(parseTaskAssign({ boxId: 'b' }, { requireIds: true })).toMatchObject({ ok: false });
+    expect(parseTaskAssign({ ids: ['T-1'], boxId: 'b' }, { requireIds: true })).toMatchObject({
+      ok: true,
+    });
+    expect(parseTaskAssign({ ids: ['oops'], boxId: 'b' }, { requireIds: true })).toMatchObject({
+      ok: false,
+    });
+  });
+});
+
+describe('parseTaskReorder', () => {
+  it('requires a non-empty list of task ids', () => {
+    expect(parseTaskReorder({ ids: ['T-2', 'T-1'] })).toMatchObject({ ok: true });
+    expect(parseTaskReorder({ ids: [] })).toMatchObject({ ok: false });
+    expect(parseTaskReorder({})).toMatchObject({ ok: false });
+  });
+});
+
+describe('parseManagerStart', () => {
+  it('takes a known agent or a custom argv, and nothing else', () => {
+    expect(parseManagerStart({ agent: 'claude' })).toMatchObject({ ok: true });
+    expect(parseManagerStart({ argv: ['my-agent', '--flag'] })).toMatchObject({ ok: true });
+    expect(parseManagerStart({})).toMatchObject({ ok: false });
+    expect(parseManagerStart({ agent: 'gemini' })).toMatchObject({ ok: false });
+  });
+
+  it('carries sessionId and restart through', () => {
+    expect(parseManagerStart({ agent: 'claude', sessionId: 's1', restart: true })).toMatchObject({
+      ok: true,
+      value: { agent: 'claude', sessionId: 's1', restart: true },
+    });
+    expect(parseManagerStart({ agent: 'claude', restart: 'yes' })).toMatchObject({ ok: false });
   });
 });

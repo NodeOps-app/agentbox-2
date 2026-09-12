@@ -41,6 +41,8 @@ import {
   type Provider,
 } from '@agentbox/core';
 import type { BoxStatus as CtlBoxStatus, StatusReply } from '@agentbox/ctl';
+import { createWorkspaceBackend } from './backend/workspaces';
+import type { BackendDeps } from './backend/deps';
 import {
   deleteJob,
   enqueuePrepareJob,
@@ -208,6 +210,7 @@ import type {
   Approval,
   Box,
   BoxStatus,
+  BoxTaskSummary,
   GithubState,
   HubState,
   Project,
@@ -2074,6 +2077,24 @@ export function createHubBackend(handle: RelayServerHandle): HubBackend {
   // demand. Threaded into every provider-driven path below.
   const hydrate: HydrateFn = (bid) => hydrateRegisteredBox(handle, bid);
 
+  // Domain slices (see lib/backend/). Each gets only the seams it needs, so it
+  // is testable without a relay handle and reviewable without this file.
+  const backendDeps: BackendDeps = {
+    notify: () => handle.hubNotifier.notify(),
+    async liveBoxIds() {
+      // Local records UNION Store registrations: on a control box a PC's cloud
+      // box has a registration and no local record, and treating it as gone
+      // would unassign its tasks on every dashboard poll.
+      const [local, registered] = await Promise.all([
+        listBoxes().catch(() => []),
+        handle.store.listBoxes().catch(() => []),
+      ]);
+      return new Set([...local.map((b) => b.id), ...registered.map((r) => r.boxId)]);
+    },
+    jobs: () => loadQueue().catch(() => []),
+  };
+  const workspaces = createWorkspaceBackend(backendDeps);
+
   /**
    * The repo a project's boxes are cloned from. A control box's projects ARE
    * repos — it holds no working copy — so the origin comes from a box
@@ -2136,10 +2157,21 @@ export function createHubBackend(handle: RelayServerHandle): HubBackend {
     return { ok: true, jobId: id };
   }
   return {
+    ...workspaces,
     // authMode is layered on by source.ts (an env-derived concern), so the host
     // backend produces everything else.
     async getData(opts): Promise<Omit<HubState, 'authMode'>> {
       const [listed, jobs] = await Promise.all([listBoxes(), loadQueue()]);
+      // Workspace facts for the two payload fields they own. Read once here so
+      // the mapping below stays synchronous.
+      const [workspaceViews, wsByProject, taskSummaries] = await Promise.all([
+        workspaces.listWorkspaces().catch(() => []),
+        workspaces.workspaceIdByProject().catch(() => new Map<string, string>()),
+        workspaces.taskSummaries().catch(() => ({
+          byBox: new Map<string, BoxTaskSummary>(),
+          byJob: new Map<string, BoxTaskSummary>(),
+        })),
+      ]);
       // `?live=1` (opt-in, expensive — mirrors providers' `?freshness=1`): refresh
       // each cloud box's `state` with an authoritative SDK probe before mapping.
       // Off the default path — a plain listing shows the fast persisted state.
@@ -2157,9 +2189,11 @@ export function createHubBackend(handle: RelayServerHandle): HubBackend {
         // surfaces in the box list (its progress is provider status instead).
         if (j.kind === 'prepare') continue;
         if (j.boxId && liveIds.has(j.boxId)) continue;
+        const jobTasks = taskSummaries.byJob.get(j.id);
+        const withTasks = (box: Box): Box => (jobTasks ? { ...box, tasks: jobTasks } : box);
         if (j.status === 'queued' || j.status === 'running')
-          jobBoxes.push(mapJobToBox(j, 'creating'));
-        else if (j.status === 'failed') jobBoxes.push(mapJobToBox(j, 'error'));
+          jobBoxes.push(withTasks(mapJobToBox(j, 'creating')));
+        else if (j.status === 'failed') jobBoxes.push(withTasks(mapJobToBox(j, 'error')));
       }
       const allRegistrations = await handle.store.listBoxes().catch(() => []);
       // Boxes the Store holds but this VPS's local state doesn't — i.e.
@@ -2227,16 +2261,26 @@ export function createHubBackend(handle: RelayServerHandle): HubBackend {
       // filesystem probe; the resolver caches per project root, so a fleet of
       // boxes over three projects costs three stats, not one per box.
       const hasGitOf = boxHasGitResolver();
+      const withTasks = (box: Box): Box => {
+        const summary = taskSummaries.byBox.get(box.id);
+        return summary ? { ...box, tasks: summary } : box;
+      };
       const listedBoxes = await Promise.all(
         listed.map(async (b) =>
-          mapBox(b, repoGrouped.get(b.id), regByBoxId.get(b.id)?.originUrl, await hasGitOf(b)),
+          withTasks(
+            mapBox(b, repoGrouped.get(b.id), regByBoxId.get(b.id)?.originUrl, await hasGitOf(b)),
+          ),
         ),
       );
       return {
         user: currentUser(),
         github: LOCAL_GITHUB,
-        projects,
-        boxes: [...jobBoxes, ...listedBoxes, ...registeredBoxes],
+        projects: projects.map((p) => {
+          const wsId = wsByProject.get(p.id);
+          return wsId ? { ...p, workspaceId: wsId } : p;
+        }),
+        workspaces: workspaceViews,
+        boxes: [...jobBoxes, ...listedBoxes, ...registeredBoxes.map(withTasks)],
         // Block-mode approvals live in-process on the relay handle, not the Store.
         approvals: handle.prompts.all().map(mapApproval),
         providers: await withRemoteProviders(listProviders(jobs)),
