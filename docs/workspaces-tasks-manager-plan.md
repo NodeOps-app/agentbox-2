@@ -48,7 +48,7 @@ the manager's own instructions come after.
 | 2 | Hub: `WorkspaceBackend` slice + `/api/v1/workspaces`, `/api/v1/tasks` | **done** |
 | 3 | CLI: `workspace`, `tasks`, `manager`, and `--tasks` on create | **done** |
 | 4 | The manager's brief: what it is told to do with the task list | planned |
-| 5 | Tray: the Manager window (task list + terminal pane) | **in progress** |
+| 5 | Tray: the Manager window (task list + terminal pane) | **done** |
 | 6 | Hub web UI: workspace + task views | planned |
 | 7 | Linear import: one ticket → several local tasks | planned |
 
