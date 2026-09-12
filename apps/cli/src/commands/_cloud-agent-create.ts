@@ -58,6 +58,12 @@ export interface CloudAgentCreateArgs {
    */
   beforeStart?: (box: BoxRecord) => Promise<{ agentArgsPrefix?: string[] } | void>;
   /**
+   * Fired once the box exists, before anything else touches it. The `--tasks`
+   * assignment rides this: the create attaches and never returns, so a caller
+   * that needs the new box's id has no other seam.
+   */
+  onCreated?: (box: BoxRecord) => Promise<void>;
+  /**
    * Whether the caller already set a seed prompt in `extraArgs` (plan / launch-
    * with-prompt / resume). On a checkpoint-restore conflict the warning is
    * injected as the agent's opening turn only when there's no seed; otherwise it
@@ -96,6 +102,7 @@ export async function cloudAgentCreate(args: CloudAgentCreateArgs): Promise<void
     // Record which agent this box was launched with so `agentbox recover` can
     // relaunch/attach the right one later. Best-effort — never block the launch.
     await recordLastAgent(result.record.id, args.mode).catch(() => {});
+    if (args.onCreated) await args.onCreated(result.record);
     let extraArgs = args.extraArgs;
     if (args.beforeStart) {
       const hook = await args.beforeStart(result.record);

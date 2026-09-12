@@ -25,6 +25,13 @@ const SESSION_HEAD_BYTES = 64 * 1024;
 const SESSION_TITLE_MAX = 120;
 const SESSION_LIST_MAX = 50;
 
+/**
+ * The one agent whose host session store we can read and whose resume flag we
+ * have verified. Everything else reports `supported: false` rather than offering
+ * a session it would silently fail to resume.
+ */
+export const RESUMABLE_MANAGER_AGENT = 'claude';
+
 export function managerSessionName(wsId: string): string {
   return `agentbox-manager-${wsId}`;
 }
@@ -43,11 +50,12 @@ export function managerAttachCommand(wsId: string): string {
 }
 
 /**
- * The agent's argv. Only claude's resume spelling is verified, so a sessionId is
- * rejected for the others upstream rather than guessed at here.
+ * The agent's argv: its binary, plus a resume flag when the caller named a
+ * session. Only claude's resume spelling is verified, so a sessionId for any
+ * other agent is refused upstream rather than guessed at here.
  */
 export function buildManagerArgv(agent: ManagerAgent, sessionId?: string): string[] {
-  if (agent === 'claude') return sessionId ? ['claude', '--resume', sessionId] : ['claude'];
+  if (agent === RESUMABLE_MANAGER_AGENT && sessionId) return [agent, '--resume', sessionId];
   return [agent];
 }
 
@@ -272,10 +280,10 @@ function titleFromTranscript(head: string): string {
  */
 export async function listResumableHostSessions(
   root: string,
-  agent = 'claude',
+  agent: string = RESUMABLE_MANAGER_AGENT,
   home: string = homedir(),
 ): Promise<{ agent: string; supported: boolean; sessions: HostSession[] }> {
-  if (agent !== 'claude') return { agent, supported: false, sessions: [] };
+  if (agent !== RESUMABLE_MANAGER_AGENT) return { agent, supported: false, sessions: [] };
   const dir = join(home, '.claude', 'projects', encodeClaudeProjectsKey(root));
   let names: string[];
   try {

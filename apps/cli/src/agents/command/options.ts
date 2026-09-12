@@ -51,6 +51,8 @@ export interface AgentCreateOptions {
   sharedDockerCache?: boolean;
   portless?: boolean;
   sessionName?: string;
+  /** `--tasks T-1,T-2`: workspace tasks to assign to the box being created. */
+  tasks?: string;
   memory?: string;
   cpus?: string;
   pidsLimit?: string;
@@ -118,6 +120,10 @@ export function addCreateOptions(cmd: Command, a: AgentCliSpec): Command {
     // Mirror create's surface so users can swap the verb without re-learning flags.
     .option('-w, --workspace <path>', 'host workspace to mount', process.cwd())
     .option('-n, --name <name>', 'friendly box name (default: <workspace-basename>-<id>)')
+    .option(
+      '--tasks <ids>',
+      'comma-separated workspace task ids to assign to this box (e.g. T-11,T-12)',
+    )
     .option(
       '--host-snapshot',
       'APFS-clone the host workspace into a per-box scratch dir before seeding /workspace (stabilizes the tar-pipe source)',

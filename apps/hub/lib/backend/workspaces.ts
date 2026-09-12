@@ -32,7 +32,7 @@ import {
   toWorkspaceView,
   unassignTasks,
   writeTasks,
-  MANAGER_AGENTS,
+  RESUMABLE_MANAGER_AGENT,
   type BoxTaskSummary,
   type ManagerAgent,
   type Workspace,
@@ -291,19 +291,20 @@ export function createWorkspaceBackend(deps: BackendDeps): WorkspaceBackend {
       }
       if (running) await stopManagerSession(wsId);
 
-      let agent: ManagerAgent | 'custom';
+      // The route validator is the accept-list for `agent`; here we only need the
+      // one rule it cannot express — a session can be resumed for exactly one
+      // agent, and starting a FRESH agent that looks resumed is worse than a 400.
+      let agent: ManagerAgent;
       let argv: string[];
       if (input.argv?.length) {
         agent = 'custom';
         argv = input.argv;
       } else {
-        if (!input.agent || !MANAGER_AGENTS.includes(input.agent)) {
-          return err(`agent must be one of ${MANAGER_AGENTS.join(', ')}, or pass argv`);
-        }
-        // Only claude's resume spelling is verified; offering a session we cannot
-        // actually resume would start a fresh agent that looks like a resumed one.
-        if (input.sessionId && input.agent !== 'claude') {
-          return err(`session resume is only supported for claude, not ${input.agent}`);
+        if (!input.agent) return err('agent or argv is required');
+        if (input.sessionId && input.agent !== RESUMABLE_MANAGER_AGENT) {
+          return err(
+            `session resume is only supported for ${RESUMABLE_MANAGER_AGENT}, not ${input.agent}`,
+          );
         }
         agent = input.agent;
         argv = buildManagerArgv(input.agent, input.sessionId);

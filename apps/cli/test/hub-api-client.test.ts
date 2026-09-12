@@ -332,3 +332,83 @@ describe('HubApiClient', () => {
     expect(calls[0]!.body).toEqual({ code: 'ABC-123' });
   });
 });
+
+describe('HubApiClient workspaces', () => {
+  it('lists workspaces and unwraps the envelope', async () => {
+    const { fetchImpl, calls } = stub({
+      'GET /api/v1/workspaces': { status: 200, body: { workspaces: [{ id: 'w1', name: 'code' }] } },
+    });
+    const out = await new HubApiClient(target(fetchImpl)).listWorkspaces();
+    expect(out).toEqual([{ id: 'w1', name: 'code' }]);
+    expect(calls[0]?.url).toBe('https://hub.example/api/v1/workspaces');
+  });
+
+  it('registers a folder by absolute path', async () => {
+    const { fetchImpl, calls } = stub({
+      'POST /api/v1/workspaces': { status: 200, body: { id: 'w1' } },
+    });
+    await new HubApiClient(target(fetchImpl)).addWorkspace({ path: '/Users/me/code' });
+    expect(calls[0]?.method).toBe('POST');
+    expect(calls[0]?.body).toEqual({ path: '/Users/me/code' });
+  });
+
+  it('encodes the workspace id into every sub-path', async () => {
+    const { fetchImpl, calls } = stub({
+      'GET /api/v1/workspaces/a%20b/tasks': { status: 200, body: { tasks: [] } },
+    });
+    await new HubApiClient(target(fetchImpl)).listTasks('a b');
+    expect(calls[0]?.url).toBe('https://hub.example/api/v1/workspaces/a%20b/tasks');
+  });
+
+  it('sends task filters as query parameters', async () => {
+    const { fetchImpl, calls } = stub({
+      'GET /api/v1/workspaces/w1/tasks': { status: 200, body: { tasks: [] } },
+      'GET /api/v1/tasks': { status: 200, body: { tasks: [] } },
+    });
+    const client = new HubApiClient(target(fetchImpl));
+    await client.listTasks('w1', { status: 'todo', boxId: 'b1' });
+    expect(calls[0]?.url).toContain('status=todo');
+    expect(calls[0]?.url).toContain('boxId=b1');
+    await client.listAllTasks({ workspaceId: 'w1' });
+    expect(calls[1]?.url).toBe('https://hub.example/api/v1/tasks?workspaceId=w1');
+  });
+
+  it('assigns tasks with the target folded into the body', async () => {
+    const { fetchImpl, calls } = stub({
+      'POST /api/v1/workspaces/w1/tasks/assign': { status: 200, body: { tasks: [] } },
+    });
+    await new HubApiClient(target(fetchImpl)).assignTasks('w1', ['T-1', 'T-2'], { boxJobId: 'j1' });
+    expect(calls[0]?.body).toEqual({ ids: ['T-1', 'T-2'], boxJobId: 'j1' });
+  });
+
+  it('drives the manager routes', async () => {
+    const { fetchImpl, calls } = stub({
+      'POST /api/v1/workspaces/w1/manager/start': { status: 200, body: { status: 'running' } },
+      'POST /api/v1/workspaces/w1/manager/stop': { status: 200, body: { status: 'stopped' } },
+      'GET /api/v1/workspaces/w1/manager/sessions': {
+        status: 200,
+        body: { agent: 'claude', supported: true, sessions: [] },
+      },
+    });
+    const client = new HubApiClient(target(fetchImpl));
+    await client.startManager('w1', { agent: 'claude', sessionId: 's1' });
+    expect(calls[0]?.body).toEqual({ agent: 'claude', sessionId: 's1' });
+    await client.stopManager('w1');
+    await client.listManagerSessions('w1', 'codex');
+    expect(calls[2]?.url).toBe(
+      'https://hub.example/api/v1/workspaces/w1/manager/sessions?agent=codex',
+    );
+  });
+
+  it('maps a missing workspace to a not_found HubApiError', async () => {
+    const { fetchImpl } = stub({
+      'GET /api/v1/workspaces/gone': {
+        status: 404,
+        body: { error: { code: 'not_found', message: 'unknown workspace gone' } },
+      },
+    });
+    await expect(new HubApiClient(target(fetchImpl)).getWorkspace('gone')).rejects.toThrow(
+      HubApiError,
+    );
+  });
+});

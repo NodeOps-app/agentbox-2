@@ -1,5 +1,6 @@
 import { join } from 'node:path';
 import { STATE_DIR } from '@agentbox/sandbox-core';
+import type { AgentId } from '@agentbox/core';
 
 /** Root of the workspace registry: one directory per workspace, keyed by its id. */
 export const WORKSPACES_DIR = join(STATE_DIR, 'workspaces');
@@ -92,13 +93,16 @@ export interface TaskFile {
   tasks: WorkTask[];
 }
 
-export type ManagerAgent = 'claude' | 'codex' | 'opencode' | 'pi';
-
-export const MANAGER_AGENTS: readonly ManagerAgent[] = ['claude', 'codex', 'opencode', 'pi'];
+/**
+ * The agent a manager runs. Open (`AgentId`), not an enumeration: which agents
+ * exist is a runtime fact — `agentbox agent add` registers more — and the API's
+ * accept-list is the hub's request validator, not this type.
+ */
+export type ManagerAgent = AgentId;
 
 /** What was started, so a restart can reuse the same agent and session. */
 export interface ManagerRecord {
-  agent: ManagerAgent | 'custom';
+  agent: ManagerAgent;
   argv: string[];
   cwd: string;
   sessionId?: string;
@@ -120,7 +124,7 @@ export interface ManagerView {
   tmuxSession: string;
   /** Ready-to-run attach command, so a GUI can show it without knowing tmux. */
   attachCommand: string;
-  agent?: ManagerAgent | 'custom';
+  agent?: ManagerAgent;
   argv?: string[];
   cwd?: string;
   sessionId?: string;
