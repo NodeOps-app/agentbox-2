@@ -1,7 +1,35 @@
 // Box view model — normalized shape the UI renders, produced by
 // lib/boxes/source.ts from the host's ~/.agentbox state (state.json + statuses).
 import type { AgentId, AgentMode } from '@agentbox/core';
+import type {
+  BoxTaskSummary,
+  HostSession,
+  ManagerStatus,
+  ManagerView,
+  Workspace,
+  WorkTask,
+  WorkTaskStatus,
+} from '@agentbox/relay';
 import type { AuthMode } from '@/lib/auth-config';
+
+// The workspace domain's wire types are the store's own — re-exported here so
+// UI/route code imports one place and @agentbox/relay stays a type-only edge.
+export type {
+  BoxTaskSummary,
+  HostSession,
+  ManagerStatus,
+  ManagerView,
+  Workspace,
+  WorkTask,
+  WorkTaskStatus,
+};
+
+/** A workspace as the API serves it: the record plus its derived counts. */
+export interface WorkspaceView extends Workspace {
+  taskCounts: { open: number; done: number };
+  /** null when no manager was ever started here (the UI's empty state). */
+  manager: { status: ManagerStatus; agent?: string } | null;
+}
 
 export type BoxStatus = 'running' | 'paused' | 'stopped' | 'creating' | 'error';
 
@@ -61,6 +89,11 @@ export interface Box {
   // `undefined` is NOT false: the hosted/Postgres source and synthetic job rows
   // say nothing, and a client must treat silence as "show", never as "hide".
   hasGit?: boolean;
+  // Roll-up of the workspace tasks assigned to this box, so a list row can show
+  // "3 / 4" and what the box is on without a second request. Absent when the box
+  // has no tasks AND on the hosted/Postgres path (which holds no workspaces) —
+  // like `hasGit`, silence means "no data", never "zero tasks".
+  tasks?: BoxTaskSummary;
   // The box's agent declares a state backup (`AgentSyncSpec.stateBackup`), so
   // `POST /boxes/{id}/backup` captures its IDENTITY and not merely a workspace.
   // True for a service bot (openclaw); absent for a coding-agent box, whose
@@ -117,6 +150,11 @@ export interface Project {
   name: string;
   repo: string;
   defaultBranch: string;
+  /**
+   * The workspace this project was discovered under, when one lists it. Lets a
+   * client group projects by workspace without fetching the workspace listing.
+   */
+  workspaceId?: string;
   /**
    * The host repo's currently checked-out branch (`git rev-parse --abbrev-ref HEAD`),
    * i.e. the base a new box would fork from. `null` when detached, unavailable, or on
@@ -362,6 +400,8 @@ export interface HubState {
   user: User;
   github: GithubState;
   projects: Project[];
+  /** Registered workspaces. Empty on the hosted/Postgres path (host state only). */
+  workspaces: WorkspaceView[];
   boxes: Box[];
   approvals: Approval[];
   providers: ProviderOption[];

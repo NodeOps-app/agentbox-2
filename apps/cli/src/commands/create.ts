@@ -46,6 +46,7 @@ import { withHubClient } from '../control-plane/with-hub.js';
 import { dockerProviderRefusal, remoteHubConfigured } from '../control-plane/remote-hub.js';
 import { attachRelayOptions } from '../control-plane/box-plane.js';
 import { resolveBoxOrExit } from '../box-ref.js';
+import { assignTasksBestEffort, parseTaskIdsOrExit, preflightOrExit } from '../lib/tasks-assign.js';
 import {
   assertSourceBoxNotRunning,
   resolveRestoreRequest,
@@ -57,6 +58,8 @@ import {
 interface CreateOptions {
   workspace: string;
   name?: string;
+  /** --tasks T-1,T-2: assign these workspace tasks to the box being created. */
+  tasks?: string;
   /** Override the sandbox backend. Resolved via the provider registry. */
   provider?: string;
   hostSnapshot?: boolean; // commander: --host-snapshot / --no-host-snapshot => true / false / undefined
@@ -291,6 +294,10 @@ export const createCommand = new Command('create')
   )
   .option('-w, --workspace <path>', 'host workspace to mount', process.cwd())
   .option('-n, --name <name>', 'friendly box name (default: <workspace-basename>-<id>)')
+  .option(
+    '--tasks <ids>',
+    'comma-separated workspace task ids to assign to this box (e.g. T-11,T-12)',
+  )
   .option(
     '--provider <name>',
     "sandbox backend: docker (default), daytona, hetzner, digitalocean, vercel, e2b, remote-docker. `docker:<host>` runs the box on that machine's docker engine over SSH.",
@@ -778,7 +785,12 @@ export const createCommand = new Command('create')
     s.start('creating box');
     // `agentbox create` builds a PLAIN box (no agent). The worker seeds the box
     // from the local workspace tree, so untracked/.env arrive as they always did.
+    const taskIds = opts.tasks ? parseTaskIdsOrExit(opts.tasks) : [];
     const outcome = await withHubClient({ preferLocal: true }, async (client) => {
+      // Validate the task ids BEFORE anything is provisioned: a typo should cost
+      // nothing, not leave a box nobody wanted.
+      const taskWorkspace =
+        taskIds.length > 0 ? await preflightOrExit(client, projectRoot, taskIds) : null;
       const { jobId } = await client.createBox({
         projectId: hashProjectPath(projectRoot),
         provider: opts.provider ?? providerName,
@@ -820,6 +832,10 @@ export const createCommand = new Command('create')
         },
       });
       cmdLog.write(`enqueued: job ${jobId}`);
+      // The box does not exist yet; the hub promotes this job id to the box id
+      // once the worker records it.
+      if (taskWorkspace)
+        await assignTasksBestEffort(client, taskWorkspace, taskIds, { boxJobId: jobId });
       return await streamJobToCompletion(client, jobId, {
         onLine: (line) => {
           s.message(line);

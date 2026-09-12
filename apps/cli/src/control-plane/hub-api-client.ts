@@ -418,6 +418,105 @@ export interface HubApiHealth {
  * own on `GET /api/v1/health` (`apiVersion`); a hub outside this set is refused up
  * front with an upgrade hint rather than failing on a missing/changed field later.
  */
+// ── workspaces / tasks / manager ──
+
+/** A folder on the hub host grouping one or more projects (`GET /workspaces`). */
+export interface HubApiWorkspace {
+  id: string;
+  name: string;
+  root: string;
+  projectIds: string[];
+  taskCounts?: { open: number; done: number };
+  manager?: { status: string; agent?: string } | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type HubApiTaskStatus = 'todo' | 'in_progress' | 'blocked' | 'done';
+
+/** A unit of work. Many tasks map to one box (`GET /workspaces/:id/tasks`). */
+export interface HubApiTask {
+  id: string;
+  workspaceId: string;
+  projectId?: string;
+  title: string;
+  description?: string;
+  status: HubApiTaskStatus;
+  order: number;
+  boxId?: string;
+  boxJobId?: string;
+  dependsOn?: string[];
+  createdBy: 'human' | 'manager' | 'api';
+  externalRef?: { kind: string; id: string; url?: string };
+  createdAt: string;
+  updatedAt: string;
+  doneAt?: string;
+}
+
+export interface HubApiTaskCreate {
+  title: string;
+  description?: string;
+  projectId?: string;
+  dependsOn?: string[];
+  createdBy?: 'human' | 'manager' | 'api';
+  boxId?: string;
+  boxJobId?: string;
+}
+
+export interface HubApiTaskUpdate {
+  title?: string;
+  description?: string;
+  status?: HubApiTaskStatus;
+  /** `null` clears the project scope. */
+  projectId?: string | null;
+  dependsOn?: string[];
+}
+
+/** A box that exists, or the create job that will become one. */
+export type HubApiAssignTarget = { boxId: string } | { boxJobId: string };
+
+export interface HubApiManager {
+  workspaceId: string;
+  status: 'running' | 'stopped' | 'never';
+  tmuxSession: string;
+  /** Ready-to-run tmux attach command for this manager's session. */
+  attachCommand: string;
+  agent?: string;
+  argv?: string[];
+  cwd?: string;
+  sessionId?: string;
+  startedAt?: string;
+  stoppedAt?: string;
+  lastExit?: number;
+}
+
+export interface HubApiManagerStart {
+  agent: string;
+  sessionId?: string;
+  restart?: boolean;
+}
+
+export interface HubApiHostSession {
+  id: string;
+  agent: string;
+  title: string;
+  updatedAt: string;
+}
+
+export interface HubApiManagerSessions {
+  agent: string;
+  /** False when this agent's session format is not one the hub can resume. */
+  supported: boolean;
+  sessions: HubApiHostSession[];
+}
+
+export interface HubApiTaskFilter {
+  workspaceId?: string;
+  projectId?: string;
+  boxId?: string;
+  status?: HubApiTaskStatus;
+}
+
 export const SUPPORTED_HUB_API_VERSIONS = ['v1'] as const;
 
 export interface HubApiTarget {
@@ -984,6 +1083,146 @@ export class HubApiClient {
     }
     return { status };
   }
+
+  // ── workspaces / tasks / manager ──
+
+  /** Workspaces the hub has registered. Empty on a hosted hub (host state only). */
+  async listWorkspaces(): Promise<HubApiWorkspace[]> {
+    return (await this.request<{ workspaces: HubApiWorkspace[] }>('GET', '/workspaces')).workspaces;
+  }
+
+  getWorkspace(id: string): Promise<HubApiWorkspace> {
+    return this.request<HubApiWorkspace>('GET', `/workspaces/${encodeURIComponent(id)}`);
+  }
+
+  /**
+   * Register a folder ON THE HUB'S MACHINE as a workspace. The path is resolved
+   * and scanned there, so a remote hub registers ITS folder, not the caller's.
+   */
+  addWorkspace(body: { path: string; name?: string }): Promise<HubApiWorkspace> {
+    return this.request<HubApiWorkspace>('POST', '/workspaces', body);
+  }
+
+  async removeWorkspace(id: string): Promise<void> {
+    await this.request<{ ok: true }>('DELETE', `/workspaces/${encodeURIComponent(id)}`);
+  }
+
+  renameWorkspace(id: string, name: string): Promise<HubApiWorkspace> {
+    return this.request<HubApiWorkspace>('POST', `/workspaces/${encodeURIComponent(id)}/rename`, {
+      name,
+    });
+  }
+
+  rescanWorkspace(id: string): Promise<HubApiWorkspace> {
+    return this.request<HubApiWorkspace>('POST', `/workspaces/${encodeURIComponent(id)}/rescan`);
+  }
+
+  async listTasks(wsId: string, filter: HubApiTaskFilter = {}): Promise<HubApiTask[]> {
+    const q = taskQuery(filter);
+    const suffix = q ? `?${q}` : '';
+    const path = `/workspaces/${encodeURIComponent(wsId)}/tasks${suffix}`;
+    return (await this.request<{ tasks: HubApiTask[] }>('GET', path)).tasks;
+  }
+
+  /** Tasks across every workspace — "what is assigned to this box" without knowing its workspace. */
+  async listAllTasks(filter: HubApiTaskFilter = {}): Promise<HubApiTask[]> {
+    const q = taskQuery(filter);
+    return (await this.request<{ tasks: HubApiTask[] }>('GET', `/tasks${q ? `?${q}` : ''}`)).tasks;
+  }
+
+  getTask(wsId: string, taskId: string): Promise<HubApiTask> {
+    return this.request<HubApiTask>(
+      'GET',
+      `/workspaces/${encodeURIComponent(wsId)}/tasks/${encodeURIComponent(taskId)}`,
+    );
+  }
+
+  addTask(wsId: string, body: HubApiTaskCreate): Promise<HubApiTask> {
+    return this.request<HubApiTask>('POST', `/workspaces/${encodeURIComponent(wsId)}/tasks`, body);
+  }
+
+  updateTask(wsId: string, taskId: string, body: HubApiTaskUpdate): Promise<HubApiTask> {
+    return this.request<HubApiTask>(
+      'POST',
+      `/workspaces/${encodeURIComponent(wsId)}/tasks/${encodeURIComponent(taskId)}`,
+      body,
+    );
+  }
+
+  completeTask(wsId: string, taskId: string): Promise<HubApiTask> {
+    return this.request<HubApiTask>(
+      'POST',
+      `/workspaces/${encodeURIComponent(wsId)}/tasks/${encodeURIComponent(taskId)}/done`,
+    );
+  }
+
+  async removeTask(wsId: string, taskId: string): Promise<void> {
+    await this.request<{ ok: true }>(
+      'DELETE',
+      `/workspaces/${encodeURIComponent(wsId)}/tasks/${encodeURIComponent(taskId)}`,
+    );
+  }
+
+  /** Point tasks at a box (or the create job that will become one). */
+  async assignTasks(
+    wsId: string,
+    ids: string[],
+    target: HubApiAssignTarget,
+  ): Promise<HubApiTask[]> {
+    const path = `/workspaces/${encodeURIComponent(wsId)}/tasks/assign`;
+    return (await this.request<{ tasks: HubApiTask[] }>('POST', path, { ids, ...target })).tasks;
+  }
+
+  unassignTask(wsId: string, taskId: string): Promise<HubApiTask> {
+    return this.request<HubApiTask>(
+      'POST',
+      `/workspaces/${encodeURIComponent(wsId)}/tasks/${encodeURIComponent(taskId)}/unassign`,
+    );
+  }
+
+  /** `ids` must be an exact permutation of the workspace's tasks. */
+  async reorderTasks(wsId: string, ids: string[]): Promise<HubApiTask[]> {
+    const path = `/workspaces/${encodeURIComponent(wsId)}/tasks/reorder`;
+    return (await this.request<{ tasks: HubApiTask[] }>('POST', path, { ids })).tasks;
+  }
+
+  getManager(wsId: string): Promise<HubApiManager> {
+    return this.request<HubApiManager>('GET', `/workspaces/${encodeURIComponent(wsId)}/manager`);
+  }
+
+  /** Start the manager agent in a tmux session ON THE HUB'S machine. */
+  startManager(wsId: string, body: HubApiManagerStart): Promise<HubApiManager> {
+    return this.request<HubApiManager>(
+      'POST',
+      `/workspaces/${encodeURIComponent(wsId)}/manager/start`,
+      body,
+    );
+  }
+
+  stopManager(wsId: string): Promise<HubApiManager> {
+    return this.request<HubApiManager>(
+      'POST',
+      `/workspaces/${encodeURIComponent(wsId)}/manager/stop`,
+    );
+  }
+
+  listManagerSessions(wsId: string, agent?: string): Promise<HubApiManagerSessions> {
+    const q = agent ? `?agent=${encodeURIComponent(agent)}` : '';
+    return this.request<HubApiManagerSessions>(
+      'GET',
+      `/workspaces/${encodeURIComponent(wsId)}/manager/sessions${q}`,
+    );
+  }
+}
+
+/** Shared task filter query string (`?status=&projectId=&boxId=&workspaceId=`). */
+function taskQuery(filter: HubApiTaskFilter): string {
+  const q = new URLSearchParams();
+  if (filter.workspaceId) q.set('workspaceId', filter.workspaceId);
+  if (filter.projectId) q.set('projectId', filter.projectId);
+  if (filter.boxId) q.set('boxId', filter.boxId);
+  if (filter.status) q.set('status', filter.status);
+  return q.toString();
 }
 
 /** Build the shared `/boxes/:id/logs` query string (service/tail/daemon/follow). */

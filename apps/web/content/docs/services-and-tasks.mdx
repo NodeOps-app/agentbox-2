@@ -3,6 +3,13 @@ title: Services & tasks
 description: Declare dev servers and setup steps in agentbox.yaml and let the supervisor run them
 ---
 
+<Callout title="Two things called tasks">
+  The **setup tasks** on this page are commands the in-box supervisor runs — `pnpm install`, a
+  migration, a build. They are not the work items in [Workspaces &amp;
+  tasks](/docs/cli#workspaces--tasks), which are what you and a manager agent plan and assign to
+  boxes.
+</Callout>
+
 Every box ships with `agentbox-ctl`, a small supervisor that reads `/workspace/agentbox.yaml` and keeps your declared **services** alive while running your one-shot **tasks** to completion. It starts automatically on `agentbox create` and `agentbox start`, so your dev server and setup steps are up before the agent starts work. See [core concepts](/docs/core-concepts) for how the box and supervisor fit together.
 
 ## agentbox.yaml

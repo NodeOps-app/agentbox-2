@@ -913,3 +913,282 @@ export async function readJson(req: Request): Promise<Parsed<unknown>> {
     return { ok: false, message: 'body is not valid JSON' };
   }
 }
+
+// ── workspaces / tasks / manager ──
+
+export const TASK_STATUSES = ['todo', 'in_progress', 'blocked', 'done'] as const;
+export type TaskStatusValue = (typeof TASK_STATUSES)[number];
+
+/** Task ids are minted server-side as `T-<n>`; a client only ever echoes one back. */
+export const TASK_ID_RE = /^T-\d+$/;
+
+// Mirrors MANAGER_AGENTS in @agentbox/relay, hardcoded here for the same reason
+// AGENTS/PROVIDERS above are: importing @agentbox/* would pull it into the Next
+// bundle.
+export const MANAGER_AGENT_NAMES = ['claude', 'codex', 'opencode', 'pi'] as const;
+
+export function isTaskStatus(v: unknown): v is TaskStatusValue {
+  return typeof v === 'string' && (TASK_STATUSES as readonly string[]).includes(v);
+}
+
+export interface WorkspaceAddInput {
+  path: string;
+  name?: string;
+}
+
+export function parseWorkspaceAdd(body: unknown): Parsed<WorkspaceAddInput> {
+  if (!isObject(body)) return { ok: false, message: 'body must be a JSON object' };
+  const { path, name } = body;
+  if (typeof path !== 'string' || path.length === 0) {
+    return { ok: false, message: 'path is required (absolute path on the hub host)' };
+  }
+  if (!path.startsWith('/')) return { ok: false, message: 'path must be absolute' };
+  const parsedName = optionalString(name, 'name');
+  if (!parsedName.ok) return parsedName;
+  if (parsedName.value !== undefined && parsedName.value.trim().length === 0) {
+    return { ok: false, message: 'name must not be empty' };
+  }
+  if ((parsedName.value?.length ?? 0) > 60) {
+    return { ok: false, message: 'name too long (max 60 chars)' };
+  }
+  return { ok: true, value: { path, ...(parsedName.value ? { name: parsedName.value } : {}) } };
+}
+
+export function parseWorkspaceRename(body: unknown): Parsed<{ name: string }> {
+  if (!isObject(body)) return { ok: false, message: 'body must be a JSON object' };
+  const { name } = body;
+  if (typeof name !== 'string' || name.trim().length === 0) {
+    return { ok: false, message: 'name is required (non-empty string)' };
+  }
+  if (name.length > 60) return { ok: false, message: 'name too long (max 60 chars)' };
+  return { ok: true, value: { name } };
+}
+
+function parseExternalRef(
+  v: unknown,
+): Parsed<{ kind: string; id: string; url?: string } | undefined> {
+  if (v === undefined) return { ok: true, value: undefined };
+  if (!isObject(v)) return { ok: false, message: 'externalRef must be an object' };
+  const { kind, id, url } = v;
+  if (typeof kind !== 'string' || kind.length === 0) {
+    return { ok: false, message: 'externalRef.kind is required (string)' };
+  }
+  if (typeof id !== 'string' || id.length === 0) {
+    return { ok: false, message: 'externalRef.id is required (string)' };
+  }
+  const parsedUrl = optionalString(url, 'externalRef.url');
+  if (!parsedUrl.ok) return parsedUrl;
+  return { ok: true, value: { kind, id, ...(parsedUrl.value ? { url: parsedUrl.value } : {}) } };
+}
+
+function parseTaskIdArray(v: unknown, field: string): Parsed<string[]> {
+  if (!Array.isArray(v) || v.length === 0) {
+    return { ok: false, message: `${field} is required (non-empty array of task ids)` };
+  }
+  for (const el of v) {
+    if (typeof el !== 'string' || !TASK_ID_RE.test(el)) {
+      return { ok: false, message: `${field} entries must be task ids like T-1` };
+    }
+  }
+  return { ok: true, value: v as string[] };
+}
+
+export interface TaskCreateInput {
+  title: string;
+  description?: string;
+  projectId?: string;
+  dependsOn?: string[];
+  createdBy?: 'human' | 'manager' | 'api';
+  externalRef?: { kind: string; id: string; url?: string };
+  boxId?: string;
+  boxJobId?: string;
+}
+
+export function parseTaskCreate(body: unknown): Parsed<TaskCreateInput> {
+  if (!isObject(body)) return { ok: false, message: 'body must be a JSON object' };
+  const { title, description, projectId, dependsOn, createdBy, externalRef, boxId, boxJobId } =
+    body;
+  if (typeof title !== 'string' || title.trim().length === 0) {
+    return { ok: false, message: 'title is required (non-empty string)' };
+  }
+  if (title.length > 300) return { ok: false, message: 'title too long (max 300 chars)' };
+  const parsedDesc = optionalString(description, 'description');
+  if (!parsedDesc.ok) return parsedDesc;
+  const parsedProject = optionalString(projectId, 'projectId');
+  if (!parsedProject.ok) return parsedProject;
+  const parsedRef = parseExternalRef(externalRef);
+  if (!parsedRef.ok) return parsedRef;
+  const parsedBox = optionalString(boxId, 'boxId');
+  if (!parsedBox.ok) return parsedBox;
+  const parsedJob = optionalString(boxJobId, 'boxJobId');
+  if (!parsedJob.ok) return parsedJob;
+  // A task is worked in ONE place; sending both leaves the reconciler to pick,
+  // and it would pick the box — silently dropping the caller's job assignment.
+  if (parsedBox.value && parsedJob.value) {
+    return { ok: false, message: 'send either boxId or boxJobId, not both' };
+  }
+  if (
+    createdBy !== undefined &&
+    createdBy !== 'human' &&
+    createdBy !== 'manager' &&
+    createdBy !== 'api'
+  ) {
+    return { ok: false, message: 'createdBy must be one of human, manager, api' };
+  }
+  let deps: string[] | undefined;
+  if (dependsOn !== undefined) {
+    const parsedDeps = parseTaskIdArray(dependsOn, 'dependsOn');
+    if (!parsedDeps.ok) return parsedDeps;
+    deps = parsedDeps.value;
+  }
+  return {
+    ok: true,
+    value: {
+      title: title.trim(),
+      ...(parsedDesc.value ? { description: parsedDesc.value } : {}),
+      ...(parsedProject.value ? { projectId: parsedProject.value } : {}),
+      ...(deps ? { dependsOn: deps } : {}),
+      ...(createdBy ? { createdBy } : {}),
+      ...(parsedRef.value ? { externalRef: parsedRef.value } : {}),
+      ...(parsedBox.value ? { boxId: parsedBox.value } : {}),
+      ...(parsedJob.value ? { boxJobId: parsedJob.value } : {}),
+    },
+  };
+}
+
+export interface TaskUpdateInput {
+  title?: string;
+  description?: string;
+  status?: TaskStatusValue;
+  projectId?: string | null;
+  dependsOn?: string[];
+  externalRef?: { kind: string; id: string; url?: string };
+}
+
+export function parseTaskUpdate(body: unknown): Parsed<TaskUpdateInput> {
+  if (!isObject(body)) return { ok: false, message: 'body must be a JSON object' };
+  const { title, description, status, projectId, dependsOn, externalRef } = body;
+  const out: TaskUpdateInput = {};
+  if (title !== undefined) {
+    if (typeof title !== 'string' || title.trim().length === 0) {
+      return { ok: false, message: 'title must be a non-empty string' };
+    }
+    if (title.length > 300) return { ok: false, message: 'title too long (max 300 chars)' };
+    out.title = title.trim();
+  }
+  const parsedDesc = optionalString(description, 'description');
+  if (!parsedDesc.ok) return parsedDesc;
+  if (parsedDesc.value !== undefined) out.description = parsedDesc.value;
+  if (status !== undefined) {
+    if (!isTaskStatus(status)) {
+      return { ok: false, message: `status must be one of ${TASK_STATUSES.join(', ')}` };
+    }
+    out.status = status;
+  }
+  // `null` clears the project scope; omitted leaves it alone.
+  if (projectId !== undefined) {
+    if (projectId !== null && typeof projectId !== 'string') {
+      return { ok: false, message: 'projectId must be a string or null' };
+    }
+    out.projectId = projectId;
+  }
+  if (dependsOn !== undefined) {
+    if (Array.isArray(dependsOn) && dependsOn.length === 0) out.dependsOn = [];
+    else {
+      const parsedDeps = parseTaskIdArray(dependsOn, 'dependsOn');
+      if (!parsedDeps.ok) return parsedDeps;
+      out.dependsOn = parsedDeps.value;
+    }
+  }
+  const parsedRef = parseExternalRef(externalRef);
+  if (!parsedRef.ok) return parsedRef;
+  if (parsedRef.value) out.externalRef = parsedRef.value;
+  if (Object.keys(out).length === 0) {
+    return { ok: false, message: 'no updatable field in body' };
+  }
+  return { ok: true, value: out };
+}
+
+export interface TaskAssignInput {
+  /** Absent on the single-task route, where the id is in the path. */
+  ids?: string[];
+  boxId?: string;
+  boxJobId?: string;
+}
+
+export function parseTaskAssign(
+  body: unknown,
+  opts: { requireIds?: boolean } = {},
+): Parsed<TaskAssignInput> {
+  if (!isObject(body)) return { ok: false, message: 'body must be a JSON object' };
+  const { ids, boxId, boxJobId } = body;
+  let parsedIds: string[] | undefined;
+  if (opts.requireIds || ids !== undefined) {
+    const parsed = parseTaskIdArray(ids, 'ids');
+    if (!parsed.ok) return parsed;
+    parsedIds = parsed.value;
+  }
+  const parsedBox = optionalString(boxId, 'boxId');
+  if (!parsedBox.ok) return parsedBox;
+  const parsedJob = optionalString(boxJobId, 'boxJobId');
+  if (!parsedJob.ok) return parsedJob;
+  if (!parsedBox.value && !parsedJob.value) {
+    return { ok: false, message: 'boxId or boxJobId is required' };
+  }
+  if (parsedBox.value && parsedJob.value) {
+    return { ok: false, message: 'send either boxId or boxJobId, not both' };
+  }
+  return {
+    ok: true,
+    value: {
+      ...(parsedIds ? { ids: parsedIds } : {}),
+      ...(parsedBox.value ? { boxId: parsedBox.value } : {}),
+      ...(parsedJob.value ? { boxJobId: parsedJob.value } : {}),
+    },
+  };
+}
+
+export function parseTaskReorder(body: unknown): Parsed<{ ids: string[] }> {
+  if (!isObject(body)) return { ok: false, message: 'body must be a JSON object' };
+  const parsed = parseTaskIdArray(body['ids'], 'ids');
+  if (!parsed.ok) return parsed;
+  return { ok: true, value: { ids: parsed.value } };
+}
+
+export interface ManagerStartInput {
+  agent: string;
+  sessionId?: string;
+  restart?: boolean;
+}
+
+/**
+ * `allowedAgents` is the accept-list for `agent`, defaulting to the built-ins so
+ * this stays a pure, import-free function; the route passes the live registry ids.
+ *
+ * There is deliberately NO free-form `argv`: the manager runs as a login-shell
+ * command on the HUB'S OWN machine, so accepting one would turn an API token into
+ * a shell on the control box — every other exec this API exposes runs inside a
+ * box. An agent the hub already knows is the only thing it will start.
+ */
+export function parseManagerStart(
+  body: unknown,
+  allowedAgents: readonly string[] = MANAGER_AGENT_NAMES,
+): Parsed<ManagerStartInput> {
+  if (!isObject(body)) return { ok: false, message: 'body must be a JSON object' };
+  const { agent, sessionId, restart } = body;
+  if (typeof agent !== 'string' || !allowedAgents.includes(agent)) {
+    return { ok: false, message: `agent must be one of ${allowedAgents.join(', ')}` };
+  }
+  const parsedSession = optionalString(sessionId, 'sessionId');
+  if (!parsedSession.ok) return parsedSession;
+  const parsedRestart = optionalBool(restart, 'restart');
+  if (!parsedRestart.ok) return parsedRestart;
+  return {
+    ok: true,
+    value: {
+      agent,
+      ...(parsedSession.value ? { sessionId: parsedSession.value } : {}),
+      ...(parsedRestart.value !== undefined ? { restart: parsedRestart.value } : {}),
+    },
+  };
+}
