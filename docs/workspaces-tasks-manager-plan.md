@@ -57,6 +57,14 @@ the manager's own instructions come after.
 - **The manager has no instructions yet.** Phase 1 starts a plain agent in the folder with
   `AGENTBOX_WORKSPACE` set and the `agentbox tasks` CLI available. What it should *do* with them (the
   file-overlap grouping, the `box.merged` follow-up) is Phase 4.
+- **A codex store holds more than sessions.** Its rollouts are flat across every project, so the
+  folder comes out of each file's opening record — which also marks the agent's own internal threads
+  (`guardian_review`, `subagent`). Those are skipped, as claude's `agent-*.jsonl` transcripts are: on
+  a real store they were 49 of 71 files, none with a turn to name them. That opening record can also
+  outgrow any fixed head read, so it is read by following the line rather than a buffer, and the
+  title is scraped after it. Candidates are ranked by mtime before the read budget applies, because
+  a resumed session keeps appending to its original file and a name-ordered cut would drop exactly
+  the ones still in use.
 - **Only claude and codex can resume a session.** Each has its own spelling — `claude --resume <id>`
   against `~/.claude/projects/<encoded-root>/<id>.jsonl`, and the SUBCOMMAND `codex resume <id>`
   against the flat `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` store, which records the folder
@@ -111,11 +119,17 @@ absence means "no data", never "zero":
   synthetic `job:<id>` row shows its tasks while the box is still being built).
 
 `POST …/manager/start` takes its accept-list from the live agent registry, minus the agents whose
-`surface` is `service`. Anything a picker offers can therefore be a manager, including one added by
-`agentbox agent add`, while a daemon-shaped agent is refused: it has no session to attach to, so it
-would leave a tmux session nobody can use. There is deliberately no free-form `argv` — the manager
-runs on the hub's own machine, so accepting one would turn an API token into a shell on a control
-box.
+`surface` is `service` and those the host reports as not installed. Anything a picker offers can
+therefore be a manager, including one added by `agentbox agent add`, while a daemon-shaped agent is
+refused (it has no session to attach to, so it would leave a tmux session nobody can use) and so is
+one the host cannot run — unlike a box, which installs its agent on demand, the manager runs where
+nothing will, and without that check the start answers 200 and the session dies with exit 127.
+
+There is deliberately no free-form `argv` — the manager runs on the hub's own machine, so accepting
+one would turn an API token into a shell on a control box. `sessionId` is constrained to an id shape
+for the same reason: it lands in the agent's argv, and a value like `--dangerously-skip-permissions`
+would be read by the AGENT as a flag, starting the manager with its approval gate off. Shell quoting
+does not cover that; only the shape check does.
 
 ## Phase 3 — the CLI
 
