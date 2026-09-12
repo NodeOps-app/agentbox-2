@@ -110,6 +110,13 @@ absence means "no data", never "zero":
 - `Box.tasks` — `{ total, done, current }`, matched by box id and by pending create-job id (so a
   synthetic `job:<id>` row shows its tasks while the box is still being built).
 
+`POST …/manager/start` takes its accept-list from the live agent registry, minus the agents whose
+`surface` is `service`. Anything a picker offers can therefore be a manager, including one added by
+`agentbox agent add`, while a daemon-shaped agent is refused: it has no session to attach to, so it
+would leave a tmux session nobody can use. There is deliberately no free-form `argv` — the manager
+runs on the hub's own machine, so accepting one would turn an API token into a shell on a control
+box.
+
 ## Phase 3 — the CLI
 
 Three thin clients over the API. Which workspace a command means resolves `--workspace`, then
