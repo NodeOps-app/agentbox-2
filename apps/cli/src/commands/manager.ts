@@ -68,7 +68,9 @@ function ago(iso: string): string {
 }
 
 /** Attach to the manager's tmux session in this terminal (or a new pane). */
-function attachToSession(m: HubApiManager, openIn?: AttachOpenIn): boolean {
+async function attachToSession(m: HubApiManager, openIn?: AttachOpenIn): Promise<boolean> {
+  // `=` is tmux's exact-match prefix: without it a session whose name merely
+  // starts with this one would match.
   const target = `=${m.tmuxSession}`;
   if (openIn && openIn !== 'same') {
     const host = detectHostTerminal();
@@ -76,13 +78,18 @@ function attachToSession(m: HubApiManager, openIn?: AttachOpenIn): boolean {
       log.error('--attach-in needs a supported terminal (tmux, cmux, herdr, iTerm2).');
       return false;
     }
-    void spawnInNewTerminal({
+    const spawned = await spawnInNewTerminal({
       host,
       mode: openIn,
       argv: ['tmux', 'attach-session', '-t', target],
       cwd: m.cwd ?? process.cwd(),
       title: 'manager',
     });
+    if (!spawned.launched) {
+      log.error(spawned.error ?? `could not open a new ${host} ${openIn}`);
+      return false;
+    }
+    log.success(spawned.note || `attached in a new ${host} ${openIn}`);
     return true;
   }
   // Inside tmux already: `attach` would refuse to nest, so switch the client.
@@ -164,7 +171,7 @@ const startCommand = new Command('start')
           ...(opts.restart ? { restart: true } : {}),
         });
         printManager(manager);
-        if (opts.attach) attachToSession(manager);
+        if (opts.attach && !(await attachToSession(manager))) process.exit(1);
       });
     },
   );
@@ -200,7 +207,7 @@ const attachCommand = new Command('attach')
         log.error(`--attach-in must be one of split, window, tab`);
         process.exit(4);
       }
-      if (!attachToSession(manager, mode)) process.exit(1);
+      if (!(await attachToSession(manager, mode))) process.exit(1);
     });
   });
 
