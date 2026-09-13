@@ -46,7 +46,8 @@ const MAX_PARENT_HOPS = 20;
 const PS_BUDGET_MS = 1000;
 
 export interface HostSessionHint {
-  agent: 'claude' | 'codex';
+  /** claude or codex today: the only agents that export a session id. */
+  agent: AgentId;
   sessionId: string;
   /** The folder the session runs in — where `--resume` finds its transcript. */
   cwd: string;

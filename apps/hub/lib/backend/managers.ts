@@ -36,6 +36,7 @@ import {
   type WorkspaceRecord,
 } from '@agentbox/relay';
 import { reconcileContext, type BackendDeps } from './deps';
+import { TMUX_MISSING } from './errors';
 import type {
   ActionResult,
   DetectManagerInput,
@@ -47,9 +48,6 @@ import type {
   StartManagerInput,
 } from '../boxes/backend-types';
 import type { ManagerView, WorkspaceView } from '../boxes/types';
-
-export const TMUX_MISSING =
-  'tmux is not installed on the hub host; a hub-run manager lives in a tmux session (brew install tmux)';
 
 function err(message: string): { ok: false; error: string } {
   return { ok: false, error: message };

@@ -4,7 +4,7 @@
 // can attach to. 409 while the session still runs anywhere; 503 without tmux.
 import { backendOrNull } from '../../../lib/backend';
 import { fail, failFromAction, ok } from '../../../lib/envelope';
-import { TMUX_MISSING } from '@/lib/backend/managers';
+import { TMUX_MISSING } from '@/lib/backend/errors';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';

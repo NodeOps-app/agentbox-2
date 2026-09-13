@@ -6,7 +6,7 @@
 import { backendOrNull } from '../../../../lib/backend';
 import { fail, failFromAction, ok } from '../../../../lib/envelope';
 import { MANAGER_AGENT_NAMES, parseManagerStart, readJson } from '../../../../lib/validate';
-import { TMUX_MISSING } from '@/lib/backend/managers';
+import { TMUX_MISSING } from '@/lib/backend/errors';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
