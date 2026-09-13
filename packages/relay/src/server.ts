@@ -1,3 +1,4 @@
+import { recordBoxGhResult, recordBoxGitPush } from './timeline-hooks.js';
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
@@ -1086,6 +1087,22 @@ export function createRelayServer(opts: RelayServerOptions): RelayServerHandle {
           body.method,
           body.params as GitRpcParams | undefined,
         );
+        if (body.method === 'git.push' && result.exitCode === 0) {
+          const pushParams = body.params as GitRpcParams | undefined;
+          const pushTree = resolveWorktree(reg, pushParams?.path ?? '/workspace');
+          if (pushTree) {
+            void recordBoxGitPush(
+              {
+                boxId: reg.boxId,
+                boxName: reg.name,
+                hostPath: pushTree.hostMainRepo,
+                branch: pushTree.sanctionedBranch ?? pushTree.branch,
+              },
+              pushParams,
+              result,
+            );
+          }
+        }
         const status = result.exitCode === 0 ? 200 : 500;
         send(res, status, result);
         return;
@@ -1294,13 +1311,31 @@ export function createRelayServer(opts: RelayServerOptions): RelayServerHandle {
         return;
       }
       if (body.method === 'gh.exec') {
+        const ghParams = body.params as GhExecRpcParams | undefined;
         const result = await handleGhExecRpc(
           reg,
-          body.params as GhExecRpcParams | undefined,
+          ghParams,
           prompts,
           subscribers,
           hostInitiatedTokens,
         );
+        const ghTree =
+          result.exitCode === 0 ? resolveWorktree(reg, ghParams?.path ?? '/workspace') : undefined;
+        if (ghTree) {
+          void recordBoxGhResult(
+            {
+              boxId: reg.boxId,
+              boxName: reg.name,
+              hostPath: ghTree.hostMainRepo,
+              branch: ghTree.sanctionedBranch ?? ghTree.branch,
+              ...(reg.originUrl ? { originUrl: reg.originUrl } : {}),
+            },
+            Array.isArray(ghParams?.args)
+              ? ghParams.args.filter((a): a is string => typeof a === 'string')
+              : [],
+            result,
+          );
+        }
         const status = result.exitCode === 0 ? 200 : 500;
         send(res, status, result);
         return;

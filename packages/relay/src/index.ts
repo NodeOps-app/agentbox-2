@@ -321,3 +321,10 @@ export {
 // manager agent session. Exported as one surface — the hub's workspace backend
 // slice is the only consumer and it needs all three together.
 export * from './workspaces/index.js';
+export {
+  prMergeTarget,
+  recordBoxGhResult,
+  recordBoxGitPush,
+  recordCreateJobTimeline,
+  type BoxTimelineContext,
+} from './timeline-hooks.js';

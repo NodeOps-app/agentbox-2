@@ -33,6 +33,10 @@ export function tasksFile(dir: string): string {
   return join(dir, 'tasks.json');
 }
 
+export function timelineFile(dir: string): string {
+  return join(dir, 'timeline.jsonl');
+}
+
 export function managersFile(dir: string): string {
   return join(dir, 'managers.json');
 }

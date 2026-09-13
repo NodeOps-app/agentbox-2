@@ -1,3 +1,4 @@
+import { recordCreateJobTimeline } from './timeline-hooks.js';
 import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { mkdir, readdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
@@ -875,6 +876,7 @@ export function startQueueLoop(deps: QueueLoopDeps): QueueLoopHandle {
           };
           await writeJob(failed);
           onStatusChange?.(failed);
+          void recordCreateJobTimeline(failed);
           log(`queue: spawn for job ${updated.id} failed: ${msg}`);
         }
       }
@@ -919,6 +921,7 @@ export function startQueueLoop(deps: QueueLoopDeps): QueueLoopHandle {
           };
           await writeJob(failed);
           onStatusChange?.(failed);
+          void recordCreateJobTimeline(failed);
           log(`queue: spawn for foreground job ${updated.id} failed: ${msg}`);
         }
       }
@@ -964,6 +967,7 @@ export function startQueueLoop(deps: QueueLoopDeps): QueueLoopHandle {
           };
           await writeJob(failed);
           onStatusChange?.(failed);
+          void recordCreateJobTimeline(failed);
           log(`queue: spawn for prepare job ${updated.id} failed: ${msg}`);
         }
       }
@@ -1037,6 +1041,7 @@ async function recoverOrphanedWorkers(
     };
     await writeJob(failed);
     onChange?.(failed);
+    void recordCreateJobTimeline(failed);
     log(`queue: recovered orphan job ${j.id} (pid ${String(j.pid ?? '?')} not alive) -> failed`);
   }
 }

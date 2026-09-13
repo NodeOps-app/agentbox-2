@@ -16,6 +16,7 @@
 
 import { execa } from 'execa';
 import { toHttpsUrl } from './git-pat.js';
+import { recordBoxGhResult, recordBoxGitPush, type BoxTimelineContext } from './timeline-hooks.js';
 import { existsSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -382,7 +383,20 @@ export async function executeCloudAction(
     };
   }
   if (action.method === 'git.push' || action.method === 'git.fetch') {
-    return runGitRpc(action, deps);
+    return runGitRpc(action, deps).then((result) => {
+      if (action.method === 'git.push' && result.exitCode === 0) {
+        void cloudTimelineContext(deps).then((ctx) =>
+          ctx
+            ? recordBoxGitPush(
+                ctx,
+                action.params as { hostInitiated?: unknown; hostOnly?: unknown } | undefined,
+                result,
+              )
+            : undefined,
+        );
+      }
+      return result;
+    });
   }
   if (action.method === 'cp.toHost' || action.method === 'cp.fromHost') {
     return runCpRpc(action, deps);
@@ -402,7 +416,18 @@ export async function executeCloudAction(
     return runBrowserOpenMirror(action, deps);
   }
   if (action.method === 'gh.exec') {
-    return runGhExecRpc(action, deps);
+    return runGhExecRpc(action, deps).then((result) => {
+      if (result.exitCode === 0) {
+        const raw = (action.params as GhExecRpcParams | undefined)?.args;
+        const args = Array.isArray(raw)
+          ? raw.filter((a): a is string => typeof a === 'string')
+          : [];
+        void cloudTimelineContext(deps).then((ctx) =>
+          ctx ? recordBoxGhResult(ctx, args, result) : undefined,
+        );
+      }
+      return result;
+    });
   }
   if (action.method.startsWith('tool.')) {
     return runToolRpc(action, deps);
@@ -720,6 +745,24 @@ export function cloudHandleOf(
     sandboxId: lookup.cloudSandboxId,
     ...(lookup.sandboxClass ? { sandboxClass: lookup.sandboxClass } : {}),
   };
+}
+
+/** What the timeline hooks need about a cloud box; null when its record is unreadable. */
+async function cloudTimelineContext(
+  deps: CloudActionExecutorDeps,
+): Promise<BoxTimelineContext | null> {
+  try {
+    const lookup = await lookupCloudBox(deps.boxId);
+    return {
+      boxId: deps.boxId,
+      ...(deps.boxName ? { boxName: deps.boxName } : {}),
+      hostPath: lookup.workspacePath,
+      ...(lookup.sanctionedBranch ? { branch: lookup.sanctionedBranch } : {}),
+      ...(deps.originUrl ? { originUrl: deps.originUrl } : {}),
+    };
+  } catch {
+    return null;
+  }
 }
 
 async function lookupCloudBox(boxId: string): Promise<BoxLookup> {

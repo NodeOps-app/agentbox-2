@@ -135,6 +135,11 @@ export interface ManagerRecord {
    * hub's own machine. A live pid with a different start time is a reused pid.
    */
   pidStartedAt?: string;
+  /**
+   * External only: `$TMUX_PANE` of the session's terminal when it runs inside
+   * tmux. The only way the hub can type into a session it did not start.
+   */
+  tmuxPane?: string;
   /** Hub only. */
   tmuxSession?: string;
   /** Hub only: what was started, so a restart can reuse it. */
@@ -185,6 +190,94 @@ export interface HostSession {
   agent: string;
   title: string;
   updatedAt: string;
+}
+
+// ── timeline ──
+
+export type TimelineEventType =
+  | 'task.created'
+  | 'task.status'
+  | 'task.assigned'
+  | 'task.unassigned'
+  | 'task.removed'
+  | 'manager.joined'
+  | 'manager.started'
+  | 'manager.resumed'
+  | 'manager.stopped'
+  | 'manager.note'
+  | 'manager.message'
+  | 'box.created'
+  | 'box.ready'
+  | 'box.failed'
+  | 'box.started'
+  | 'box.stopped'
+  | 'box.destroyed'
+  | 'git.push'
+  | 'pr.opened'
+  | 'pr.ready'
+  | 'pr.merged'
+  | 'pr.closed';
+
+export type TimelineActor = 'human' | 'manager' | 'box' | 'hub' | 'github';
+
+export type TimelineNoteKind = 'note' | 'replan' | 'plan';
+
+export type TimelineChecks = 'pass' | 'fail' | 'pending' | 'none';
+
+export interface TimelinePr {
+  /** `owner/name`. */
+  repo: string;
+  number: number;
+  title: string;
+  url: string;
+  base: string;
+  head: string;
+  additions?: number;
+  deletions?: number;
+  checks?: TimelineChecks;
+  mergeState?: string;
+  autoMerge?: boolean;
+  mergedBy?: string;
+}
+
+/**
+ * One line of a workspace's append-only `timeline.jsonl`. Current state lives in
+ * tasks/managers/boxes and is overwritten; this is the only record of what
+ * happened, so every field is captured at write time rather than joined later.
+ */
+export interface TimelineEvent {
+  /** Time-sortable: zero-padded base-36 milliseconds, then a random suffix. */
+  id: string;
+  at: string;
+  type: TimelineEventType;
+  actor: TimelineActor;
+  managerId?: string;
+  turn?: number;
+  prompt?: string;
+  boxId?: string;
+  boxName?: string;
+  agent?: string;
+  branch?: string;
+  projectId?: string;
+  /** Captured at write time: reconciliation later clears a task's box pointer. */
+  taskIds?: string[];
+  task?: { id: string; title: string; from?: WorkTaskStatus; to?: WorkTaskStatus };
+  pr?: TimelinePr;
+  /** A note's text, or the message sent to a manager. */
+  text?: string;
+  noteKind?: TimelineNoteKind;
+  /** `task.assigned`: the box was already running, i.e. it was given more work. */
+  boxRunning?: boolean;
+  /** Dedupe key: an append carrying a key already in the log is a no-op. */
+  key?: string;
+}
+
+/** Who did something, as a mutation's caller knows it. */
+export interface TimelineStamp {
+  actor: TimelineActor;
+  managerId?: string;
+  turn?: number;
+  prompt?: string;
 }
 
 /** Roll-up of a box's assigned tasks, for a box row in a list. */

@@ -144,7 +144,11 @@ export function managerAttachCommand(tmuxSession: string): string {
  * named a session. A sessionId for an agent with no verified spelling is
  * refused upstream rather than guessed at here.
  */
-export function buildManagerArgv(agent: ManagerAgent, sessionId?: string): string[] {
+export function buildManagerArgv(
+  agent: ManagerAgent,
+  sessionId?: string,
+  prompt?: string,
+): string[] {
   if (!sessionId) return [agent];
   // Last line before the id becomes argv on this machine: a value that reads as
   // an option would be parsed by the AGENT, not by us, and both agents expose
@@ -152,7 +156,14 @@ export function buildManagerArgv(agent: ManagerAgent, sessionId?: string): strin
   // check is here as well because this function is the one that builds argv.
   if (!/^[A-Za-z0-9][A-Za-z0-9_-]*$/u.test(sessionId)) return [agent];
   const resume = RESUME_ARGV[agent];
-  return resume ? [agent, ...resume(sessionId)] : [agent];
+  if (!resume) return [agent];
+  const text = prompt?.trim();
+  // The prompt is caller-supplied text: one that starts with `-` would be parsed
+  // as a flag (`--dangerously-skip-permissions`). A leading space keeps it a
+  // positional for both argument parsers without changing what the agent reads.
+  return text
+    ? [agent, ...resume(sessionId), text.startsWith('-') ? ` ${text}` : text]
+    : [agent, ...resume(sessionId)];
 }
 
 function shellQuote(arg: string): string {
@@ -585,6 +596,8 @@ export interface DetectManagerInput {
   host?: string;
   /** `$AGENTBOX_MANAGER` of the caller: set inside a hub-run manager's own session. */
   managerId?: string;
+  /** `$TMUX_PANE` when the session's terminal runs inside tmux. */
+  tmuxPane?: string;
 }
 
 /**
@@ -599,58 +612,76 @@ export async function upsertDetectedManager(
   wsId: string,
   input: DetectManagerInput,
   now: Date = new Date(),
-): Promise<{ manager: ManagerRecord; created: boolean }> {
-  return updateManagers<{ manager: ManagerRecord; created: boolean }>(wsId, (managers) => {
-    const at = now.toISOString();
-    let idx = managers.findIndex((m) => m.agent === input.agent && m.sessionId === input.sessionId);
-    if (idx === -1 && input.managerId) idx = managers.findIndex((m) => m.id === input.managerId);
-    if (idx === -1) {
-      const manager: ManagerRecord = {
-        id: newManagerId(),
-        workspaceId: wsId,
-        agent: input.agent,
-        kind: 'external',
-        cwd: input.cwd,
-        sessionId: input.sessionId,
-        ...(input.host ? { host: input.host } : {}),
-        ...(input.pid !== undefined ? { pid: input.pid } : {}),
-        ...(input.pid !== undefined && input.pidStartedAt
-          ? { pidStartedAt: input.pidStartedAt }
-          : {}),
-        boxIds: [],
-        boxJobIds: [],
-        createdAt: at,
-        lastSeenAt: at,
+): Promise<{ manager: ManagerRecord; created: boolean; sessionChanged: boolean }> {
+  return updateManagers<{ manager: ManagerRecord; created: boolean; sessionChanged: boolean }>(
+    wsId,
+    (managers) => {
+      const at = now.toISOString();
+      let idx = managers.findIndex(
+        (m) => m.agent === input.agent && m.sessionId === input.sessionId,
+      );
+      if (idx === -1 && input.managerId) idx = managers.findIndex((m) => m.id === input.managerId);
+      if (idx === -1) {
+        const manager: ManagerRecord = {
+          id: newManagerId(),
+          workspaceId: wsId,
+          agent: input.agent,
+          kind: 'external',
+          cwd: input.cwd,
+          sessionId: input.sessionId,
+          ...(input.host ? { host: input.host } : {}),
+          ...(input.pid !== undefined ? { pid: input.pid } : {}),
+          ...(input.pid !== undefined && input.pidStartedAt
+            ? { pidStartedAt: input.pidStartedAt }
+            : {}),
+          ...(input.tmuxPane ? { tmuxPane: input.tmuxPane } : {}),
+          boxIds: [],
+          boxJobIds: [],
+          createdAt: at,
+          lastSeenAt: at,
+        };
+        return {
+          managers: [...managers, manager],
+          result: { manager, created: true, sessionChanged: false },
+        };
+      }
+      const prev = managers[idx]!;
+      const next: ManagerRecord = { ...prev, sessionId: input.sessionId, lastSeenAt: at };
+      // `/clear` starts a new session in the same process: the cached title named
+      // the old one.
+      if (prev.sessionId !== input.sessionId) delete next.title;
+      const fromOwnSession = input.managerId !== undefined && input.managerId === prev.id;
+      if (prev.kind === 'hub' && !fromOwnSession && input.pid !== undefined) {
+        // The session is being run from somewhere other than the hub's tmux — the
+        // user resumed it in a terminal. Observe that process from now on.
+        next.kind = 'external';
+        delete next.tmuxSession;
+        delete next.argv;
+        delete next.startedAt;
+        delete next.stoppedAt;
+        delete next.lastExit;
+      }
+      if (next.kind === 'external') {
+        if (input.pid !== undefined) next.pid = input.pid;
+        else delete next.pid;
+        if (input.pid !== undefined && input.pidStartedAt) next.pidStartedAt = input.pidStartedAt;
+        else delete next.pidStartedAt;
+        if (input.host) next.host = input.host;
+        if (input.tmuxPane) next.tmuxPane = input.tmuxPane;
+        else delete next.tmuxPane;
+      }
+      const out = [...managers];
+      out[idx] = next;
+      return {
+        managers: out,
+        result: {
+          manager: next,
+          created: false,
+          sessionChanged: prev.sessionId !== input.sessionId,
+        },
       };
-      return { managers: [...managers, manager], result: { manager, created: true } };
-    }
-    const prev = managers[idx]!;
-    const next: ManagerRecord = { ...prev, sessionId: input.sessionId, lastSeenAt: at };
-    // `/clear` starts a new session in the same process: the cached title named
-    // the old one.
-    if (prev.sessionId !== input.sessionId) delete next.title;
-    const fromOwnSession = input.managerId !== undefined && input.managerId === prev.id;
-    if (prev.kind === 'hub' && !fromOwnSession && input.pid !== undefined) {
-      // The session is being run from somewhere other than the hub's tmux — the
-      // user resumed it in a terminal. Observe that process from now on.
-      next.kind = 'external';
-      delete next.tmuxSession;
-      delete next.argv;
-      delete next.startedAt;
-      delete next.stoppedAt;
-      delete next.lastExit;
-    }
-    if (next.kind === 'external') {
-      if (input.pid !== undefined) next.pid = input.pid;
-      else delete next.pid;
-      if (input.pid !== undefined && input.pidStartedAt) next.pidStartedAt = input.pidStartedAt;
-      else delete next.pidStartedAt;
-      if (input.host) next.host = input.host;
-    }
-    const out = [...managers];
-    out[idx] = next;
-    return { managers: out, result: { manager: next, created: false } };
-  });
+    },
+  );
 }
 
 /** Record that a manager created this box (or the create job that will become it). */
@@ -806,6 +837,7 @@ export async function startManagerSession(input: StartManagerSessionInput): Prom
   };
   delete next.pid;
   delete next.pidStartedAt;
+  delete next.tmuxPane;
   delete next.stoppedAt;
   delete next.lastExit;
   return updateManagers(input.wsId, (managers) => {
@@ -826,6 +858,7 @@ export async function resumeManagerSession(
   wsId: string,
   id: string,
   probe: ManagerProbe & { env?: NodeJS.ProcessEnv } = {},
+  opts: { prompt?: string } = {},
 ): Promise<ManagerRecord> {
   const rec = (await readManagers(wsId)).find((m) => m.id === id);
   if (!rec) throw new Error(`unknown manager ${id}`);
@@ -855,10 +888,43 @@ export async function resumeManagerSession(
   return startManagerSession({
     wsId,
     manager: rec,
-    argv: buildManagerArgv(rec.agent, rec.sessionId),
+    argv: buildManagerArgv(rec.agent, rec.sessionId, opts.prompt),
     ...(probe.exec ? { exec: probe.exec } : {}),
     ...(probe.env ? { env: probe.env } : {}),
   });
+}
+
+/** Where to type into a running manager: the hub's own session, or a detected terminal pane. */
+export type ManagerKeysTarget = { session: string } | { pane: string };
+
+/** `%<n>`, the only shape `$TMUX_PANE` takes. */
+export const TMUX_PANE_RE = /^%\d+$/u;
+
+/**
+ * The agent TUIs treat a key burst ending in Enter as one paste and keep the
+ * Enter as a newline inside it. A pause between the text and the Enter makes the
+ * Enter a separate keypress, which submits.
+ */
+const SUBMIT_DELAY_MS = 400;
+
+/**
+ * Type `text` into a running manager and submit it. Newlines are flattened: each
+ * one would reach the agent as Enter and submit a fragment.
+ */
+export async function sendKeysToManager(
+  target: ManagerKeysTarget,
+  text: string,
+  exec: ManagerExec = defaultExec,
+  sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
+): Promise<void> {
+  const t = 'session' in target ? `${exactTarget(target.session)}:` : target.pane;
+  if ('pane' in target && !TMUX_PANE_RE.test(target.pane)) {
+    throw new Error(`not a tmux pane id: ${target.pane}`);
+  }
+  const flat = text.replace(/\s*[\r\n]+\s*/gu, ' ').trim();
+  await exec('tmux', ['send-keys', '-t', t, '-l', flat]);
+  await sleep(SUBMIT_DELAY_MS);
+  await exec('tmux', ['send-keys', '-t', t, 'Enter']);
 }
 
 /**
@@ -896,6 +962,171 @@ export async function stopManagerSession(
     await rm(legacyManagerFiles(await dirFor(wsId)).exit, { force: true }).catch(() => {});
   }
   return stopped;
+}
+
+// ── session turns ──
+
+export interface SessionTurn {
+  /** 1-based count of user turns so far. */
+  turn: number;
+  /** The latest turn's prompt, as a one-line title; absent when none was readable. */
+  prompt?: string;
+}
+
+interface TurnCache {
+  ino: number;
+  offset: number;
+  turns: number;
+  lastPrompt?: string;
+  promptIds: Set<string>;
+}
+
+/** Keyed by transcript path. Each call reads only the bytes appended since the last. */
+const turnCaches = new Map<string, TurnCache>();
+/** A codex session's rollout file, once found: the store is flat and walking it is not free. */
+const rolloutPaths = new Map<string, string>();
+const TURN_READ_CHUNK = 4 * 1024 * 1024;
+
+/** A claude `user` row that is a turn the human (or a harness) typed, not a tool result. */
+function claudeTurnRow(row: unknown): { promptId?: string; prompt: string | null } | null {
+  const rec = row as {
+    type?: string;
+    isMeta?: boolean;
+    isSidechain?: boolean;
+    promptId?: unknown;
+    message?: { content?: unknown };
+  };
+  if (rec.type !== 'user' || rec.isMeta || rec.isSidechain) return null;
+  const content = rec.message?.content;
+  if (Array.isArray(content)) {
+    const blocks = content as { type?: string }[];
+    if (blocks.length === 0 || blocks.every((b) => b?.type === 'tool_result')) return null;
+  } else if (typeof content !== 'string') {
+    return null;
+  }
+  const text = firstTextBlock(content);
+  return {
+    ...(typeof rec.promptId === 'string' ? { promptId: rec.promptId } : {}),
+    prompt: text === null ? null : asTitle(text),
+  };
+}
+
+function absorbTurnLine(agent: string, cache: TurnCache, line: string): void {
+  if (agent === 'claude') {
+    if (!line.includes('"user"')) return;
+    let row: unknown;
+    try {
+      row = JSON.parse(line);
+    } catch {
+      return;
+    }
+    const hit = claudeTurnRow(row);
+    if (!hit) return;
+    if (hit.promptId !== undefined) {
+      if (cache.promptIds.has(hit.promptId)) return;
+      cache.promptIds.add(hit.promptId);
+    } else if (hit.prompt === null) {
+      // No prompt id and nothing typed: a command wrapper (`/clear`), not a turn.
+      return;
+    }
+    cache.turns += 1;
+    if (hit.prompt) cache.lastPrompt = hit.prompt;
+    return;
+  }
+  if (!line.includes('turn_context') && !line.includes('user_message')) return;
+  let rec: { type?: string; payload?: { type?: string; message?: unknown } };
+  try {
+    rec = JSON.parse(line) as typeof rec;
+  } catch {
+    return;
+  }
+  if (rec.type === 'turn_context') cache.turns += 1;
+  else if (
+    rec.type === 'event_msg' &&
+    rec.payload?.type === 'user_message' &&
+    typeof rec.payload.message === 'string'
+  ) {
+    const prompt = asTitle(rec.payload.message);
+    if (prompt) cache.lastPrompt = prompt;
+  }
+}
+
+async function transcriptFor(
+  agent: string,
+  cwd: string,
+  sessionId: string,
+  home: string,
+): Promise<string | null> {
+  if (agent === 'claude') {
+    return join(home, '.claude', 'projects', encodeClaudeProjectsKey(cwd), `${sessionId}.jsonl`);
+  }
+  if (agent !== 'codex') return null;
+  const known = rolloutPaths.get(sessionId);
+  if (known && (await stat(known).catch(() => null))) return known;
+  const hit = (await findRolloutFiles(join(home, '.codex', 'sessions'))).find(
+    (f) => f.id === sessionId,
+  );
+  if (!hit) return null;
+  rolloutPaths.set(sessionId, hit.file);
+  return hit.file;
+}
+
+/**
+ * Which turn a session is on, and what that turn asked, read from the agent's
+ * own transcript. `undefined` when the transcript is not readable here or has no
+ * turn yet.
+ *
+ * - claude: a turn is a new `promptId` on a `user` row that is neither meta nor
+ *   tool results only (rows without a prompt id count when they carry typed text).
+ * - codex: a turn is a `turn_context` row; the prompt is the last `user_message`.
+ */
+export async function sessionTurn(
+  agent: string,
+  cwd: string,
+  sessionId: string,
+  home: string = homedir(),
+): Promise<SessionTurn | undefined> {
+  const file = await transcriptFor(agent, cwd, sessionId, home);
+  if (!file) return undefined;
+  let fh;
+  try {
+    fh = await open(file, 'r');
+  } catch {
+    turnCaches.delete(file);
+    return undefined;
+  }
+  try {
+    const st = await fh.stat();
+    let cache = turnCaches.get(file);
+    if (!cache || cache.ino !== st.ino || st.size < cache.offset) {
+      cache = { ino: st.ino, offset: 0, turns: 0, promptIds: new Set() };
+      turnCaches.set(file, cache);
+    }
+    let tail = '';
+    let pos = cache.offset;
+    const chunk = Buffer.alloc(Math.min(TURN_READ_CHUNK, Math.max(1, st.size - cache.offset)));
+    while (pos < st.size) {
+      const { bytesRead } = await fh.read(chunk, 0, Math.min(chunk.length, st.size - pos), pos);
+      if (bytesRead === 0) break;
+      pos += bytesRead;
+      const text = tail + chunk.subarray(0, bytesRead).toString('utf8');
+      const end = text.lastIndexOf('\n');
+      if (end === -1) {
+        tail = text;
+        continue;
+      }
+      for (const line of text.slice(0, end).split('\n')) absorbTurnLine(agent, cache, line);
+      tail = text.slice(end + 1);
+    }
+    // A partial last line is left for the next call to read whole.
+    cache.offset = pos - Buffer.byteLength(tail, 'utf8');
+    if (cache.turns === 0) return undefined;
+    return { turn: cache.turns, ...(cache.lastPrompt ? { prompt: cache.lastPrompt } : {}) };
+  } catch {
+    return undefined;
+  } finally {
+    await fh.close();
+  }
 }
 
 /**
