@@ -240,6 +240,19 @@ describe('managerStatus', () => {
     expect(await managerStatus(rec, probe)).toBe('running');
   });
 
+  it('reads a reused pid as stopped: same pid, different start time', async () => {
+    const rec = record({ pid: 42, host: 'laptop', pidStartedAt: 'Sun Sep 13 10:00:00 2026' });
+    const probe = (started: string | undefined) => ({
+      hostname: host,
+      isPidAlive: () => true,
+      processStartTime: async () => started,
+    });
+    expect(await managerStatus(rec, probe('Sun Sep 13 10:00:00 2026'))).toBe('running');
+    expect(await managerStatus(rec, probe('Sun Sep 13 11:30:00 2026'))).toBe('stopped');
+    // Unreadable is not evidence of a different process.
+    expect(await managerStatus(rec, probe(undefined))).toBe('running');
+  });
+
   it('falls back to the last-seen window without a pid', async () => {
     const seen = Date.parse('2026-01-01T00:00:00Z');
     const rec = record({ lastSeenAt: new Date(seen).toISOString() });

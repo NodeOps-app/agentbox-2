@@ -1305,3 +1305,9 @@ export function parseManagerDetect(
     },
   };
 }
+
+/** `?force=1` (or `true`) on a DELETE that is otherwise refused while something runs. */
+export function isForce(req: Request): boolean {
+  const v = new URL(req.url).searchParams.get('force');
+  return v === '1' || v === 'true';
+}

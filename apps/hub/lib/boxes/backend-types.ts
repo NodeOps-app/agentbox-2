@@ -1054,8 +1054,8 @@ export interface ManagerBackend {
   startManager(wsId: string, input: StartManagerInput): Promise<ManagerResult>;
   resumeManager(id: string): Promise<ManagerResult>;
   stopManager(id: string): Promise<ManagerResult>;
-  /** Forget a manager record. Refused while it runs. */
-  removeManager(id: string): Promise<ActionResult>;
+  /** Forget a manager record. Refused while it runs, unless `force`. */
+  removeManager(id: string, opts?: { force?: boolean }): Promise<ActionResult>;
   listManagerSessions(wsId: string, agent?: string): Promise<ManagerSessionsResult | null>;
   /** Record that a manager's create produced this job. Best-effort from `create()`. */
   attachJob(managerId: string, jobId: string): Promise<ActionResult>;
@@ -1075,8 +1075,8 @@ export interface WorkspaceBackend {
   addWorkspace(input: { path: string; name?: string }): Promise<WorkspaceResult>;
   rescanWorkspace(id: string): Promise<WorkspaceResult>;
   renameWorkspace(id: string, name: string): Promise<WorkspaceResult>;
-  /** Unregister. The folder, its projects and their boxes are untouched. */
-  removeWorkspace(id: string): Promise<ActionResult>;
+  /** Unregister. The folder, its projects and their boxes are untouched. Refused while a manager runs, unless `force`. */
+  removeWorkspace(id: string, opts?: { force?: boolean }): Promise<ActionResult>;
 
   /** `null` = unknown workspace (so a route can answer 404 rather than an empty list). */
   listTasks(wsId: string, filter?: TaskFilter): Promise<WorkTask[] | null>;

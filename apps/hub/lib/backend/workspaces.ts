@@ -59,6 +59,7 @@ export function createWorkspaceBackend(deps: BackendDeps): WorkspaceBackend {
     ...(deps.managerExec ? { exec: deps.managerExec } : {}),
     ...(deps.hostname ? { hostname: deps.hostname } : {}),
     ...(deps.isPidAlive ? { isPidAlive: deps.isPidAlive } : {}),
+    ...(deps.processStartTime ? { processStartTime: deps.processStartTime } : {}),
   };
 
   /** How many of a workspace's managers are running right now. */
@@ -166,13 +167,15 @@ export function createWorkspaceBackend(deps: BackendDeps): WorkspaceBackend {
       return view ? { ok: true, workspace: view } : unknownWorkspace(id);
     },
 
-    async removeWorkspace(id: string): Promise<ActionResult> {
+    async removeWorkspace(id: string, opts: { force?: boolean } = {}): Promise<ActionResult> {
       const rec = await readWorkspace(id);
       if (!rec) return unknownWorkspace(id);
       // A live manager is a running process in that folder: unregistering under
       // it would drop the only record pointing at that session and its boxes.
-      if ((await managerCounts(id)).running > 0) {
-        return err('a manager of this workspace is running; stop it before removing the workspace');
+      if (!opts.force && (await managerCounts(id)).running > 0) {
+        return err(
+          'a manager of this workspace is running; stop it before removing the workspace (or force it)',
+        );
       }
       await removeWorkspace(id);
       deps.notify();

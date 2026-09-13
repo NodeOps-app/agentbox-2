@@ -953,7 +953,7 @@ export function buildOpenApi(): Record<string, unknown> {
           tags: ['Workspaces'],
           summary: 'Unregister a workspace',
           description:
-            'Drops the workspace record, its tasks and its managers. The folder, its projects and their boxes are untouched. Refused (409) while any of its managers is running.',
+            'Drops the workspace record, its tasks and its managers. The folder, its projects and their boxes are untouched. Refused (409) while any of its managers is running, unless `force=1`.',
           parameters: [
             {
               name: 'id',
@@ -961,6 +961,12 @@ export function buildOpenApi(): Record<string, unknown> {
               required: true,
               schema: { type: 'string' },
               description: 'Workspace id.',
+            },
+            {
+              name: 'force',
+              in: 'query',
+              schema: { type: 'string', enum: ['1', 'true'] },
+              description: 'Remove it even while one of its managers reads as running.',
             },
           ],
           responses: {
@@ -1544,7 +1550,7 @@ export function buildOpenApi(): Record<string, unknown> {
                     pid: {
                       type: 'integer',
                       description:
-                        "The agent process, probed for liveness when `host` is this hub's.",
+                        "The agent process, probed for liveness when `host` is this hub's; its start time is recorded then too, so a reused pid does not read as running.",
                     },
                     host: {
                       type: 'string',
@@ -1592,8 +1598,16 @@ export function buildOpenApi(): Record<string, unknown> {
           tags: ['Managers'],
           summary: 'Forget a manager',
           description:
-            'Drops the record. Its boxes and tasks are untouched (tasks keep a `managerId` nothing resolves). Refused (409) while it runs.',
-          parameters: [managerIdParam],
+            'Drops the record. Its boxes and tasks are untouched (tasks keep a `managerId` nothing resolves). Refused (409) while it runs, unless `force=1` — which forgets it regardless of status and leaves its process (a tmux session, a terminal) alone.',
+          parameters: [
+            managerIdParam,
+            {
+              name: 'force',
+              in: 'query',
+              schema: { type: 'string', enum: ['1', 'true'] },
+              description: 'Forget it regardless of status.',
+            },
+          ],
           responses: {
             '200': {
               description: 'Forgotten',
@@ -3396,6 +3410,11 @@ export function buildOpenApi(): Record<string, unknown> {
             title: { type: 'string', description: "The session's first user turn, when readable." },
             host: { type: 'string' },
             pid: { type: 'number' },
+            pidStartedAt: {
+              type: 'string',
+              description:
+                "The pid's start time (`ps -o lstart=`), recorded when the session reported the hub's own host. A live pid with a different start time is a reused pid, and the manager reads as stopped.",
+            },
             tmuxSession: { type: 'string' },
             attachCommand: {
               type: 'string',

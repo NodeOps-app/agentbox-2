@@ -442,6 +442,7 @@ agentbox workspace show
 agentbox workspace rescan             # pick up a repo cloned in after registration
 agentbox workspace rename storefront
 agentbox workspace rm -y              # unregisters only; the folder and its boxes stay
+agentbox workspace rm -y --force      # even while one of its managers reads as running
 ```
 
 Every command below finds its workspace the same way: `--workspace <id|path>` if you pass one, else
@@ -488,6 +489,7 @@ agentbox manager status 3f9a                # one manager, by id or unique prefi
 agentbox manager resume 3f9a --attach       # reopen an ended session in the hub's tmux
 agentbox manager stop 3f9a                  # hub-run managers only
 agentbox manager forget 3f9a -y             # drop a stopped manager's record
+agentbox manager forget 3f9a -y --force     # drop it even if it reads as running
 agentbox manager start --agent claude       # a new hub-run manager; offers to resume a session
 agentbox manager start --agent codex --new  # --new skips the resume picker
 agentbox manager attach                     # the running hub-run manager; or --attach-in split|window|tab
@@ -513,7 +515,8 @@ Codex's default `workspace-write` sandbox blocks loopback, so the CLI cannot rea
 it at all: set `[sandbox_workspace_write] network_access = true` in `~/.codex/config.toml` (or use a
 full-access sandbox). Even then `ps` is not permitted in that sandbox, so a sandboxed Codex manager has
 no pid and counts as running for 30 minutes after it last ran `agentbox`. A Claude Code session counts
-as running exactly as long as its process lives.
+as running exactly as long as its process lives — the hub records the process's start time, so a pid
+the system later hands to another process does not keep it running.
 
 ## Providers
 

@@ -141,7 +141,8 @@ const removeCommand = new Command('remove')
   .description('Unregister a workspace (the folder and its boxes are untouched)')
   .argument('[workspace]', 'workspace id or path (default: the one containing the cwd)')
   .option('-y, --yes', 'skip the confirmation')
-  .action(async (ref: string | undefined, opts: { yes?: boolean }) => {
+  .option('--force', 'remove it even while one of its managers reads as running')
+  .action(async (ref: string | undefined, opts: { yes?: boolean; force?: boolean }) => {
     await withHubClient({ preferLocal: true }, async (client) => {
       const ws = await mustResolve(client, ref);
       if (!opts.yes) {
@@ -155,7 +156,7 @@ const removeCommand = new Command('remove')
           return;
         }
       }
-      await client.removeWorkspace(ws.id);
+      await client.removeWorkspace(ws.id, { force: Boolean(opts.force) });
       log.success(`unregistered ${ws.name}`);
     });
   });

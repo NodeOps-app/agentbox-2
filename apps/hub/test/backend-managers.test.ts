@@ -15,6 +15,7 @@ interface Harness {
   deps: BackendDeps & { notify: ReturnType<typeof vi.fn> };
   spawned: string[][];
   alive: Set<number>;
+  started: Map<number, string>;
   tmux: Set<string>;
 }
 
@@ -23,6 +24,7 @@ interface Harness {
 function harness(over: { boxIds?: string[]; jobs?: Partial<QueueJob>[] } = {}): Harness {
   const spawned: string[][] = [];
   const alive = new Set<number>();
+  const started = new Map<number, string>();
   const tmux = new Set<string>();
   const deps = {
     notify: vi.fn(),
@@ -30,6 +32,7 @@ function harness(over: { boxIds?: string[]; jobs?: Partial<QueueJob>[] } = {}): 
     jobs: async () => (over.jobs ?? []) as QueueJob[],
     hostname: () => 'laptop',
     isPidAlive: (pid: number) => alive.has(pid),
+    processStartTime: async (pid: number) => started.get(pid),
     managerExec: async (_file: string, args: string[]) => {
       spawned.push(args);
       if (args[0] === 'new-session') tmux.add(args[3]!);
@@ -38,7 +41,7 @@ function harness(over: { boxIds?: string[]; jobs?: Partial<QueueJob>[] } = {}): 
       return { exitCode: 0 };
     },
   };
-  return { deps, spawned, alive, tmux };
+  return { deps, spawned, alive, started, tmux };
 }
 
 function backends(h: Harness) {
@@ -188,6 +191,46 @@ describe('liveness and lifecycle', () => {
     if (!res.ok) throw new Error(res.error);
     return { managers, workspaces, manager: res.manager, root };
   }
+
+  it('records the pid start time and reads a reused pid as stopped', async () => {
+    const h = harness();
+    h.started.set(99, 'Sun Sep 13 10:00:00 2026');
+    const { managers, manager } = await external(h);
+    expect(manager).toMatchObject({ pidStartedAt: 'Sun Sep 13 10:00:00 2026', status: 'running' });
+    // The session exited and the system handed pid 99 to something else.
+    h.started.set(99, 'Sun Sep 13 12:00:00 2026');
+    expect((await managers.getManager(manager.id))?.status).toBe('stopped');
+  });
+
+  it('never stamps a pid reported from another host', async () => {
+    const h = harness();
+    h.started.set(7, 'whatever');
+    const { managers } = backends(h);
+    const res = await managers.detectManager({
+      agent: 'claude',
+      sessionId: S2,
+      cwd: await makeFolder(),
+      pid: 7,
+      host: 'desktop',
+    });
+    if (!res.ok) throw new Error(res.error);
+    expect(res.manager.pidStartedAt).toBeUndefined();
+  });
+
+  it('forgets a running manager and removes its workspace with force', async () => {
+    const h = harness();
+    const { managers, workspaces, manager } = await external(h);
+    expect(await managers.removeManager(manager.id)).toMatchObject({ ok: false });
+    expect(await workspaces.removeWorkspace(manager.workspaceId)).toMatchObject({ ok: false });
+    expect(await workspaces.removeWorkspace(manager.workspaceId, { force: true })).toEqual({
+      ok: true,
+    });
+    const again = await external(h);
+    expect(await again.managers.removeManager(again.manager.id, { force: true })).toEqual({
+      ok: true,
+    });
+    expect(await again.managers.getManager(again.manager.id)).toBeNull();
+  });
 
   it('flips to stopped when the pid dies, and filters by status', async () => {
     const h = harness();

@@ -405,10 +405,31 @@ export function isPidAlive(pid: number): boolean {
   }
 }
 
+/**
+ * When a process started, as `ps` prints it, or undefined when it cannot be read.
+ * A pid is reused once its process exits, so a live pid alone does not say the
+ * session is still there; its start time does.
+ */
+export async function processStartTime(pid: number): Promise<string | undefined> {
+  try {
+    const r = await execa('ps', ['-o', 'lstart=', '-p', String(pid)], {
+      // lstart is locale-formatted: pin it so two reads compare equal.
+      env: { ...process.env, LC_ALL: 'C' },
+      timeout: 2000,
+      reject: false,
+    });
+    const out = r.exitCode === 0 ? r.stdout.trim() : '';
+    return out || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export interface ManagerProbe {
   exec?: ManagerExec;
   hostname?: () => string;
   isPidAlive?: (pid: number) => boolean;
+  processStartTime?: (pid: number) => Promise<string | undefined>;
   now?: () => number;
 }
 
@@ -425,7 +446,13 @@ export async function managerStatus(
   // A pid is only meaningful on the machine it came from: probing it on a remote
   // hub would ask about whatever unrelated process holds that number there.
   if (rec.pid !== undefined && rec.host !== undefined && rec.host === host) {
-    return (probe.isPidAlive ?? isPidAlive)(rec.pid) ? 'running' : 'stopped';
+    if (!(probe.isPidAlive ?? isPidAlive)(rec.pid)) return 'stopped';
+    if (rec.pidStartedAt) {
+      // An unreadable start time is not evidence the process changed.
+      const started = await (probe.processStartTime ?? processStartTime)(rec.pid);
+      if (started !== undefined && started !== rec.pidStartedAt) return 'stopped';
+    }
+    return 'running';
   }
   const now = (probe.now ?? Date.now)();
   const seen = Date.parse(rec.lastSeenAt);
@@ -521,6 +548,8 @@ export interface DetectManagerInput {
   /** Realpath of the folder the session runs in. */
   cwd: string;
   pid?: number;
+  /** The pid's start time on the hub's machine; only when `host` is the hub's. */
+  pidStartedAt?: string;
   host?: string;
   /** `$AGENTBOX_MANAGER` of the caller: set inside a hub-run manager's own session. */
   managerId?: string;
@@ -553,6 +582,9 @@ export async function upsertDetectedManager(
         sessionId: input.sessionId,
         ...(input.host ? { host: input.host } : {}),
         ...(input.pid !== undefined ? { pid: input.pid } : {}),
+        ...(input.pid !== undefined && input.pidStartedAt
+          ? { pidStartedAt: input.pidStartedAt }
+          : {}),
         boxIds: [],
         boxJobIds: [],
         createdAt: at,
@@ -579,6 +611,8 @@ export async function upsertDetectedManager(
     if (next.kind === 'external') {
       if (input.pid !== undefined) next.pid = input.pid;
       else delete next.pid;
+      if (input.pid !== undefined && input.pidStartedAt) next.pidStartedAt = input.pidStartedAt;
+      else delete next.pidStartedAt;
       if (input.host) next.host = input.host;
     }
     const out = [...managers];
@@ -739,6 +773,7 @@ export async function startManagerSession(input: StartManagerSessionInput): Prom
     lastSeenAt: at,
   };
   delete next.pid;
+  delete next.pidStartedAt;
   delete next.stoppedAt;
   delete next.lastExit;
   return updateManagers(input.wsId, (managers) => {

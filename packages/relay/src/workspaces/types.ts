@@ -130,6 +130,11 @@ export interface ManagerRecord {
   host?: string;
   /** External only. */
   pid?: number;
+  /**
+   * External only: the pid's start time, recorded when the detect came from the
+   * hub's own machine. A live pid with a different start time is a reused pid.
+   */
+  pidStartedAt?: string;
   /** Hub only. */
   tmuxSession?: string;
   /** Hub only: what was started, so a restart can reuse it. */

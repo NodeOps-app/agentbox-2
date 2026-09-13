@@ -18,6 +18,7 @@ import {
   managerStatus,
   newManagerId,
   patchManager,
+  processStartTime,
   readManagerExit,
   readReconciledManagers,
   readTasks,
@@ -77,6 +78,7 @@ export function createManagerBackend(
     hostname,
     ...(deps.managerExec ? { exec: deps.managerExec } : {}),
     ...(deps.isPidAlive ? { isPidAlive: deps.isPidAlive } : {}),
+    ...(deps.processStartTime ? { processStartTime: deps.processStartTime } : {}),
   };
 
   /**
@@ -191,11 +193,17 @@ export function createManagerBackend(
           }
         }
       }
+      // Only a pid from this machine can be stamped: elsewhere it names another process.
+      const pidStartedAt =
+        input.pid !== undefined && input.host === hostname()
+          ? await (deps.processStartTime ?? processStartTime)(input.pid).catch(() => undefined)
+          : undefined;
       const { manager, created } = await upsertDetectedManager(ws.id, {
         agent: input.agent,
         sessionId: input.sessionId,
         cwd,
         ...(input.pid !== undefined ? { pid: input.pid } : {}),
+        ...(pidStartedAt ? { pidStartedAt } : {}),
         ...(input.host ? { host: input.host } : {}),
         ...(input.managerId ? { managerId: input.managerId } : {}),
       });
@@ -311,13 +319,15 @@ export function createManagerBackend(
       return answer(id);
     },
 
-    async removeManager(id: string): Promise<ActionResult> {
+    async removeManager(id: string, opts: { force?: boolean } = {}): Promise<ActionResult> {
       const rec = await findManager(id);
       if (!rec) return err(`unknown manager ${id}`);
       // A record is the only handle on a running process: forgetting it would
       // leave a tmux session (or a terminal session's boxes) nothing points at.
-      if ((await managerStatus(rec, probe)) === 'running') {
-        return err(`manager ${id} is running; stop it before forgetting it`);
+      // `force` is the way out when the status is wrong (a pid the probe cannot
+      // tell apart, a last-seen window that has not lapsed yet).
+      if (!opts.force && (await managerStatus(rec, probe)) === 'running') {
+        return err(`manager ${id} is running; stop it before forgetting it (or force it)`);
       }
       await removeManagerRecord(rec.workspaceId, id);
       deps.notify();

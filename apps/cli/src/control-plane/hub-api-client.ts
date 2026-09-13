@@ -499,6 +499,7 @@ export interface HubApiManager {
   title?: string;
   host?: string;
   pid?: number;
+  pidStartedAt?: string;
   tmuxSession?: string;
   /** Ready-to-run tmux attach command; only for a running hub-run manager. */
   attachCommand?: string;
@@ -1143,8 +1144,9 @@ export class HubApiClient {
     return this.request<HubApiWorkspace>('POST', '/workspaces', body);
   }
 
-  async removeWorkspace(id: string): Promise<void> {
-    await this.request<{ ok: true }>('DELETE', `/workspaces/${encodeURIComponent(id)}`);
+  async removeWorkspace(id: string, opts: { force?: boolean } = {}): Promise<void> {
+    const q = opts.force ? '?force=1' : '';
+    await this.request<{ ok: true }>('DELETE', `/workspaces/${encodeURIComponent(id)}${q}`);
   }
 
   renameWorkspace(id: string, name: string): Promise<HubApiWorkspace> {
@@ -1269,8 +1271,9 @@ export class HubApiClient {
     return this.request<HubApiManager>('POST', `/managers/${encodeURIComponent(id)}/stop`);
   }
 
-  async removeManager(id: string): Promise<void> {
-    await this.request<{ ok: true }>('DELETE', `/managers/${encodeURIComponent(id)}`);
+  async removeManager(id: string, opts: { force?: boolean } = {}): Promise<void> {
+    const q = opts.force ? '?force=1' : '';
+    await this.request<{ ok: true }>('DELETE', `/managers/${encodeURIComponent(id)}${q}`);
   }
 
   listManagerSessions(wsId: string, agent?: string): Promise<HubApiManagerSessions> {

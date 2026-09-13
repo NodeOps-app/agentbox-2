@@ -38,6 +38,8 @@ export interface BackendDeps {
    */
   hostname?: () => string;
   isPidAlive?: (pid: number) => boolean;
+  /** `ps -o lstart=` of a pid; faked in tests like the pid probe. */
+  processStartTime?: (pid: number) => Promise<string | undefined>;
 }
 
 /**

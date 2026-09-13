@@ -431,7 +431,8 @@ const forgetCommand = new Command('forget')
   .description('Forget a stopped manager (its boxes and tasks are untouched)')
   .argument('<id>', 'manager id (or a unique prefix)')
   .option('-y, --yes', 'skip the confirmation')
-  .action(async (id: string, opts: { yes?: boolean }) => {
+  .option('--force', 'forget it even if it reads as running (its process is left alone)')
+  .action(async (id: string, opts: { yes?: boolean; force?: boolean }) => {
     await withHubClient({ preferLocal: true }, async (client) => {
       const target = await mustManager(client, id);
       if (!opts.yes) {
@@ -444,7 +445,7 @@ const forgetCommand = new Command('forget')
           return;
         }
       }
-      await client.removeManager(target.id);
+      await client.removeManager(target.id, { force: Boolean(opts.force) });
       log.success(`forgot ${target.id}`);
     });
   });
