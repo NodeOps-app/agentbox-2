@@ -3,6 +3,7 @@
 // are only ever true NOW — a box working a task, a PR waiting to be merged —
 // which are built at read time and never stored.
 import {
+  findManager,
   findWorkspaceContaining,
   listWorkspaces,
   readReconciledTasks,
@@ -18,6 +19,7 @@ import {
   type TimelineStamp,
   type WorkTask,
 } from '@agentbox/relay';
+import { inBackground } from './background';
 import { reconcileContext, type BackendDeps, type DiffStat, type TimelineBoxFact } from './deps';
 import { createGithubPrSync, type GithubPrSync } from './github-prs';
 import type {
@@ -37,6 +39,8 @@ export const PLAN_MIN_TASKS = 3;
 /** A move to `in_progress` this soon after an assignment is that assignment, not news. */
 const ASSIGN_STATUS_WINDOW_MS = 60 * 1000;
 const DIFF_CACHE_MS = 60 * 1000;
+/** A box's diff that takes longer than this is left off the read that asked for it. */
+const DIFF_TIMEOUT_MS = 3000;
 export const TIMELINE_DEFAULT_LIMIT = 100;
 
 function newestFirst(a: { at: string; id: string }, b: { at: string; id: string }): number {
@@ -49,9 +53,28 @@ function taskIdsOf(ev: TimelineEvent): string[] {
   return ev.task ? [ev.task.id] : [];
 }
 
-function samePr(a: TimelineEvent['pr'], b: TimelineEvent['pr']): boolean {
-  if (!a || !b || a.number !== b.number) return false;
-  return !a.repo || !b.repo || a.repo === b.repo;
+/**
+ * Whether two PR refs are one PR. A ref whose repo is unknown (a message that
+ * named only a number) matches only when a single repo in the log has that
+ * number; in a workspace over several repos, `#12` alone names none of them.
+ */
+function prMatcher(
+  events: TimelineEvent[],
+): (a: TimelineEvent['pr'], b: TimelineEvent['pr']) => boolean {
+  const repos = new Map<number, Set<string>>();
+  for (const ev of events) {
+    if (!ev.pr?.repo) continue;
+    const set = repos.get(ev.pr.number) ?? new Set<string>();
+    set.add(ev.pr.repo);
+    repos.set(ev.pr.number, set);
+  }
+  return (a, b) => {
+    if (!a || !b || a.number !== b.number) return false;
+    if (a.repo && b.repo) return a.repo === b.repo;
+    const known = a.repo || b.repo;
+    const set = repos.get(a.number);
+    return Boolean(known) && set?.size === 1 && set.has(known);
+  };
 }
 
 /**
@@ -62,6 +85,7 @@ function samePr(a: TimelineEvent['pr'], b: TimelineEvent['pr']): boolean {
  */
 export function aggregateTimeline(events: TimelineEvent[]): TimelineItem[] {
   const asc = [...events].sort(newestFirst).reverse();
+  const samePr = prMatcher(events);
   const drop = new Set<string>();
 
   const groups: TimelineEvent[][] = [];
@@ -122,12 +146,19 @@ export function aggregateTimeline(events: TimelineEvent[]): TimelineItem[] {
   return [...items, ...plans].sort(newestFirst);
 }
 
-/** Ready PRs not merged or closed since, newest first, with whether a message approved them. */
+/**
+ * Ready PRs not merged or closed since, newest first, with whether a message
+ * approved them. With `synced` false (no GitHub sync has completed since the hub
+ * started), a PR the sync has not confirmed is left out: the log alone cannot
+ * tell a PR still ready from one that went red or merged while the hub was down.
+ */
 export function liveReadyItems(
   events: TimelineEvent[],
   prState?: (repo: string, number: number) => string | undefined,
+  synced = true,
 ): TimelineLiveItem[] {
   const sorted = [...events].sort(newestFirst);
+  const samePr = prMatcher(events);
   const finished = new Set<string>();
   for (const ev of sorted) {
     if ((ev.type === 'pr.merged' || ev.type === 'pr.closed') && ev.pr) {
@@ -144,7 +175,7 @@ export function liveReadyItems(
     // A PR that went red (or conflicted) after the log recorded it ready is no
     // longer awaiting anyone; the log cannot un-append, the last sync can say so.
     const state = prState?.(ev.pr.repo, ev.pr.number);
-    if (state && state !== 'ready') continue;
+    if (state ? state !== 'ready' : !synced) continue;
     const approved = sorted.some((m) => m.type === 'manager.message' && samePr(m.pr, ev.pr));
     out.push({
       id: `live:pr:${key}`,
@@ -207,6 +238,18 @@ export function parseShortstat(out: string): DiffStat {
 export interface TimelineBackendOptions {
   sync?: GithubPrSync;
   now?: () => number;
+  diffTimeoutMs?: number;
+}
+
+function orNullAfter<T>(p: Promise<T | null>, ms: number): Promise<T | null> {
+  return new Promise((resolve) => {
+    const t = setTimeout(() => resolve(null), ms);
+    t.unref?.();
+    void p.then((v) => {
+      clearTimeout(t);
+      resolve(v);
+    });
+  });
 }
 
 export function createTimelineBackend(
@@ -215,15 +258,19 @@ export function createTimelineBackend(
 ): TimelineBackend {
   const sync = opts.sync ?? createGithubPrSync(deps);
   const now = opts.now ?? Date.now;
-  const diffCache = new Map<string, { at: number; value: DiffStat | null }>();
+  const diffTimeout = opts.diffTimeoutMs ?? DIFF_TIMEOUT_MS;
+  /** The exec promise, not its result: overlapping reads share one exec. */
+  const diffCache = new Map<string, { at: number; value: Promise<DiffStat | null> }>();
 
-  async function diffOf(box: TimelineBoxFact): Promise<DiffStat | null> {
-    if (!deps.boxDiffStat || box.state !== 'running') return null;
-    const hit = diffCache.get(box.id);
-    if (hit && now() - hit.at < DIFF_CACHE_MS) return hit.value;
-    const value = await deps.boxDiffStat(box.id).catch(() => null);
-    diffCache.set(box.id, { at: now(), value });
-    return value;
+  function diffOf(box: TimelineBoxFact): Promise<DiffStat | null> {
+    if (!deps.boxDiffStat || box.state !== 'running') return Promise.resolve(null);
+    let hit = diffCache.get(box.id);
+    if (!hit || now() - hit.at >= DIFF_CACHE_MS) {
+      hit = { at: now(), value: deps.boxDiffStat(box).catch(() => null) };
+      diffCache.set(box.id, hit);
+    }
+    // A slow exec keeps running and answers a later read from the cache.
+    return orNullAfter(hit.value, diffTimeout);
   }
 
   async function liveBoxItems(
@@ -231,32 +278,42 @@ export function createTimelineBackend(
     tasks: WorkTask[],
     events: TimelineEvent[],
   ): Promise<TimelineLiveItem[]> {
-    const out: TimelineLiveItem[] = [];
-    for (const box of boxes) {
-      const mine = sortTasksByOrder(tasks.filter((t) => t.boxId === box.id));
-      const current = mine.find((t) => t.status === 'in_progress');
-      if (!current) continue;
-      const diff = await diffOf(box);
-      const since = events.find(
-        (ev) =>
-          (ev.type === 'task.assigned' && taskIdsOf(ev).includes(current.id)) ||
-          (ev.type === 'box.created' && ev.boxId === box.id),
-      );
-      out.push({
-        id: `live:task:${box.id}`,
-        type: 'task.in_progress',
-        at: since?.at ?? current.updatedAt,
-        boxId: box.id,
-        boxName: box.name,
-        ...(box.agent ? { agent: box.agent } : {}),
-        ...(box.branches[0] ? { branch: box.branches[0] } : {}),
-        ...(current.managerId ? { managerId: current.managerId } : {}),
-        task: { id: current.id, title: current.title },
-        taskIds: mine.filter((t) => t.status !== 'done').map((t) => t.id),
-        ...(diff ? diff : {}),
-      });
-    }
-    return out;
+    const rows = await Promise.all(
+      boxes.map(async (box): Promise<TimelineLiveItem | null> => {
+        const mine = sortTasksByOrder(tasks.filter((t) => t.boxId === box.id));
+        const current = mine.find((t) => t.status === 'in_progress');
+        if (!current) return null;
+        return liveBoxItem(box, mine, current, events, await diffOf(box));
+      }),
+    );
+    return rows.filter((row): row is TimelineLiveItem => row !== null);
+  }
+
+  function liveBoxItem(
+    box: TimelineBoxFact,
+    mine: WorkTask[],
+    current: WorkTask,
+    events: TimelineEvent[],
+    diff: DiffStat | null,
+  ): TimelineLiveItem {
+    const since = events.find(
+      (ev) =>
+        (ev.type === 'task.assigned' && taskIdsOf(ev).includes(current.id)) ||
+        (ev.type === 'box.created' && ev.boxId === box.id),
+    );
+    return {
+      id: `live:task:${box.id}`,
+      type: 'task.in_progress',
+      at: since?.at ?? current.updatedAt,
+      boxId: box.id,
+      boxName: box.name,
+      ...(box.agent ? { agent: box.agent } : {}),
+      ...(box.branches[0] ? { branch: box.branches[0] } : {}),
+      ...(current.managerId ? { managerId: current.managerId } : {}),
+      task: { id: current.id, title: current.title },
+      taskIds: mine.filter((t) => t.status !== 'done').map((t) => t.id),
+      ...(diff ? diff : {}),
+    };
   }
 
   return {
@@ -279,7 +336,7 @@ export function createTimelineBackend(
       items = items.slice(0, q.limit ?? TIMELINE_DEFAULT_LIMIT);
       const live = [
         ...(await liveBoxItems(boxes, tasks, events)),
-        ...liveReadyItems(events, (repo, n) => sync.prState(repo, n)),
+        ...liveReadyItems(events, (repo, n) => sync.prState(repo, n), sync.synced(wsId)),
       ];
       const boxIds = new Set(boxes.map((b) => b.id));
       const pending = (deps.pendingApprovalBoxIds?.() ?? []).filter((id) => boxIds.has(id)).length;
@@ -313,24 +370,51 @@ async function boxEventBase(
   };
 }
 
+export type StampFor = (
+  ref: { agent: string; sessionId: string } | { managerId: string },
+  wsId: string,
+) => Promise<TimelineStamp | undefined>;
+
+const HUMAN: TimelineStamp = { actor: 'human' };
+
+/**
+ * The stamp to write into `wsId`'s log. A session the route carried unresolved
+ * is resolved against this workspace, and a stamp naming another workspace's
+ * manager becomes a human one: that manager's turn means nothing in this log.
+ */
+export async function stampInWorkspace(
+  meta: TimelineMeta | undefined,
+  wsId: string,
+  stampFor: StampFor,
+): Promise<TimelineStamp | undefined> {
+  if (meta?.session) return (await stampFor(meta.session, wsId).catch(() => undefined)) ?? HUMAN;
+  const stamp = meta?.stamp;
+  if (!stamp?.managerId) return stamp;
+  const rec = await findManager(stamp.managerId).catch(() => null);
+  return rec?.workspaceId === wsId ? stamp : HUMAN;
+}
+
 export interface BoxTimelineSeams {
   deps: BackendDeps;
-  /** A manager's stamp (turn + prompt), for a create that names its manager. */
-  managerStamp(managerId: string): Promise<TimelineStamp | undefined>;
+  /** A manager's stamp (turn + prompt), only when it is a manager of `wsId`. */
+  stampFor: StampFor;
 }
 
 /**
  * Wrap the box routes that change what a workspace's timeline says: create,
  * start/stop/destroy, and the two pushes. Wrapped rather than threaded through
- * each method's many return paths; every record is best-effort and after the
- * operation answered, so it can never turn a success into a failure.
+ * each method's many return paths. Every record runs in the background after the
+ * operation answered, so it neither delays the response nor turns a success
+ * into a failure.
  */
 export function withBoxTimeline(hub: HubBackend, seams: BoxTimelineSeams): HubBackend {
   const { deps } = seams;
 
+  /** The box's persisted record; nothing when no workspace exists to log it in. */
   async function factOf(id: string): Promise<TimelineBoxFact | undefined> {
-    if (!deps.boxFacts || id.startsWith('job:')) return undefined;
-    return (await deps.boxFacts().catch(() => [])).find((b) => b.id === id);
+    if (!deps.boxFact || id.startsWith('job:')) return undefined;
+    if ((await listWorkspaces()).length === 0) return undefined;
+    return deps.boxFact(id);
   }
 
   async function recordAround<R extends { ok: boolean }>(
@@ -339,23 +423,22 @@ export function withBoxTimeline(hub: HubBackend, seams: BoxTimelineSeams): HubBa
     meta: TimelineMeta | undefined,
     op: () => Promise<R>,
   ): Promise<R> {
-    // Read before the op: a destroyed box has no record left to name it by.
-    const fact = await factOf(id).catch(() => undefined);
+    // A destroyed box has no record left to name it by, so that one is read first.
+    const before = type === 'box.destroyed' ? await factOf(id).catch(() => undefined) : undefined;
     const res = await op();
-    if (!res.ok || !fact) return res;
-    try {
+    if (!res.ok) return res;
+    inBackground(async () => {
+      const fact = before ?? (type === 'box.destroyed' ? undefined : await factOf(id));
+      if (!fact) return;
       const ws = await workspaceForPath(fact.projectRoot);
-      if (ws) {
-        await recordTimelineEvent(ws.id, {
-          type,
-          ...stampFields(meta?.stamp),
-          ...(await boxEventBase(fact, ws.id)),
-        });
-        deps.notify();
-      }
-    } catch {
-      /* best-effort */
-    }
+      if (!ws) return;
+      const [stamp, base] = await Promise.all([
+        stampInWorkspace(meta, ws.id, seams.stampFor),
+        boxEventBase(fact, ws.id),
+      ]);
+      await recordTimelineEvent(ws.id, { type, ...stampFields(stamp), ...base });
+      deps.notify();
+    });
     return res;
   }
 
@@ -369,32 +452,28 @@ export function withBoxTimeline(hub: HubBackend, seams: BoxTimelineSeams): HubBa
   hub.create = async (input, meta) => {
     const res = await create(input, meta);
     if (!res.ok || !input.projectId) return res;
-    try {
-      const ws = (await listWorkspaces()).find((w) => w.projectIds.includes(input.projectId!));
-      if (ws) {
-        const stamp =
-          meta?.stamp?.actor === 'manager'
-            ? meta.stamp
-            : input.managerId
-              ? ((await seams.managerStamp(input.managerId).catch(() => undefined)) ?? meta?.stamp)
-              : meta?.stamp;
-        const name = input.name?.trim();
-        const branch = input.opts?.useBranch ?? (name ? `agentbox/${name}` : undefined);
-        await recordTimelineEvent(ws.id, {
-          type: 'box.created',
-          ...stampFields(stamp),
-          ...(input.managerId && !stamp?.managerId ? { managerId: input.managerId } : {}),
-          key: `job:${res.jobId}:created`,
-          ...(name ? { boxName: name } : {}),
-          ...(input.agent !== 'none' ? { agent: input.agent } : {}),
-          ...(branch ? { branch } : {}),
-          projectId: input.projectId,
-        });
-        deps.notify();
-      }
-    } catch {
-      /* best-effort */
-    }
+    const projectId = input.projectId;
+    inBackground(async () => {
+      const ws = (await listWorkspaces()).find((w) => w.projectIds.includes(projectId));
+      if (!ws) return;
+      // The manager a create names is the one the box belongs to, whoever sent it.
+      const named = input.managerId
+        ? await seams.stampFor({ managerId: input.managerId }, ws.id).catch(() => undefined)
+        : undefined;
+      const stamp = named ?? (await stampInWorkspace(meta, ws.id, seams.stampFor));
+      const name = input.name?.trim();
+      const branch = input.opts?.useBranch ?? (name ? `agentbox/${name}` : undefined);
+      await recordTimelineEvent(ws.id, {
+        type: 'box.created',
+        ...stampFields(stamp),
+        key: `job:${res.jobId}:created`,
+        ...(name ? { boxName: name } : {}),
+        ...(input.agent !== 'none' ? { agent: input.agent } : {}),
+        ...(branch ? { branch } : {}),
+        projectId,
+      });
+      deps.notify();
+    });
     return res;
   };
   hub.start = (id, meta) => recordAround(id, 'box.started', meta, () => start(id, meta));

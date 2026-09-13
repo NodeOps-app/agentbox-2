@@ -322,9 +322,12 @@ export {
 // slice is the only consumer and it needs all three together.
 export * from './workspaces/index.js';
 export {
+  prMergeRepo,
   prMergeTarget,
+  prViewArgs,
   recordBoxGhResult,
   recordBoxGitPush,
   recordCreateJobTimeline,
   type BoxTimelineContext,
+  type GitPushOrigin,
 } from './timeline-hooks.js';

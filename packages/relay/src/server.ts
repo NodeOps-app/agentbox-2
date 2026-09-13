@@ -992,6 +992,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServerHandle {
         // Per-box `agentbox/<name>` branches are the box's own scratch branch
         // — pushes to them are the whole point of agentbox, so they bypass
         // the y/N gate. Any other branch still prompts.
+        let pushHostInitiated = false;
         if (body.method === 'git.push') {
           const hostOnlyParams = body.params as GitRpcParams | undefined;
           if (hostOnlyParams?.hostOnly) {
@@ -1049,6 +1050,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServerHandle {
             !bypassPushGate &&
             tokenClaimed &&
             hostInitiatedTokens.consume(params?.hostInitiated, reg.boxId, 'git.push', incomingHash);
+          pushHostInitiated = hostInitiatedOk;
           if (!bypassPushGate && tokenClaimed && !hostInitiatedOk) {
             send(res, 500, {
               exitCode: 10,
@@ -1098,7 +1100,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServerHandle {
                 hostPath: pushTree.hostMainRepo,
                 branch: pushTree.sanctionedBranch ?? pushTree.branch,
               },
-              pushParams,
+              { hostInitiated: pushHostInitiated, hostOnly: Boolean(pushParams?.hostOnly) },
               result,
             );
           }

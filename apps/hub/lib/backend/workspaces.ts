@@ -36,6 +36,7 @@ import {
   type Workspace,
   type WorkTask,
 } from '@agentbox/relay';
+import { inBackground } from './background';
 import { reconcileContext as fleetContext, type BackendDeps } from './deps';
 import type {
   ActionResult,
@@ -340,24 +341,28 @@ export function createWorkspaceBackend(deps: BackendDeps): WorkspaceBackend {
       if (bad) return err(bad);
       try {
         const tasks = await assignTasks(wsId, ids, target);
-        const box =
-          'boxId' in target && deps.boxFacts
-            ? (await deps.boxFacts().catch(() => [])).find((b) => b.id === target.boxId)
-            : undefined;
-        await record(wsId, {
-          type: 'task.assigned',
-          ...stampFields(meta?.stamp),
-          taskIds: tasks.map((t) => t.id),
-          ...(tasks.length === 1 ? { task: { id: tasks[0]!.id, title: tasks[0]!.title } } : {}),
-          ...('boxId' in target ? { boxId: target.boxId } : {}),
-          ...(box ? { boxName: box.name } : {}),
-          ...(box?.agent ? { agent: box.agent } : {}),
-          ...(box?.branches[0] ? { branch: box.branches[0] } : {}),
-          // "Gave more work to a running box" rather than "planned into a new one".
-          boxRunning: box?.state === 'running',
-        });
-        await recordNote(wsId, meta, ids);
         deps.notify();
+        // Naming the box probes its state, so the event is written after the answer.
+        inBackground(async () => {
+          const box =
+            'boxId' in target && deps.boxFact
+              ? await deps.boxFact(target.boxId, { withState: true }).catch(() => undefined)
+              : undefined;
+          await record(wsId, {
+            type: 'task.assigned',
+            ...stampFields(meta?.stamp),
+            taskIds: tasks.map((t) => t.id),
+            ...(tasks.length === 1 ? { task: { id: tasks[0]!.id, title: tasks[0]!.title } } : {}),
+            ...('boxId' in target ? { boxId: target.boxId } : {}),
+            ...(box ? { boxName: box.name } : {}),
+            ...(box?.agent ? { agent: box.agent } : {}),
+            ...(box?.branches[0] ? { branch: box.branches[0] } : {}),
+            // "Gave more work to a running box" rather than "planned into a new one".
+            boxRunning: box?.state === 'running',
+          });
+          await recordNote(wsId, meta, ids);
+          deps.notify();
+        });
         return { ok: true, tasks };
       } catch (e) {
         return err(e instanceof Error ? e.message : String(e));

@@ -966,22 +966,33 @@ export function parseManagerNote(body: unknown): Parsed<{ text: string; kind?: N
   };
 }
 
-export function parseManagerMessage(body: unknown): Parsed<{ text: string; prNumber?: number }> {
+const PR_REPO_RE = /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/;
+
+export function parseManagerMessage(
+  body: unknown,
+): Parsed<{ text: string; prNumber?: number; repo?: string }> {
   if (!isObject(body)) return { ok: false, message: 'body must be a JSON object' };
   const text = requiredText(body['text']);
   if (!text.ok) return text;
-  const { prNumber } = body;
+  const { prNumber, repo } = body;
   if (
     prNumber !== undefined &&
     (typeof prNumber !== 'number' || !Number.isInteger(prNumber) || prNumber <= 0)
   ) {
     return { ok: false, message: 'prNumber must be a positive integer' };
   }
+  if (repo !== undefined) {
+    if (typeof repo !== 'string' || !PR_REPO_RE.test(repo)) {
+      return { ok: false, message: 'repo must be owner/name' };
+    }
+    if (prNumber === undefined) return { ok: false, message: 'repo needs prNumber' };
+  }
   return {
     ok: true,
     value: {
       text: text.value,
       ...(prNumber !== undefined ? { prNumber: prNumber as number } : {}),
+      ...(repo !== undefined ? { repo: repo as string } : {}),
     },
   };
 }

@@ -9,6 +9,7 @@ import {
   parseProject,
   parsePrune,
   parseManagerDetect,
+  parseManagerMessage,
   parseManagerStart,
   parseTaskAssign,
   parseTaskCreate,
@@ -572,5 +573,17 @@ describe('managerId on creates and tasks', () => {
       value: { managerId: null },
     });
     expect(parseTaskUpdate({ managerId: 'x' }).ok).toBe(false);
+  });
+});
+
+describe('parseManagerMessage', () => {
+  it('accepts a repo alongside prNumber and refuses a bad or orphan one', () => {
+    expect(parseManagerMessage({ text: 'go', prNumber: 3, repo: 'o/r' })).toEqual({
+      ok: true,
+      value: { text: 'go', prNumber: 3, repo: 'o/r' },
+    });
+    expect(parseManagerMessage({ text: 'go', prNumber: 3, repo: 'o/r/x' }).ok).toBe(false);
+    expect(parseManagerMessage({ text: 'go', prNumber: 3, repo: 7 }).ok).toBe(false);
+    expect(parseManagerMessage({ text: 'go', repo: 'o/r' }).ok).toBe(false);
   });
 });

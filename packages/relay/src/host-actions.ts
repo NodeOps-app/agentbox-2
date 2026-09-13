@@ -383,15 +383,13 @@ export async function executeCloudAction(
     };
   }
   if (action.method === 'git.push' || action.method === 'git.fetch') {
-    return runGitRpc(action, deps).then((result) => {
+    const push = { hostInitiated: false };
+    return runGitRpc(action, deps, push).then((result) => {
       if (action.method === 'git.push' && result.exitCode === 0) {
+        const hostOnly = Boolean((action.params as GitRpcParams | undefined)?.hostOnly);
         void cloudTimelineContext(deps).then((ctx) =>
           ctx
-            ? recordBoxGitPush(
-                ctx,
-                action.params as { hostInitiated?: unknown; hostOnly?: unknown } | undefined,
-                result,
-              )
+            ? recordBoxGitPush(ctx, { hostInitiated: push.hostInitiated, hostOnly }, result)
             : undefined,
         );
       }
@@ -1276,6 +1274,8 @@ export async function resolveHostGitRepo(
 async function runGitRpc(
   action: HostAction,
   deps: CloudActionExecutorDeps,
+  /** Set once the push's host-initiated token is checked, for the timeline hook. */
+  push: { hostInitiated: boolean } = { hostInitiated: false },
 ): Promise<HostActionResult> {
   const params = (action.params ?? {}) as GitRpcParams;
   const lookup = await lookupCloudBox(deps.boxId);
@@ -1414,6 +1414,7 @@ async function runGitRpc(
       incomingHashGit,
     ) ??
       false);
+  push.hostInitiated = hostInitiatedOk;
   if (action.method === 'git.push' && !bypassPushGate && tokenClaimedGit && !hostInitiatedOk) {
     return {
       exitCode: 10,

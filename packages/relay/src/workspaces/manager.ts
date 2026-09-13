@@ -908,6 +908,17 @@ export const TMUX_PANE_RE = /^%\d+$/u;
 const SUBMIT_DELAY_MS = 400;
 
 /**
+ * The `send-keys -l` argv that types `text` verbatim. `--` keeps a leading `-`
+ * from parsing as a flag, and a trailing `;` is escaped because tmux reads an
+ * argument ending in `;` as a command separator and drops it.
+ */
+export function sendKeysLiteralArgv(target: string, text: string): string[] {
+  const flat = text.replace(/\s*[\r\n]+\s*/gu, ' ').trim();
+  const literal = flat.endsWith(';') ? `${flat.slice(0, -1)}\\;` : flat;
+  return ['send-keys', '-t', target, '-l', '--', literal];
+}
+
+/**
  * Type `text` into a running manager and submit it. Newlines are flattened: each
  * one would reach the agent as Enter and submit a fragment.
  */
@@ -921,8 +932,7 @@ export async function sendKeysToManager(
   if ('pane' in target && !TMUX_PANE_RE.test(target.pane)) {
     throw new Error(`not a tmux pane id: ${target.pane}`);
   }
-  const flat = text.replace(/\s*[\r\n]+\s*/gu, ' ').trim();
-  await exec('tmux', ['send-keys', '-t', t, '-l', flat]);
+  await exec('tmux', sendKeysLiteralArgv(t, text));
   await sleep(SUBMIT_DELAY_MS);
   await exec('tmux', ['send-keys', '-t', t, 'Enter']);
 }
@@ -983,6 +993,8 @@ interface TurnCache {
 
 /** Keyed by transcript path. Each call reads only the bytes appended since the last. */
 const turnCaches = new Map<string, TurnCache>();
+/** The read in flight per transcript path; the next caller waits for it. */
+const turnReads = new Map<string, Promise<SessionTurn | undefined>>();
 /** A codex session's rollout file, once found: the store is flat and walking it is not free. */
 const rolloutPaths = new Map<string, string>();
 const TURN_READ_CHUNK = 4 * 1024 * 1024;
@@ -1088,6 +1100,22 @@ export async function sessionTurn(
 ): Promise<SessionTurn | undefined> {
   const file = await transcriptFor(agent, cwd, sessionId, home);
   if (!file) return undefined;
+  // Two readers of one transcript would both absorb the bytes past the shared
+  // offset and count every turn in them twice.
+  const prev = turnReads.get(file) ?? Promise.resolve(undefined);
+  const next = prev.then(
+    () => readSessionTurn(agent, file),
+    () => readSessionTurn(agent, file),
+  );
+  turnReads.set(file, next);
+  try {
+    return await next;
+  } finally {
+    if (turnReads.get(file) === next) turnReads.delete(file);
+  }
+}
+
+async function readSessionTurn(agent: string, file: string): Promise<SessionTurn | undefined> {
   let fh;
   try {
     fh = await open(file, 'r');

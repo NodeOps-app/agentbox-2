@@ -2095,7 +2095,11 @@ export function createHubBackend(handle: RelayServerHandle): HubBackend {
       return new Set([...local.map((b) => b.id), ...registered.map((r) => r.boxId)]);
     },
     jobs: () => loadQueue().catch(() => []),
-    ...createBoxFactSeams({ listBoxes: () => listBoxes(), providerForBox }),
+    ...createBoxFactSeams({
+      listBoxes: () => listBoxes(),
+      readBoxRecord: async (id) => (await readState()).boxes.find((b) => b.id === id),
+      providerForBox,
+    }),
     pendingApprovalBoxIds: () => handle.prompts.all().map((p) => p.boxId),
   };
   const workspaces = createWorkspaceBackend(backendDeps);
@@ -3882,6 +3886,6 @@ export function createHubBackend(handle: RelayServerHandle): HubBackend {
   };
   return withBoxTimeline(hub, {
     deps: backendDeps,
-    managerStamp: (id) => managers.timelineStamp({ managerId: id }),
+    stampFor: (ref, wsId) => managers.timelineStamp(ref, wsId),
   });
 }

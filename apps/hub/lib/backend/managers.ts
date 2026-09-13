@@ -51,6 +51,7 @@ import {
   type WorkspaceRecord,
 } from '@agentbox/relay';
 import { reconcileContext, type BackendDeps } from './deps';
+import { stampInWorkspace } from './timeline';
 import { TMUX_MISSING } from './errors';
 import type {
   ActionResult,
@@ -171,26 +172,44 @@ export function createManagerBackend(
     };
   }
 
-  /** A lifecycle event about `rec`, by whoever the stamp names. Best-effort. */
+  async function timelineStamp(
+    ref: { agent: string; sessionId: string } | { managerId: string },
+    wsId?: string,
+  ): Promise<TimelineStamp | undefined> {
+    const rec =
+      'managerId' in ref
+        ? await findManager(ref.managerId)
+        : await findManagerBySession(ref.agent, ref.sessionId);
+    if (!rec || (wsId !== undefined && rec.workspaceId !== wsId)) return undefined;
+    return managerStamp(rec);
+  }
+
+  /** A lifecycle event about `rec`, by whoever the meta names in its workspace. Best-effort. */
   async function recordManagerEvent(
     rec: ManagerRecord,
     type: TimelineEventType,
-    stamp: TimelineStamp | undefined,
+    meta: TimelineMeta | undefined,
   ): Promise<void> {
     await recordTimelineEvent(rec.workspaceId, {
       type,
-      ...stampFields(stamp),
+      ...stampFields(await stampInWorkspace(meta, rec.workspaceId, timelineStamp)),
       managerId: rec.id,
       agent: rec.agent,
     });
   }
 
-  /** The PR a message is about, as the log last saw it. */
-  async function knownPr(wsId: string, number: number): Promise<TimelinePr> {
-    const hit = (await readTimeline(wsId).catch((): TimelineEvent[] => [])).find(
-      (ev) => ev.pr?.number === number,
+  /**
+   * The PR a message is about, as the log last saw it. Without `repo` that is
+   * the one repo in the log with this number; with none or several, the repo
+   * stays unknown, and an unknown repo matches no PR on read.
+   */
+  async function knownPr(wsId: string, number: number, repo?: string): Promise<TimelinePr> {
+    const hits = (await readTimeline(wsId).catch((): TimelineEvent[] => [])).filter(
+      (ev) => ev.pr?.number === number && ev.pr.repo && (!repo || ev.pr.repo === repo),
     );
-    return hit?.pr ?? { repo: '', number, title: '', url: '', base: '', head: '' };
+    const last = hits.at(-1)?.pr;
+    if (last && new Set(hits.map((ev) => ev.pr!.repo)).size === 1) return last;
+    return { repo: repo ?? '', number, title: '', url: '', base: '', head: '' };
   }
 
   async function viewsOf(ws: WorkspaceRecord, ctx: ReconcileContext): Promise<ManagerView[]> {
@@ -330,7 +349,7 @@ export function createManagerBackend(
       // A detect runs on nearly every CLI call; only a new record or a new
       // session in an existing one (`/clear`, a hub-run agent's first call) is news.
       if (created || sessionChanged) {
-        await recordManagerEvent(manager, 'manager.joined', { actor: 'manager' });
+        await recordManagerEvent(manager, 'manager.joined', { stamp: { actor: 'manager' } });
       }
       deps.notify();
       const [view, workspace] = await Promise.all([viewOf(manager.id), opts.workspaceView(ws.id)]);
@@ -388,7 +407,7 @@ export function createManagerBackend(
           } catch (e) {
             return err(messageOf(e));
           }
-          await recordManagerEvent(existing, 'manager.resumed', meta?.stamp);
+          await recordManagerEvent(existing, 'manager.resumed', meta);
           deps.notify();
           return answer(existing.id);
         }
@@ -416,7 +435,7 @@ export function createManagerBackend(
       } catch (e) {
         return err(`could not start the manager: ${messageOf(e)}`);
       }
-      await recordManagerEvent(manager, 'manager.started', meta?.stamp);
+      await recordManagerEvent(manager, 'manager.started', meta);
       deps.notify();
       return answer(manager.id);
     },
@@ -430,7 +449,7 @@ export function createManagerBackend(
       } catch (e) {
         return err(messageOf(e));
       }
-      await recordManagerEvent(rec, 'manager.resumed', meta?.stamp);
+      await recordManagerEvent(rec, 'manager.resumed', meta);
       deps.notify();
       return answer(id);
     },
@@ -445,7 +464,7 @@ export function createManagerBackend(
         return err(messageOf(e));
       }
       // Stop is idempotent: stopping a session that had already ended is not an event.
-      if (wasRunning) await recordManagerEvent(rec, 'manager.stopped', meta?.stamp);
+      if (wasRunning) await recordManagerEvent(rec, 'manager.stopped', meta);
       deps.notify();
       return answer(id);
     },
@@ -471,14 +490,7 @@ export function createManagerBackend(
       return listResumableHostSessions(ws.root, agent ?? 'claude');
     },
 
-    async timelineStamp(ref, wsId) {
-      const rec =
-        'managerId' in ref
-          ? await findManager(ref.managerId)
-          : await findManagerBySession(ref.agent, ref.sessionId);
-      if (!rec || (wsId !== undefined && rec.workspaceId !== wsId)) return undefined;
-      return managerStamp(rec);
-    },
+    timelineStamp,
 
     async addManagerNote(id, input): Promise<ManagerNoteResult> {
       const rec = await findManager(id);
@@ -528,11 +540,15 @@ export function createManagerBackend(
       } catch (e) {
         return err(messageOf(e));
       }
-      const pr =
-        input.prNumber !== undefined ? await knownPr(rec.workspaceId, input.prNumber) : undefined;
+      const [pr, stamp] = await Promise.all([
+        input.prNumber !== undefined
+          ? knownPr(rec.workspaceId, input.prNumber, input.repo)
+          : undefined,
+        stampInWorkspace(meta, rec.workspaceId, timelineStamp),
+      ]);
       const event = await recordTimelineEvent(rec.workspaceId, {
         type: 'manager.message',
-        ...stampFields(meta?.stamp),
+        ...stampFields(stamp),
         managerId: rec.id,
         text: input.text,
         ...(pr ? { pr } : {}),

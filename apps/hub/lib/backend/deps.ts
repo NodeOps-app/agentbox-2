@@ -66,8 +66,13 @@ export interface BackendDeps {
   processStartTime?: (pid: number) => Promise<string | undefined>;
   /** Every box this hub has a record for. Absent: the timeline names no boxes. */
   boxFacts?(): Promise<TimelineBoxFact[]>;
+  /**
+   * One box's persisted record, without listing the fleet. `withState` also
+   * reads its runtime state (a docker inspect, or a cloud box's last state).
+   */
+  boxFact?(id: string, opts?: { withState?: boolean }): Promise<TimelineBoxFact | undefined>;
   /** `git diff --shortstat` in a running box; null when the exec fails. */
-  boxDiffStat?(boxId: string): Promise<DiffStat | null>;
+  boxDiffStat?(box: TimelineBoxFact): Promise<DiffStat | null>;
   /** Box ids with a pending host-action approval. */
   pendingApprovalBoxIds?(): string[];
   /** How the GitHub sync runs `gh`; tests fake it, production spawns the host's gh. */

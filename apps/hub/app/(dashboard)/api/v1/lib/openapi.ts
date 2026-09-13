@@ -1817,7 +1817,7 @@ export function buildOpenApi(): Record<string, unknown> {
           tags: ['Managers', 'Timeline'],
           summary: "Type a message into a manager's session",
           description:
-            "Types `text` into the session and submits it (newlines are flattened to spaces). A running hub-run manager gets it in its tmux session (`delivered: session`); a running external manager in the tmux pane it reported at detect (`pane`, only when it runs on this hub's machine); a stopped manager with a session is resumed in the hub's tmux with the text as its prompt (`resumed`). A running external manager outside tmux answers 409 with code `manager_unreachable` — a client offers the text to paste instead. `prNumber` ties the message to a PR, which is how a later merge shows `approvedByYou`. Records `manager.message` on success.",
+            "Types `text` into the session and submits it (newlines are flattened to spaces). A running hub-run manager gets it in its tmux session (`delivered: session`); a running external manager in the tmux pane it reported at detect (`pane`, only when it runs on this hub's machine); a stopped manager with a session is resumed in the hub's tmux with the text as its prompt (`resumed`). A running external manager outside tmux answers 409 with code `manager_unreachable` — a client offers the text to paste instead. `prNumber` (with `repo`, `owner/name`, when the workspace spans several repos) ties the message to a PR, which is how a later merge shows `approvedByYou`; without `repo` the PR is matched only when one repo in the log has that number. Records `manager.message` on success.",
           parameters: [managerIdParam],
           requestBody: {
             required: true,
@@ -1828,6 +1828,11 @@ export function buildOpenApi(): Record<string, unknown> {
                   properties: {
                     text: { type: 'string', maxLength: 2000 },
                     prNumber: { type: 'integer', minimum: 1 },
+                    repo: {
+                      type: 'string',
+                      pattern: '^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$',
+                      description: '`owner/name` of the PR; requires `prNumber`.',
+                    },
                   },
                   required: ['text'],
                 },

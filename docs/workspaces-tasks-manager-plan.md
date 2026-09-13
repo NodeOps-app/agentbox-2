@@ -279,7 +279,10 @@ without writing and stamps `managerId`, `turn` and `prompt`. `sessionTurn` (`man
 transcript incrementally from a per-file offset — claude: a new `promptId` on a `user` row that is
 neither meta nor tool results only; codex: a `turn_context` row, with the prompt from the last
 `user_message` — and only when the store is on the hub's disk (the same rule as the title). No header
-(the tray, the web UI) is `human`.
+(the tray, the web UI) is `human`. A route that does not name a workspace (box create, lifecycle and
+git; manager message, stop and resume) carries the session unresolved, and the backend resolves it in
+the box's or manager's own workspace: a manager of another workspace is recorded as `human`, never
+stamped into this log.
 
 | Event | Written by |
 | --- | --- |
@@ -288,11 +291,11 @@ neither meta nor tool results only; codex: a `turn_context` row, with the prompt
 | `manager.started/resumed/stopped` | the manager slice (stop only when the session was running) |
 | `manager.note` | `POST /managers/{id}/notes`, and `note` on task create/update/assign/reorder bodies (`replan` for a reorder) |
 | `manager.message` | `POST /managers/{id}/message` |
-| `box.created` | the hub's create, with the manager's turn and key `job:<jobId>:created` |
+| `box.created` | the hub's create, key `job:<jobId>:created`, stamped with the manager the create names (`managerId`) when it belongs to the workspace, else with the caller's session |
 | `box.ready/failed` | the queue worker at a create job's terminal status, and the queue loop when a worker cannot start or dies (key `job:<jobId>:ready\|failed`) |
-| `box.started/stopped/destroyed`, `git.push` | the hub's box lifecycle route and git route (`push`, `push-host`), wrapped in `withBoxTimeline` |
-| `git.push` (from a box) | the relay `git.push` RPC, docker and cloud, unless host-initiated or host-only — those came through the hub route, which recorded the real caller |
-| `pr.opened/merged` (from a box) | the relay `gh` shim after an exit-0 `gh pr create` / `gh pr merge`, read back with `gh pr view` |
+| `box.started/stopped/destroyed`, `git.push` | the hub's box lifecycle route and git route (`push`, `push-host`), wrapped in `withBoxTimeline`. Written in the background after the operation answered, from the box's `state.json` record by id (read before a destroy, which removes it); nothing is read when no workspace exists. `task.assigned` is written the same way |
+| `git.push` (from a box) | the relay `git.push` RPC, docker and cloud, unless it is host-only or carried a host-initiated token the relay validated and consumed — those came through the hub route, which recorded the real caller. A `hostInitiated` param the relay rejected or never checked does not skip the event |
+| `pr.opened/merged` (from a box) | the relay `gh` shim after an exit-0 `gh pr create` / `gh pr merge`, read back with `gh pr view` (scoped with the merge's `-R`/`--repo` when it named one) |
 | `pr.opened/ready/merged/closed` | the GitHub sync |
 
 **Dedupe.** A PR event's key is `pr:<owner/repo>#<n>:<opened|ready|merged|closed>`, built by one
@@ -313,17 +316,23 @@ answers `{ items, live, summary?, github }`. Items collapse 3+ `task.created` fr
 within 10 minutes into one `plan` (`count`, `taskIds`, `prompt`), drop a move to `in_progress` within a
 minute of that task's assignment, and mark a `pr.merged` preceded by a message about it
 `approvedByYou`. `live` is built at read time and never stored: one row per box with an in-progress
-task (plus `git diff --shortstat` of a running box, cached 60 s) and one per `pr.ready` not merged or
-closed since (`awaiting`, and `approved` once a message about it exists), minus a PR the last sync saw
-go red. `summary` counts merges and their +/−, tasks done, and what awaits you (unapproved ready PRs
+task (plus `git diff --shortstat` of a running box, run for every box in parallel and cached 60 s; a
+read that waits over 3 s gets the row without the diff, and the still-running exec answers a later
+read) and one per `pr.ready` not merged or closed since (`awaiting`, and `approved` once a message about
+it exists), minus a PR the last sync saw go red. PR states live in the hub's memory, so after a restart,
+until a sync of that workspace completes, a ready PR no sync has confirmed is left out of `live` and of
+`summary.awaiting`. `summary` counts merges and their +/−, tasks done, and what awaits you (unapproved ready PRs
 plus pending approvals on the workspace's boxes) since `since`.
 
-**Approve does not merge.** The tray's Approve posts `POST /managers/{id}/message {text, prNumber?}`,
+**Approve does not merge.** The tray's Approve posts `POST /managers/{id}/message {text, prNumber?, repo?}`,
 which types the text into the manager and submits it — a running hub-run manager's tmux session, a
 running external manager's `$TMUX_PANE` (recorded at detect when `$TMUX` is set, and only reachable on
 the hub's machine), or a stopped manager resumed in the hub's tmux with the text as its prompt — and
-the manager merges. The text is typed with `send-keys -l`, newlines flattened, and submitted with a
-separate Enter after a short pause (the agent TUIs keep an Enter inside a key burst as a newline). A
+the manager merges. The text is typed with `send-keys -l --` (so a leading `-` is not a flag), newlines
+flattened, a trailing `;` escaped (tmux reads it as a command separator), and submitted with a
+separate Enter after a short pause (the agent TUIs keep an Enter inside a key burst as a newline).
+`repo` (`owner/name`) pins the PR the message is about; with only `prNumber` it is tied to a PR only when
+one repo in the log has that number, since a workspace can span several repos. A
 resume's prompt that starts with `-` gets a leading space so the agent cannot parse it as a flag.
 
 **CLI.** `agentbox manager note "<text>" [id] [--replan|--plan]`, and `--note` on

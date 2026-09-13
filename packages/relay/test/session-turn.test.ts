@@ -5,6 +5,7 @@ import { describe, expect, it } from 'vitest';
 import { encodeClaudeProjectsKey } from '@agentbox/sandbox-core';
 import {
   buildManagerArgv,
+  sendKeysLiteralArgv,
   sendKeysToManager,
   sessionTurn,
   upsertDetectedManager,
@@ -103,6 +104,32 @@ describe('sessionTurn', () => {
   });
 });
 
+describe('sessionTurn concurrency', () => {
+  it('counts each turn once when calls for one transcript overlap', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'agentbox-turn-par-'));
+    const file = await claudeTranscript(home);
+    // Rows without a prompt id are counted one by one, not deduped by id: the
+    // shape two overlapping reads of the same bytes would count twice.
+    await writeFile(
+      file,
+      jsonl([user(undefined, 'first'), user(undefined, 'second'), user(undefined, 'third')]),
+    );
+    const results = await Promise.all(
+      Array.from({ length: 6 }, () => sessionTurn('claude', CWD, ID, home)),
+    );
+    expect(results).toEqual(Array.from({ length: 6 }, () => ({ turn: 3, prompt: 'third' })));
+    await appendFile(file, jsonl([user(undefined, 'fourth')]));
+    const again = await Promise.all([
+      sessionTurn('claude', CWD, ID, home),
+      sessionTurn('claude', CWD, ID, home),
+    ]);
+    expect(again).toEqual([
+      { turn: 4, prompt: 'fourth' },
+      { turn: 4, prompt: 'fourth' },
+    ]);
+  });
+});
+
 describe('manager messages', () => {
   it('resumes with the message as the prompt, never letting it read as a flag', () => {
     expect(buildManagerArgv('claude', ID, 'Approved: merge PR #409')).toEqual([
@@ -134,15 +161,28 @@ describe('manager messages', () => {
       async () => {},
     );
     expect(calls).toEqual([
-      ['send-keys', '-t', '=agentbox-manager-abc:', '-l', 'line one line two'],
+      ['send-keys', '-t', '=agentbox-manager-abc:', '-l', '--', 'line one line two'],
       ['send-keys', '-t', '=agentbox-manager-abc:', 'Enter'],
     ]);
     calls.length = 0;
     await sendKeysToManager({ pane: '%12' }, 'hi', exec, async () => {});
-    expect(calls[0]).toEqual(['send-keys', '-t', '%12', '-l', 'hi']);
+    expect(calls[0]).toEqual(['send-keys', '-t', '%12', '-l', '--', 'hi']);
     await expect(
       sendKeysToManager({ pane: 'x; rm' }, 'hi', exec, async () => {}),
     ).rejects.toThrow();
+  });
+
+  it('keeps a leading dash and a trailing semicolon literal', () => {
+    expect(sendKeysLiteralArgv('%1', '-R reset please')).toEqual([
+      'send-keys',
+      '-t',
+      '%1',
+      '-l',
+      '--',
+      '-R reset please',
+    ]);
+    expect(sendKeysLiteralArgv('%1', 'merge PR #409;').at(-1)).toBe('merge PR #409\\;');
+    expect(sendKeysLiteralArgv('%1', 'a; b').at(-1)).toBe('a; b');
   });
 
   it('stores the pane a detected session reported, and reports a new session id', async () => {

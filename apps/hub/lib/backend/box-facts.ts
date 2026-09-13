@@ -1,6 +1,6 @@
-// The box seams the timeline reads (`BackendDeps.boxFacts` / `boxDiffStat`),
-// built from the host's box records. Kept out of `hub-backend.ts`, which only
-// hands in the two functions it owns.
+// The box seams the timeline reads (`BackendDeps.boxFacts` / `boxFact` /
+// `boxDiffStat`), built from the host's box records. Kept out of
+// `hub-backend.ts`, which only hands in the functions it owns.
 import { hashProjectPath } from '@agentbox/config';
 import type { BoxRecord, Provider } from '@agentbox/core';
 import { BOX_WORKSPACE } from '@agentbox/sandbox-core';
@@ -10,10 +10,14 @@ import { parseShortstat } from './timeline';
 
 export interface BoxFactSources {
   listBoxes(): Promise<ListedBox[]>;
+  /** The persisted record for one box (`state.json`), with no per-box probing. */
+  readBoxRecord(id: string): Promise<BoxRecord | undefined>;
   providerForBox(box: BoxRecord): Promise<Provider>;
 }
 
-export function boxFactOf(b: ListedBox): TimelineBoxFact {
+const STATE_PROBE_TIMEOUT_MS = 3000;
+
+export function boxFactOf(b: BoxRecord & { state?: string }): TimelineBoxFact {
   const root = b.projectRoot ?? b.workspacePath ?? b.id;
   const tree = b.gitWorktrees?.[0];
   const branches = [
@@ -34,16 +38,56 @@ export function boxFactOf(b: ListedBox): TimelineBoxFact {
   };
 }
 
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | undefined> {
+  return new Promise((resolve) => {
+    const t = setTimeout(() => resolve(undefined), ms);
+    t.unref?.();
+    p.then(
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      () => {
+        clearTimeout(t);
+        resolve(undefined);
+      },
+    );
+  });
+}
+
 export function createBoxFactSeams(src: BoxFactSources): {
   boxFacts(): Promise<TimelineBoxFact[]>;
-  boxDiffStat(boxId: string): Promise<DiffStat | null>;
+  boxFact(id: string, opts?: { withState?: boolean }): Promise<TimelineBoxFact | undefined>;
+  boxDiffStat(box: TimelineBoxFact): Promise<DiffStat | null>;
 } {
+  // The record a fact was built from, so a diff of a box that was just listed
+  // does not list the whole fleet again to find it.
+  const recordOf = new WeakMap<TimelineBoxFact, BoxRecord>();
+  const remember = (fact: TimelineBoxFact, rec: BoxRecord): TimelineBoxFact => {
+    recordOf.set(fact, rec);
+    return fact;
+  };
   return {
     async boxFacts() {
-      return (await src.listBoxes()).map(boxFactOf);
+      return (await src.listBoxes()).map((b) => remember(boxFactOf(b), b));
     },
-    async boxDiffStat(boxId) {
-      const box = (await src.listBoxes()).find((b) => b.id === boxId);
+    async boxFact(id, opts) {
+      const rec = await src.readBoxRecord(id);
+      if (!rec) return undefined;
+      let state: string | undefined;
+      if (opts?.withState) {
+        state =
+          rec.provider && rec.provider !== 'docker'
+            ? rec.cloud?.lastState
+            : await withTimeout(
+                src.providerForBox(rec).then((p) => p.probeState(rec)),
+                STATE_PROBE_TIMEOUT_MS,
+              );
+      }
+      return remember(boxFactOf(state ? { ...rec, state } : rec), rec);
+    },
+    async boxDiffStat(fact) {
+      const box = recordOf.get(fact) ?? (await src.readBoxRecord(fact.id));
       if (!box) return null;
       const provider = await src.providerForBox(box);
       const r = await provider.exec(box, ['git', 'diff', '--shortstat'], { cwd: BOX_WORKSPACE });

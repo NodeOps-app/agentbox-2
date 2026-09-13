@@ -35,6 +35,11 @@ export interface GithubPrSync {
   syncNow(ws: WorkspaceRecord): Promise<GithubSyncStatus>;
   /** The state a PR had at the last sync, when this hub has seen it. */
   prState(repo: string, number: number): PrLiveState | undefined;
+  /**
+   * Whether a sync of this workspace has completed since the hub started. PR
+   * states live in memory, so before that no logged `pr.ready` is confirmed.
+   */
+  synced(wsId: string): boolean;
 }
 
 export const GITHUB_SYNC_INTERVAL_MS = 60_000;
@@ -58,6 +63,7 @@ interface WorkspaceSyncState {
   lastAt: number;
   running: Promise<GithubSyncStatus> | null;
   status: GithubSyncStatus | null;
+  confirmed: boolean;
 }
 
 interface RepoRef {
@@ -216,7 +222,7 @@ export function createGithubPrSync(
   function stateOf(wsId: string): WorkspaceSyncState {
     let st = states.get(wsId);
     if (!st) {
-      st = { lastAt: 0, running: null, status: null };
+      st = { lastAt: 0, running: null, status: null, confirmed: false };
       states.set(wsId, st);
     }
     return st;
@@ -229,6 +235,7 @@ export function createGithubPrSync(
       .catch((): GithubSyncStatus => 'unavailable')
       .then((status) => {
         st.status = status;
+        if (status === 'ok') st.confirmed = true;
         st.lastAt = now();
         st.running = null;
         return status;
@@ -245,6 +252,9 @@ export function createGithubPrSync(
     syncNow: run,
     prState(repo, number) {
       return prStates.get(`${repo}#${String(number)}`);
+    },
+    synced(wsId) {
+      return states.get(wsId)?.confirmed ?? false;
     },
   };
 }

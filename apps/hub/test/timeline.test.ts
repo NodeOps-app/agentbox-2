@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { assertTempHome } from '../../../scripts/test-home.js';
+import { backgroundSettled } from '../lib/backend/background';
 import { createManagerBackend } from '../lib/backend/managers';
 import { createWorkspaceBackend } from '../lib/backend/workspaces';
 import { createGithubPrSync } from '../lib/backend/github-prs';
@@ -12,11 +13,16 @@ import {
   createTimelineBackend,
   liveReadyItems,
   parseShortstat,
+  stampInWorkspace,
+  withBoxTimeline,
 } from '../lib/backend/timeline';
 import type { BackendDeps, TimelineBoxFact } from '../lib/backend/deps';
+import type { HubBackend } from '../lib/boxes/backend-types';
 import { readTimeline, readWorkspace, type TimelineEvent } from '@agentbox/relay';
 
 const S1 = '5edc0ee0-ce9a-4e30-962d-bc630388d8bc';
+const S2 = '6fdc0ee0-ce9a-4e30-962d-bc630388d8bc';
+const S3 = '7fdc0ee0-ce9a-4e30-962d-bc630388d8bc';
 const MGR = '0123456789abcdef';
 
 let seq = 0;
@@ -102,6 +108,29 @@ describe('aggregateTimeline', () => {
     expect(items.find((i) => i.pr?.number === 409)?.approvedByYou).toBe(true);
     expect(items.find((i) => i.pr?.number === 405)?.approvedByYou).toBeUndefined();
   });
+
+  it('matches a message by repo and number, and a repo-less one only when the number is unambiguous', () => {
+    const other = pr(409, { repo: 'o/other', url: 'https://github.com/o/other/pull/409' });
+    const merged = ev({ type: 'pr.merged', actor: 'github', pr: pr(409) });
+    const wrongRepo = ev({ type: 'manager.message', actor: 'human', pr: other });
+    expect(
+      aggregateTimeline([wrongRepo, merged]).find((i) => i.type === 'pr.merged')?.approvedByYou,
+    ).toBeUndefined();
+
+    const bare = ev({ type: 'manager.message', actor: 'human', pr: pr(409, { repo: '' }) });
+    const single = aggregateTimeline([
+      bare,
+      ev({ type: 'pr.merged', actor: 'github', pr: pr(409) }),
+    ]);
+    expect(single.find((i) => i.type === 'pr.merged')?.approvedByYou).toBe(true);
+
+    const ambiguous = aggregateTimeline([
+      ev({ type: 'pr.ready', actor: 'github', pr: other }),
+      bare,
+      ev({ type: 'pr.merged', actor: 'github', pr: pr(409) }),
+    ]);
+    expect(ambiguous.find((i) => i.type === 'pr.merged')?.approvedByYou).toBeUndefined();
+  });
 });
 
 describe('live rows and summary', () => {
@@ -116,6 +145,16 @@ describe('live rows and summary', () => {
     expect(liveReadyItems([ready409, message])[0]?.approved).toBe(true);
     // The last sync saw it go red: not awaiting anyone any more.
     expect(liveReadyItems([ready409], () => 'open')).toEqual([]);
+    // No sync since the hub started: only a PR the sync already confirmed is live.
+    expect(liveReadyItems([ready409], () => undefined, false)).toEqual([]);
+    expect(liveReadyItems([ready409], () => 'ready', false)).toHaveLength(1);
+    const summary = buildTimelineSummary(
+      [ready409],
+      '2000-01-01T00:00:00.000Z',
+      liveReadyItems([ready409], () => undefined, false),
+      0,
+    );
+    expect(summary.awaiting).toBe(0);
   });
 
   it('sums merges and finished tasks since a time, and counts what awaits you', () => {
@@ -192,6 +231,7 @@ function harness(): Harness {
       return { exitCode: 0 };
     },
     boxFacts: async () => boxes,
+    boxFact: async (id) => boxes.find((b) => b.id === id),
     boxDiffStat: async () => ({ filesChanged: 3, additions: 84, deletions: 31 }),
     pendingApprovalBoxIds: () => [],
     ghExec: gh,
@@ -268,6 +308,7 @@ describe('timeline writes and reads', () => {
       },
     );
     if (!assigned.ok) throw new Error(assigned.error);
+    await backgroundSettled();
     const note = await managers.addManagerNote(detected.manager.id, {
       text: 'holding B until A merges',
       kind: 'replan',
@@ -421,7 +462,14 @@ describe('sendManagerMessage', () => {
     if (!res.ok) throw new Error(res.error);
     expect(res.delivered).toBe('session');
     const session = `=agentbox-manager-${started.manager.id}:`;
-    expect(h.spawned).toContainEqual(['send-keys', '-t', session, '-l', 'Approved: merge PR #409']);
+    expect(h.spawned).toContainEqual([
+      'send-keys',
+      '-t',
+      session,
+      '-l',
+      '--',
+      'Approved: merge PR #409',
+    ]);
     expect(h.spawned).toContainEqual(['send-keys', '-t', session, 'Enter']);
     expect(res.event).toMatchObject({
       type: 'manager.message',
@@ -457,7 +505,7 @@ describe('sendManagerMessage', () => {
     if (!paned.ok) throw new Error(paned.error);
     const sent = await managers.sendManagerMessage(paned.manager.id, { text: 'hello' });
     expect(sent).toMatchObject({ ok: true, delivered: 'pane' });
-    expect(h.spawned).toContainEqual(['send-keys', '-t', '%5', '-l', 'hello']);
+    expect(h.spawned).toContainEqual(['send-keys', '-t', '%5', '-l', '--', 'hello']);
   });
 
   it('resumes a stopped manager with the message as its prompt', async () => {
@@ -476,5 +524,182 @@ describe('sendManagerMessage', () => {
     expect(res).toMatchObject({ ok: true, delivered: 'resumed' });
     const start = h.spawned.find((a) => a[0] === 'new-session');
     expect(start?.at(-1)).toContain(`'--resume' '${S1}' 'keep going'`);
+  });
+});
+
+describe('diffs on the live rows', () => {
+  it('leaves the diff off a row whose exec is slow, and shares one exec between reads', async () => {
+    const h = harness();
+    const { workspaces } = backends(h);
+    const root = await folder();
+    const added = await workspaces.addWorkspace({ path: root });
+    if (!added.ok) throw new Error(added.error);
+    const wsId = added.workspace.id;
+    for (const id of ['box1', 'box2']) {
+      h.boxes.push({
+        id,
+        name: id,
+        branches: [`agentbox/${id}`],
+        state: 'running',
+        projectRoot: root,
+        projectId: 'p1',
+      });
+    }
+    for (const [title, boxId] of [
+      ['A', 'box1'],
+      ['B', 'box2'],
+    ] as const) {
+      const t = await workspaces.addTask(wsId, { title });
+      if (!t.ok) throw new Error(t.error);
+      const a = await workspaces.assignTasks(wsId, [t.task.id], { boxId });
+      if (!a.ok) throw new Error(a.error);
+    }
+    await backgroundSettled();
+    let release: (v: {
+      filesChanged: number;
+      additions: number;
+      deletions: number;
+    }) => void = () => {};
+    const slow = new Promise<{ filesChanged: number; additions: number; deletions: number }>(
+      (resolve) => {
+        release = resolve;
+      },
+    );
+    const calls: string[] = [];
+    h.deps.boxDiffStat = async (box) => {
+      calls.push(box.id);
+      return box.id === 'box1' ? slow : { filesChanged: 1, additions: 2, deletions: 3 };
+    };
+    const timeline = createTimelineBackend(h.deps, { diffTimeoutMs: 30 });
+    const [first, second] = await Promise.all([
+      timeline.getTimeline(wsId),
+      timeline.getTimeline(wsId),
+    ]);
+    for (const res of [first, second]) {
+      const rows = res!.live.filter((l) => l.type === 'task.in_progress');
+      expect(rows.find((l) => l.boxId === 'box1')?.filesChanged).toBeUndefined();
+      expect(rows.find((l) => l.boxId === 'box2')?.filesChanged).toBe(1);
+    }
+    expect(calls.sort()).toEqual(['box1', 'box2']);
+    release({ filesChanged: 9, additions: 9, deletions: 9 });
+    const later = await timeline.getTimeline(wsId);
+    expect(later!.live.find((l) => l.boxId === 'box1')?.filesChanged).toBe(9);
+    expect(calls).toHaveLength(2);
+  });
+});
+
+describe('stamps from routes that do not name a workspace', () => {
+  function fakeHub(): HubBackend {
+    const okResult = async () => ({ ok: true as const });
+    return {
+      create: async () => ({ ok: true as const, jobId: 'job1' }),
+      start: okResult,
+      stop: okResult,
+      destroy: okResult,
+      gitPush: okResult,
+      gitPushHost: okResult,
+    } as unknown as HubBackend;
+  }
+
+  it("never writes another workspace's manager into a log, and a create keeps its named manager", async () => {
+    const h = harness();
+    const { managers } = backends(h);
+    const root1 = await folder();
+    const root2 = await folder();
+    const detect = async (sessionId: string, cwd: string) => {
+      const d = await managers.detectManager({ agent: 'claude', sessionId, cwd, host: 'laptop' });
+      if (!d.ok) throw new Error(d.error);
+      return d;
+    };
+    const a = await detect(S1, root1);
+    const c = await detect(S3, root1);
+    const b = await detect(S2, root2);
+    expect(a.workspace.id).not.toBe(b.workspace.id);
+    const ws1 = a.workspace.id;
+
+    const foreign = await stampInWorkspace(
+      { session: { agent: 'claude', sessionId: S2 } },
+      ws1,
+      managers.timelineStamp,
+    );
+    expect(foreign).toEqual({ actor: 'human' });
+    expect(
+      await stampInWorkspace(
+        { stamp: { actor: 'manager', managerId: b.manager.id } },
+        ws1,
+        managers.timelineStamp,
+      ),
+    ).toEqual({ actor: 'human' });
+
+    h.boxes.push({
+      id: 'box1',
+      name: 'box-one',
+      branches: ['agentbox/box-one'],
+      state: 'running',
+      projectRoot: root1,
+      projectId: 'p1',
+    });
+    const hub = withBoxTimeline(fakeHub(), { deps: h.deps, stampFor: managers.timelineStamp });
+    await hub.start('box1', { session: { agent: 'claude', sessionId: S2 } });
+    await hub.stop('box1', { session: { agent: 'claude', sessionId: S1 } });
+    const projectId = (await readWorkspace(ws1))!.projectIds[0]!;
+    await hub.create(
+      { projectId, managerId: c.manager.id, agent: 'claude', name: 'made' } as Parameters<
+        HubBackend['create']
+      >[0],
+      { session: { agent: 'claude', sessionId: S1 } },
+    );
+    await backgroundSettled();
+
+    const events = await readTimeline(ws1);
+    const started = events.find((e) => e.type === 'box.started');
+    expect(started).toMatchObject({ actor: 'human', boxName: 'box-one' });
+    expect(started?.managerId).toBeUndefined();
+    expect(started?.turn).toBeUndefined();
+    expect(events.find((e) => e.type === 'box.stopped')).toMatchObject({
+      actor: 'manager',
+      managerId: a.manager.id,
+      turn: 41,
+    });
+    expect(events.find((e) => e.type === 'box.created')).toMatchObject({
+      actor: 'manager',
+      managerId: c.manager.id,
+    });
+    expect((await readTimeline(b.workspace.id)).some((e) => e.type.startsWith('box.'))).toBe(false);
+  });
+});
+
+describe('a message about a PR in a workspace over several repos', () => {
+  it('ties the message to the repo it names, and to none when the number alone is ambiguous', async () => {
+    const h = harness();
+    const { workspaces, managers } = backends(h);
+    const added = await workspaces.addWorkspace({ path: await folder() });
+    if (!added.ok) throw new Error(added.error);
+    const wsId = added.workspace.id;
+    const { recordTimelineEvent } = await import('@agentbox/relay');
+    await recordTimelineEvent(wsId, { type: 'pr.ready', actor: 'github', pr: pr(12) });
+    await recordTimelineEvent(wsId, {
+      type: 'pr.ready',
+      actor: 'github',
+      pr: pr(12, { repo: 'o/web', url: 'https://github.com/o/web/pull/12' }),
+    });
+    const started = await managers.startManager(wsId, { agent: 'claude' });
+    if (!started.ok) throw new Error(started.error);
+    const named = await managers.sendManagerMessage(started.manager.id, {
+      text: 'merge it',
+      prNumber: 12,
+      repo: 'o/web',
+    });
+    if (!named.ok) throw new Error(named.error);
+    expect(named.event?.pr).toMatchObject({ repo: 'o/web', number: 12, title: 'PR 12' });
+    const bare = await managers.sendManagerMessage(started.manager.id, {
+      text: 'merge 12',
+      prNumber: 12,
+    });
+    if (!bare.ok) throw new Error(bare.error);
+    expect(bare.event?.pr).toMatchObject({ repo: '', number: 12 });
+    const live = liveReadyItems(await readTimeline(wsId));
+    expect(live.find((l) => l.pr?.repo === 'o/web')?.approved).toBe(true);
+    expect(live.find((l) => l.pr?.repo === 'o/r')?.approved).toBeUndefined();
   });
 });

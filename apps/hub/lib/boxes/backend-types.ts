@@ -971,6 +971,11 @@ export interface RemoteDockerHostView {
 /** Who made a mutation (for the timeline), and the note explaining it, if any. */
 export interface TimelineMeta {
   stamp?: TimelineStamp;
+  /**
+   * The caller's `X-AgentBox-Session`, not yet resolved: set instead of `stamp`
+   * when the route does not know the workspace, which the backend resolves it in.
+   */
+  session?: { agent: string; sessionId: string };
   note?: string;
 }
 
@@ -1165,7 +1170,7 @@ export interface ManagerBackend {
   /** Type a message into the manager's session (resuming a stopped one with it). */
   sendManagerMessage(
     id: string,
-    input: { text: string; prNumber?: number },
+    input: { text: string; prNumber?: number; repo?: string },
     meta?: TimelineMeta,
   ): Promise<ManagerMessageResult>;
   /** Forget a manager record. Refused while it runs, unless `force`. */

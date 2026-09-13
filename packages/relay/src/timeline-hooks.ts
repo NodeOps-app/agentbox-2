@@ -26,6 +26,13 @@ async function boxTaskIds(wsId: string, boxId: string): Promise<string[]> {
   return tasks.filter((t) => t.boxId === boxId).map((t) => t.id);
 }
 
+/** How the relay classified a push, after checking its host-initiated token. */
+export interface GitPushOrigin {
+  /** A token the relay minted and just consumed, not merely a `hostInitiated` param. */
+  hostInitiated: boolean;
+  hostOnly: boolean;
+}
+
 /**
  * A push the box itself asked for. A host-initiated one came from the hub's git
  * route (or the CLI through it), which records it with the real caller; a
@@ -33,10 +40,10 @@ async function boxTaskIds(wsId: string, boxId: string): Promise<string[]> {
  */
 export async function recordBoxGitPush(
   ctx: BoxTimelineContext,
-  params: { hostInitiated?: unknown; hostOnly?: unknown } | undefined,
+  origin: GitPushOrigin,
   result: { exitCode: number },
 ): Promise<void> {
-  if (result.exitCode !== 0 || params?.hostInitiated || params?.hostOnly) return;
+  if (result.exitCode !== 0 || origin.hostInitiated || origin.hostOnly) return;
   try {
     const ws = await workspaceForPath(ctx.hostPath);
     if (!ws) return;
@@ -69,6 +76,8 @@ const MERGE_VALUE_FLAGS = new Set([
   '-A',
   '--author-email',
   '--match-head-commit',
+  '-R',
+  '--repo',
 ]);
 
 /** The PR a `gh pr merge` names (number, URL or branch), if it names one. */
@@ -82,6 +91,35 @@ export function prMergeTarget(rest: readonly string[]): string | undefined {
     if (!arg.startsWith('-')) return arg;
   }
   return undefined;
+}
+
+/** The repo a `gh pr merge` names with `-R`/`--repo`, if any. */
+export function prMergeRepo(rest: readonly string[]): string | undefined {
+  for (let i = 0; i < rest.length; i++) {
+    const arg = rest[i] ?? '';
+    if (arg === '-R' || arg === '--repo') return rest[i + 1] || undefined;
+    if (arg.startsWith('--repo=')) return arg.slice('--repo='.length) || undefined;
+    if (arg.startsWith('-R') && arg.length > 2) return arg.slice(2);
+    if (MERGE_VALUE_FLAGS.has(arg)) i++;
+  }
+  return undefined;
+}
+
+/** The `gh pr view` that reads a PR back, scoped to the repo the original command named. */
+export function prViewArgs(
+  lead: readonly string[],
+  target: string,
+  repo: string | undefined,
+): string[] {
+  return [
+    ...lead,
+    'pr',
+    'view',
+    target,
+    ...(repo ? ['--repo', repo] : []),
+    '--json',
+    GH_PR_JSON_FIELDS,
+  ];
 }
 
 /**
@@ -109,14 +147,8 @@ export async function recordBoxGhResult(
     const lead = args.slice(0, args.length - verb.length);
     const ghTarget = await resolveGhTarget(ctx.originUrl);
     if (ghTarget.error) return;
-    const run = ghRunContext(ctx.hostPath, ctx.originUrl, [
-      ...lead,
-      'pr',
-      'view',
-      target,
-      '--json',
-      GH_PR_JSON_FIELDS,
-    ]);
+    const repo = verb[1] === 'merge' ? prMergeRepo(verb.slice(2)) : undefined;
+    const run = ghRunContext(ctx.hostPath, ctx.originUrl, prViewArgs(lead, target, repo));
     const view = await runHostGh(run.args, run.cwd, { host: ghTarget.host, timeoutMs: 20_000 });
     if (view.exitCode !== 0) return;
     const pr = JSON.parse(view.stdout) as GhPrJson;
