@@ -465,6 +465,7 @@ agentbox tasks list -a --json
 agentbox tasks show T-11
 agentbox tasks update T-11 --status blocked
 agentbox tasks reorder T-14 T-11 T-12 # list every id
+agentbox tasks reorder T-14 T-11 T-12 --note "T-14 unblocks the payment tasks"  # say why
 agentbox tasks done T-11
 agentbox tasks rm T-11 -y
 
@@ -497,6 +498,8 @@ agentbox manager start --agent claude       # a new hub-run manager; offers to r
 agentbox manager start --agent codex --new  # --new skips the resume picker
 agentbox manager attach                     # the running hub-run manager; or --attach-in split|window|tab
 agentbox manager sessions --agent codex     # resumable sessions in this folder
+agentbox manager note "holding T-12 until #405 merges" --replan  # on the timeline, at this turn
+agentbox manager note "split checkout into two boxes" 3f9a       # a manager by id, from anywhere
 ```
 
 A manager is either **external** — the Claude Code or Codex session in your own terminal, detected
@@ -512,6 +515,14 @@ need `tmux` on the machine running the hub; `agentbox doctor` tells you if it is
 agent's own store; `--session <id>` on `start` resumes one. Only `claude` and `codex` are resumable —
 each with its own spelling — and the rest report that they are unsupported rather than quietly
 starting a fresh agent that looks resumed.
+
+Every change a manager session makes through `agentbox` lands on the workspace **timeline** — the
+tray's Manager window, and `GET /api/v1/workspaces/{id}/timeline` — stamped with the session's turn,
+next to the boxes that session started, their pushes and the pull requests that merged. The timeline
+cannot see the reasoning, so say it: `--note` on `tasks add | update | assign | reorder` and
+`manager note` (with `--replan` or `--plan`) record why next to the change. Outside a session,
+`manager note` needs a manager id. A message the tray's **Approve** sends reaches a hub-run manager in
+its tmux session, and an external one only when its terminal runs inside tmux.
 
 Detection has limits. OpenCode and Pi export no session id, so their sessions are never registered.
 Codex's default `workspace-write` sandbox blocks loopback, so the CLI cannot reach the hub from inside

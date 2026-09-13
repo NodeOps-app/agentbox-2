@@ -53,6 +53,8 @@ the manager's own instructions come after.
 | 7 | Linear import: one ticket → several local tasks | planned |
 | 8a | Managers are detected, not declared: many per workspace, `/api/v1/managers`, `Box.managerId` | **done** |
 | 8b | Tray: boxes grouped by manager, the Manager window's session picker | planned |
+| 9a | Timeline: per-workspace event log, GitHub PR sync, `GET …/timeline`, manager notes and messages | **done** |
+| 9b | Tray: Plan / Timeline in the Manager window, Approve → message the manager | in progress |
 
 ### Known gaps
 
@@ -250,6 +252,99 @@ with `hostname` / `isPidAlive` seams on `BackendDeps` so the status matrix is te
 **CLI.** `agentbox manager list | status [id] | start | resume <id> | stop <id> | attach [id] |
 sessions | forget <id>`; `agentbox tasks list --manager <id> | --mine`. A `tasks` / `workspace` /
 `manager` command in a folder no workspace contains registers the session instead of failing.
+
+## Phase 9 — the timeline
+
+The Manager window shows what is planned and the manager's terminal. The timeline shows what
+happened: which boxes a manager started, what merged, which tasks finished, when it re-planned and
+why, when a running box was given more work. Nothing recorded that before — tasks, managers and box
+records are current state whose timestamps are overwritten, and the relay's event ring is in memory
+and per box — so this phase adds an append-only log per workspace and writes to it at every mutation
+point.
+
+**The log.** `~/.agentbox/workspaces/<id>-<slug>/timeline.jsonl`, one `TimelineEvent` per line
+(`packages/relay/src/workspaces/timeline-store.ts`). An append takes the workspace lock and is one
+`appendFile`. Past 5000 lines, or once the oldest event is over 90 days old, the file is rewritten
+(temp+rename) keeping the newest 4000 events inside the window — below the trigger, so a full log is
+not rewritten on every append. Reads order by `at`, not by append order: a merge the GitHub sync finds
+late carries the time it merged. Several processes append (the hub, the relay's RPC handlers, a queue
+worker), so the in-memory index of dedupe keys is refreshed from the bytes past its last offset on
+every use, and rebuilt when the inode changes (a compaction). Every writer except the note route is
+best-effort: a log failure never fails the mutation that already happened.
+
+**Who.** Every event has an `actor`: `human`, `manager`, `box`, `hub` or `github`. The CLI sends
+`X-AgentBox-Session: <agent>:<sessionId>` on every request when it runs inside a host session (detected
+once per process, without the `ps` walk); the hub resolves it to a manager of the route's workspace
+without writing and stamps `managerId`, `turn` and `prompt`. `sessionTurn` (`manager.ts`) reads the
+transcript incrementally from a per-file offset — claude: a new `promptId` on a `user` row that is
+neither meta nor tool results only; codex: a `turn_context` row, with the prompt from the last
+`user_message` — and only when the store is on the hub's disk (the same rule as the title). No header
+(the tray, the web UI) is `human`.
+
+| Event | Written by |
+| --- | --- |
+| `task.created/status/assigned/unassigned/removed` | the workspace slice's task methods. `assigned` carries `boxRunning` ("gave more work to a running box"); `reorder` records only its note |
+| `manager.joined` | detect, only for a new record or a new session id on one |
+| `manager.started/resumed/stopped` | the manager slice (stop only when the session was running) |
+| `manager.note` | `POST /managers/{id}/notes`, and `note` on task create/update/assign/reorder bodies (`replan` for a reorder) |
+| `manager.message` | `POST /managers/{id}/message` |
+| `box.created` | the hub's create, with the manager's turn and key `job:<jobId>:created` |
+| `box.ready/failed` | the queue worker at a create job's terminal status, and the queue loop when a worker cannot start or dies (key `job:<jobId>:ready\|failed`) |
+| `box.started/stopped/destroyed`, `git.push` | the hub's box lifecycle route and git route (`push`, `push-host`), wrapped in `withBoxTimeline` |
+| `git.push` (from a box) | the relay `git.push` RPC, docker and cloud, unless host-initiated or host-only — those came through the hub route, which recorded the real caller |
+| `pr.opened/merged` (from a box) | the relay `gh` shim after an exit-0 `gh pr create` / `gh pr merge`, read back with `gh pr view` |
+| `pr.opened/ready/merged/closed` | the GitHub sync |
+
+**Dedupe.** A PR event's key is `pr:<owner/repo>#<n>:<opened|ready|merged|closed>`, built by one
+function (`prTimelineEvents` in `timeline-pr.ts`) for both the shim and the sync, so a merge reported by
+both lands once.
+
+**GitHub sync** (`apps/hub/lib/backend/github-prs.ts`). `GET …/timeline` starts one in the background
+when the last is over 60 s old; one runs per workspace at a time, and rows it appends fire `notify()`.
+It collapses the workspace's project folders to the GitHub repos behind them (`gh repo view`, cached),
+runs `gh pr list --state all --limit 50 --search updated:>=<workspace created>` per repo, and keeps a
+PR whose head branch the workspace knows (a box's branch, or any branch on a logged event) or whose
+author is the `gh` user — the second rule is how the manager's own host-side PRs get in. `pr.ready` is
+open, checks passing, and `mergeStateStatus` CLEAN or HAS_HOOKS. Without `gh`, logged out, or with no
+GitHub repo, the response says `github: 'unavailable'`.
+
+**Reading** (`apps/hub/lib/backend/timeline.ts`). `GET /workspaces/{id}/timeline?before=&limit=&since=`
+answers `{ items, live, summary?, github }`. Items collapse 3+ `task.created` from one manager turn
+within 10 minutes into one `plan` (`count`, `taskIds`, `prompt`), drop a move to `in_progress` within a
+minute of that task's assignment, and mark a `pr.merged` preceded by a message about it
+`approvedByYou`. `live` is built at read time and never stored: one row per box with an in-progress
+task (plus `git diff --shortstat` of a running box, cached 60 s) and one per `pr.ready` not merged or
+closed since (`awaiting`, and `approved` once a message about it exists), minus a PR the last sync saw
+go red. `summary` counts merges and their +/−, tasks done, and what awaits you (unapproved ready PRs
+plus pending approvals on the workspace's boxes) since `since`.
+
+**Approve does not merge.** The tray's Approve posts `POST /managers/{id}/message {text, prNumber?}`,
+which types the text into the manager and submits it — a running hub-run manager's tmux session, a
+running external manager's `$TMUX_PANE` (recorded at detect when `$TMUX` is set, and only reachable on
+the hub's machine), or a stopped manager resumed in the hub's tmux with the text as its prompt — and
+the manager merges. The text is typed with `send-keys -l`, newlines flattened, and submitted with a
+separate Enter after a short pause (the agent TUIs keep an Enter inside a key burst as a newline). A
+resume's prompt that starts with `-` gets a leading space so the agent cannot parse it as a flag.
+
+**CLI.** `agentbox manager note "<text>" [id] [--replan|--plan]`, and `--note` on
+`tasks add | update | assign | reorder`. There is no timeline command: the hub API and the tray read it.
+
+### Known gaps (Phase 9)
+
+- **GitHub remotes only.** A project whose remote is not on GitHub gets no PR rows.
+- **A turn needs a local store.** A manager whose transcript is on another machine is stamped with its
+  id but no turn or prompt.
+- **An external manager outside tmux can't receive a message.** The route answers 409
+  `manager_unreachable` and the client offers the text to paste. A pane is addressed on the hub user's
+  default tmux server.
+- **Merges done by hand on github.com show up only for known branches or PRs by the gh user**, and only
+  on the next sync, which runs when the timeline is read.
+- **The log cannot un-append.** A PR logged `pr.ready` that later went red stays in the history; the
+  live row follows the last sync, whose PR states live in the hub's memory and are empty after a
+  restart until the next sync.
+- **`box.started` records the request**, including one for a box that was already running.
+- **Relay-side writes fire no change event.** A push or PR from a box shows on the next poll or the
+  next hub-side change.
 
 ## Files to touch (representative)
 
