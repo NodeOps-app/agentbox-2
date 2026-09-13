@@ -37,7 +37,7 @@ import {
   parseTaskIdsOrExit,
   preflightOrExit,
 } from '../../lib/tasks-assign.js';
-import { withHubClient } from '../../control-plane/with-hub.js';
+import { withHubClient, withHubClientQuiet } from '../../control-plane/with-hub.js';
 import { parseMaxOption } from '../../lib/queue/parse-max-option.js';
 import { submitQueueJob } from '../../lib/queue/submit.js';
 import { captureOpenTerminalContext } from '../../terminal/queue-open.js';
@@ -238,9 +238,16 @@ export async function runAgentCreate(
    */
   const recordCreate = async (target: { boxId: string } | { boxJobId: string }): Promise<void> => {
     if (sessionHint) {
-      await withHubClient({ preferLocal: true }, (client) =>
+      // Quiet: a docker create never needed the hub, so an unreachable one must
+      // not print an error, set a failing exit code, or get auto-started here.
+      const registered = await withHubClientQuiet({ preferLocal: true }, (client) =>
         registerHostManager(client, sessionHint, target),
       );
+      if (!registered.ok) {
+        log.warn(
+          `could not register this ${sessionHint.agent} session as a manager: ${registered.error}`,
+        );
+      }
     }
     if (!taskWorkspaceId) return;
     await withHubClient({ preferLocal: true }, (client) =>
