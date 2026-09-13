@@ -49,6 +49,13 @@ export async function resolveWorkspace(
   return (await resolveWorkspaceAndManager(client, ref)).workspace;
 }
 
+/** Process seams, so a test drives resolution without the real env, cwd or ~/.claude. */
+export interface WorkspaceRefDeps {
+  env?: NodeJS.ProcessEnv;
+  cwd?: string;
+  detect?: () => HostSessionHint | undefined;
+}
+
 /**
  * Resolve the workspace and, inside a host agent session, the manager that
  * session is registered as.
@@ -58,12 +65,6 @@ export async function resolveWorkspace(
  * first. `register` also registers when a workspace was found, for a caller that
  * needs the manager id (a task added from inside a session belongs to it).
  */
-export interface WorkspaceRefDeps {
-  env?: NodeJS.ProcessEnv;
-  cwd?: string;
-  detect?: () => HostSessionHint | undefined;
-}
-
 export async function resolveWorkspaceAndManager(
   client: Pick<HubApiClient, 'listWorkspaces' | 'detectManager'>,
   ref?: string,
