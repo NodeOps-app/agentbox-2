@@ -23,6 +23,7 @@ import {
   managerSessionName,
   managerStatus,
   newManagerId,
+  readManagerExit,
   readManagers,
   readReconciledManagers,
   reconcileManagers,
@@ -36,6 +37,7 @@ import {
   tmuxSessionExists,
   toManagerView,
   upsertDetectedManager,
+  usesLegacySession,
   type ManagerExec,
   type ManagerRecord,
   type WorkTask,
@@ -437,6 +439,45 @@ describe('the single-manager layout', () => {
     expect(existsSync(join(dir, 'manager.json'))).toBe(false);
     expect(existsSync(join(dir, 'manager.exit'))).toBe(false);
     expect(await readManagers(id)).toEqual([migrated]);
+  });
+
+  it("reads a session's exit code from the old path after migrating, and drops it on stop", async () => {
+    const { id, root } = await makeWorkspace();
+    const dir = (await resolveWorkspaceDir(id))!;
+    await writeFile(
+      join(dir, 'manager.json'),
+      JSON.stringify({ agent: 'claude', cwd: root, tmuxSession: `agentbox-manager-${id}` }),
+    );
+    const [migrated] = await readManagers(id);
+    expect(usesLegacySession(migrated!)).toBe(true);
+    // Migrated while the session ran; it exits later and writes where it always did.
+    await writeFile(join(dir, 'manager.exit'), '4');
+    expect(await readManagerExit(id, migrated!.id)).toBeUndefined();
+    expect(await readManagerExit(id, migrated!.id, { legacy: true })).toBe(4);
+    const stopped = await stopManagerSession(id, migrated!.id, { exec: fakeExec().exec });
+    expect(stopped?.lastExit).toBe(4);
+    expect(existsSync(join(dir, 'manager.exit'))).toBe(false);
+  });
+
+  it('keeps an old exit file the migration did not read', async () => {
+    const { id, root } = await makeWorkspace();
+    const dir = (await resolveWorkspaceDir(id))!;
+    await writeFile(
+      join(dir, 'manager.json'),
+      JSON.stringify({
+        agent: 'claude',
+        cwd: root,
+        tmuxSession: `agentbox-manager-${id}`,
+        lastExit: 1,
+      }),
+    );
+    await writeFile(join(dir, 'manager.exit'), '3');
+    const [migrated] = await readManagers(id);
+    expect(migrated!.lastExit).toBe(1);
+    expect(existsSync(join(dir, 'manager.exit'))).toBe(true);
+    expect(usesLegacySession({ ...migrated!, tmuxSession: managerSessionName(migrated!.id) })).toBe(
+      false,
+    );
   });
 });
 

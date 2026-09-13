@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, realpath, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -6,7 +6,7 @@ import { assertTempHome } from '../../../scripts/test-home.js';
 import { createManagerBackend } from '../lib/backend/managers';
 import { createWorkspaceBackend } from '../lib/backend/workspaces';
 import type { BackendDeps } from '../lib/backend/deps';
-import type { QueueJob } from '@agentbox/relay';
+import { resolveWorkspaceDir, type QueueJob } from '@agentbox/relay';
 
 const S1 = '5edc0ee0-ce9a-4e30-962d-bc630388d8bc';
 const S2 = '01a09ad5-8f51-7ec0-b8f4-2daa8be67500';
@@ -368,6 +368,57 @@ describe('startManager', () => {
       error: expect.stringContaining('only supported for claude, codex'),
     });
     expect(h.spawned.filter((a) => a[0] === 'new-session')).toEqual([]);
+  });
+});
+
+describe('the single-manager layout', () => {
+  async function legacyWorkspace(h: Harness) {
+    const { workspaces, managers } = backends(h);
+    const root = await makeFolder();
+    const added = await workspaces.addWorkspace({ path: root });
+    if (!added.ok) throw new Error(added.error);
+    const wsId = added.workspace.id;
+    const dir = (await resolveWorkspaceDir(wsId))!;
+    return { workspaces, managers, root, wsId, dir };
+  }
+
+  it("joins a legacy session's first detect to its migrated record, and reads its exit code", async () => {
+    const h = harness();
+    const { managers, root, wsId, dir } = await legacyWorkspace(h);
+    const session = `agentbox-manager-${wsId}`;
+    await writeFile(
+      join(dir, 'manager.json'),
+      JSON.stringify({ agent: 'claude', cwd: root, tmuxSession: session }),
+    );
+    h.tmux.add(session);
+    // AGENTBOX_MANAGER=1 in that session: the CLI sends no managerId.
+    const res = await managers.detectManager({ agent: 'claude', sessionId: S1, cwd: root });
+    if (!res.ok) throw new Error(res.error);
+    expect(res.manager).toMatchObject({ kind: 'hub', sessionId: S1, status: 'running' });
+    expect(await managers.listManagers()).toHaveLength(1);
+    h.tmux.delete(session);
+    await writeFile(join(dir, 'manager.exit'), '2');
+    expect(await managers.getManager(res.manager.id)).toMatchObject({
+      status: 'stopped',
+      lastExit: 2,
+    });
+  });
+
+  it('never folds a terminal session into a current hub-run manager in its folder', async () => {
+    const h = harness();
+    const { managers, root, wsId } = await legacyWorkspace(h);
+    const started = await managers.startManager(wsId, { agent: 'claude' });
+    if (!started.ok) throw new Error(started.error);
+    const res = await managers.detectManager({
+      agent: 'claude',
+      sessionId: S1,
+      cwd: root,
+      pid: 5,
+      host: 'laptop',
+    });
+    if (!res.ok) throw new Error(res.error);
+    expect(res.manager.id).not.toBe(started.manager.id);
+    expect(res.manager.kind).toBe('external');
   });
 });
 

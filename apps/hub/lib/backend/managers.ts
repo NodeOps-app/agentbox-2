@@ -20,6 +20,7 @@ import {
   patchManager,
   processStartTime,
   readManagerExit,
+  readManagers,
   readReconciledManagers,
   readTasks,
   readWorkspace,
@@ -31,6 +32,7 @@ import {
   tmuxAvailable,
   toManagerView,
   upsertDetectedManager,
+  usesLegacySession,
   RESUMABLE_MANAGER_AGENTS,
   type ManagerProbe,
   type ManagerRecord,
@@ -113,7 +115,7 @@ export function createManagerBackend(
         const status = await managerStatus(rec, probe);
         const lastExit =
           status === 'stopped' && rec.kind === 'hub' && rec.lastExit === undefined
-            ? await readManagerExit(ws.id, rec.id)
+            ? await readManagerExit(ws.id, rec.id, { legacy: usesLegacySession(rec) })
             : undefined;
         return toManagerView(rec, {
           status,
@@ -157,6 +159,29 @@ export function createManagerBackend(
     return null;
   }
 
+  /**
+   * The migrated single-manager record a detect with no `managerId` comes from.
+   * That layout started its agent with `AGENTBOX_MANAGER=1`, which names no
+   * record, so its first detect would otherwise register a duplicate external
+   * manager beside the running hub one. Limited to records still on the old tmux
+   * name: a current hub-run manager exports its own id, and a terminal session in
+   * the same folder must not be folded into it.
+   */
+  async function legacyManagerFor(
+    wsId: string,
+    agent: string,
+    cwd: string,
+  ): Promise<string | undefined> {
+    const candidates = (await readManagers(wsId)).filter(
+      (m) => usesLegacySession(m) && !m.sessionId && m.agent === agent && m.cwd === cwd,
+    );
+    const running: string[] = [];
+    for (const m of candidates) {
+      if ((await managerStatus(m, probe)) === 'running') running.push(m.id);
+    }
+    return running.length === 1 ? running[0] : undefined;
+  }
+
   /** Running first, then the most recently seen. */
   function sortViews(views: ManagerView[]): ManagerView[] {
     return [...views].sort((a, b) => {
@@ -198,6 +223,8 @@ export function createManagerBackend(
         input.pid !== undefined && input.host === hostname()
           ? await (deps.processStartTime ?? processStartTime)(input.pid).catch(() => undefined)
           : undefined;
+      const managerId =
+        input.managerId ?? (known ? undefined : await legacyManagerFor(ws.id, input.agent, cwd));
       const { manager, created } = await upsertDetectedManager(ws.id, {
         agent: input.agent,
         sessionId: input.sessionId,
@@ -205,7 +232,7 @@ export function createManagerBackend(
         ...(input.pid !== undefined ? { pid: input.pid } : {}),
         ...(pidStartedAt ? { pidStartedAt } : {}),
         ...(input.host ? { host: input.host } : {}),
-        ...(input.managerId ? { managerId: input.managerId } : {}),
+        ...(managerId ? { managerId } : {}),
       });
       if (input.boxId) await attachBoxToManager(ws.id, manager.id, { boxId: input.boxId });
       else if (input.boxJobId) {

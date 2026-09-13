@@ -242,8 +242,14 @@ interface LegacyManagerRecord {
  * session name is KEPT: a session started under the old name may still be
  * running, and renaming it here would report a live agent as stopped and leave
  * `stop` unable to reach it.
+ *
+ * `exitConsumed` says the old exit file's code is now on the record, so the file
+ * is spent. Otherwise it stays: a session still running writes it there on exit.
  */
-async function readLegacyManager(dir: string, wsId: string): Promise<ManagerRecord | null> {
+async function readLegacyManager(
+  dir: string,
+  wsId: string,
+): Promise<{ record: ManagerRecord; exitConsumed: boolean } | null> {
   const files = legacyManagerFiles(dir);
   let legacy: LegacyManagerRecord;
   try {
@@ -253,13 +259,13 @@ async function readLegacyManager(dir: string, wsId: string): Promise<ManagerReco
   }
   if (typeof legacy.agent !== 'string' || typeof legacy.cwd !== 'string') return null;
   let lastExit = legacy.lastExit;
+  let exitConsumed = false;
   if (lastExit === undefined) {
-    const raw = await readFile(files.exit, 'utf8').catch(() => '');
-    const n = Number.parseInt(raw.trim(), 10);
-    if (!Number.isNaN(n)) lastExit = n;
+    lastExit = await readExitFile(files.exit);
+    exitConsumed = lastExit !== undefined;
   }
   const at = legacy.startedAt ?? new Date().toISOString();
-  return {
+  const record: ManagerRecord = {
     id: newManagerId(),
     workspaceId: wsId,
     agent: legacy.agent,
@@ -276,6 +282,26 @@ async function readLegacyManager(dir: string, wsId: string): Promise<ManagerReco
     ...(legacy.stoppedAt ? { stoppedAt: legacy.stoppedAt } : {}),
     ...(lastExit === undefined ? {} : { lastExit }),
   };
+  return { record, exitConsumed };
+}
+
+async function readExitFile(file: string): Promise<number | undefined> {
+  const raw = await readFile(file, 'utf8').catch(() => '');
+  const n = Number.parseInt(raw.trim(), 10);
+  return Number.isNaN(n) ? undefined : n;
+}
+
+/**
+ * A hub record migrated from the single-manager layout whose tmux session still
+ * has the old name: its agent writes its exit code to the old `manager.exit`, and
+ * it was started with `AGENTBOX_MANAGER=1`, which names no record.
+ */
+export function usesLegacySession(rec: ManagerRecord): boolean {
+  return (
+    rec.kind === 'hub' &&
+    rec.tmuxSession !== undefined &&
+    rec.tmuxSession !== managerSessionName(rec.id)
+  );
 }
 
 async function writeManagerFile(dir: string, managers: ManagerRecord[]): Promise<void> {
@@ -300,14 +326,17 @@ export async function updateManagers<T>(
     async () => {
       const current = await readManagerFile(dir);
       const legacy = current === null ? await readLegacyManager(dir, wsId) : null;
-      const { managers, result } = await fn(current ?? (legacy ? [legacy] : []));
+      const { managers, result } = await fn(current ?? (legacy ? [legacy.record] : []));
       await writeManagerFile(dir, managers);
       if (legacy) {
         // Removed only AFTER managers.json is on disk: a crash in between leaves
         // both files, and managers.json wins on the next read.
         const files = legacyManagerFiles(dir);
         await rm(files.rec, { force: true }).catch(() => {});
-        await rm(files.exit, { force: true }).catch(() => {});
+        // An exit file not read into the record belongs to a session that may
+        // still write it: `readManagerExit` falls back to it and the next stop
+        // deletes it. One that WAS read is spent.
+        if (legacy.exitConsumed) await rm(files.exit, { force: true }).catch(() => {});
       }
       return result;
     },
@@ -459,14 +488,16 @@ export async function managerStatus(
   return !Number.isNaN(seen) && now - seen < MANAGER_SEEN_WINDOW_MS ? 'running' : 'stopped';
 }
 
-export async function readManagerExit(wsId: string, id: string): Promise<number | undefined> {
-  try {
-    const raw = (await readFile(managerExitFile(await dirFor(wsId), id), 'utf8')).trim();
-    const n = Number.parseInt(raw, 10);
-    return Number.isNaN(n) ? undefined : n;
-  } catch {
-    return undefined;
-  }
+/** The agent's exit code; `legacy` also reads the old layout's file (see `usesLegacySession`). */
+export async function readManagerExit(
+  wsId: string,
+  id: string,
+  opts: { legacy?: boolean } = {},
+): Promise<number | undefined> {
+  const dir = await dirFor(wsId);
+  const current = await readExitFile(managerExitFile(dir, id));
+  if (current !== undefined || !opts.legacy) return current;
+  return readExitFile(legacyManagerFiles(dir).exit);
 }
 
 /**
@@ -852,12 +883,18 @@ export async function stopManagerSession(
   const exec = probe.exec ?? defaultExec;
   const session = rec.tmuxSession ?? managerSessionName(rec.id);
   await exec('tmux', ['kill-session', '-t', exactTarget(session)]).catch(() => {});
-  const lastExit = await readManagerExit(wsId, id);
-  return patchManager(wsId, id, (current) => ({
+  const legacy = usesLegacySession(rec);
+  const lastExit = await readManagerExit(wsId, id, { legacy });
+  const stopped = await patchManager(wsId, id, (current) => ({
     ...current,
     stoppedAt: new Date().toISOString(),
     ...(lastExit === undefined ? {} : { lastExit }),
   }));
+  // The old layout's exit file is spent once its code is on the record.
+  if (legacy) {
+    await rm(legacyManagerFiles(await dirFor(wsId)).exit, { force: true }).catch(() => {});
+  }
+  return stopped;
 }
 
 /**
