@@ -13,6 +13,7 @@ import { basename, dirname, join } from 'node:path';
 import { log } from '@agentbox/cli-kit';
 import { encodeClaudeProjectsKey } from '@agentbox/sandbox-core';
 import type { AgentId } from '@agentbox/core';
+import { HubApiError } from '../control-plane/hub-api-client.js';
 import type {
   HubApiClient,
   HubApiManagerDetect,
@@ -273,7 +274,7 @@ export interface RegisteredManager {
  * bookkeeping around a create or a task, and losing it is a warning.
  */
 export async function registerHostManager(
-  client: HubApiClient,
+  client: Pick<HubApiClient, 'detectManager'>,
   hint: HostSessionHint,
   attach?: { boxId: string } | { boxJobId: string },
 ): Promise<RegisteredManager | undefined> {
@@ -282,6 +283,11 @@ export async function registerHostManager(
     const res = await client.detectManager(body);
     return { managerId: res.manager.id, workspace: res.workspace };
   } catch (err) {
+    if (err instanceof HubApiError && err.code === 'invalid_request') {
+      // The hub refused the folder (the home folder, or one it does not have).
+      log.warn(`this ${hint.agent} session was not registered as a manager: ${err.message}`);
+      return undefined;
+    }
     log.warn(
       `could not register this ${hint.agent} session as a manager: ${err instanceof Error ? err.message : String(err)}` +
         (hint.agent === 'codex'

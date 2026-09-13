@@ -139,7 +139,9 @@ export async function addTask(wsId: string, input: AddTaskInput): Promise<WorkTa
     : input.boxJobId
       ? { boxJobId: input.boxJobId }
       : null;
-  const managerId = input.managerId ?? (target ? await managerIdForTarget(target) : undefined);
+  const managerId =
+    input.managerId ??
+    (target ? await managerIdForTarget(target, { workspaceId: wsId }) : undefined);
   return updateTasks(wsId, async (tasks) => {
     if (input.dependsOn?.length) {
       const err = validateDependsOn(tasks, '', input.dependsOn);
@@ -254,7 +256,7 @@ export async function assignTasks(
 ): Promise<WorkTask[]> {
   // A task with no manager joins the one that made its box: that session is the
   // one working it. Resolved before the lock — it reads every workspace's managers.
-  const inherited = target ? await managerIdForTarget(target) : undefined;
+  const inherited = target ? await managerIdForTarget(target, { workspaceId: wsId }) : undefined;
   return updateTasks(wsId, (tasks) => {
     const wanted = new Set(ids);
     const missing = ids.filter((id) => !tasks.some((t) => t.id === id));

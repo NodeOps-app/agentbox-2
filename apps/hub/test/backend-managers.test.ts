@@ -1,6 +1,6 @@
 import { mkdir, mkdtemp, realpath, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { homedir, tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { assertTempHome } from '../../../scripts/test-home.js';
 import { createManagerBackend } from '../lib/backend/managers';
@@ -104,6 +104,72 @@ describe('detectManager', () => {
     expect(res.workspace.id).toBe(added.workspace.id);
     expect(res.manager.boxIds).toEqual(['b1']);
     expect((await managers.managerByBox()).get('b1')).toBe(res.manager.id);
+  });
+});
+
+describe('detectManager refusals', () => {
+  it('never creates a workspace at /, the home folder or above it', async () => {
+    const { workspaces, managers } = backends(harness());
+    const home = await realpath(homedir());
+    for (const cwd of ['/', home, dirname(home)]) {
+      const res = await managers.detectManager({ agent: 'claude', sessionId: S1, cwd });
+      expect(res).toMatchObject({
+        ok: false,
+        invalid: true,
+        error: expect.stringContaining('agentbox workspace add <project folder>'),
+      });
+    }
+    expect(await workspaces.listWorkspaces()).toEqual([]);
+  });
+
+  it('refuses a folder this hub does not have, and registers nothing', async () => {
+    const { workspaces, managers } = backends(harness());
+    const res = await managers.detectManager({
+      agent: 'claude',
+      sessionId: S1,
+      cwd: join(await makeFolder(), 'not-here'),
+    });
+    expect(res).toMatchObject({
+      ok: false,
+      invalid: true,
+      error: expect.stringContaining('folder does not exist on this hub'),
+    });
+    expect(await workspaces.listWorkspaces()).toEqual([]);
+    expect(await managers.listManagers()).toEqual([]);
+  });
+
+  it('refuses a task a manager of another workspace would own, on add and on update', async () => {
+    const { workspaces, managers } = backends(harness());
+    const a = await managers.detectManager({
+      agent: 'claude',
+      sessionId: S1,
+      cwd: await makeFolder(),
+    });
+    const b = await managers.detectManager({
+      agent: 'codex',
+      sessionId: S2,
+      cwd: await makeFolder(),
+    });
+    if (!a.ok || !b.ok) throw new Error('detect failed');
+    expect(
+      await workspaces.addTask(a.workspace.id, { title: 't', managerId: b.manager.id }),
+    ).toMatchObject({
+      ok: false,
+      invalid: true,
+      error: expect.stringContaining('belongs to workspace'),
+    });
+    expect(
+      await workspaces.addTask(a.workspace.id, { title: 't', managerId: 'ffffffffffffffff' }),
+    ).toMatchObject({ ok: false, invalid: true });
+    const own = await workspaces.addTask(a.workspace.id, { title: 't', managerId: a.manager.id });
+    if (!own.ok) throw new Error(own.error);
+    expect(own.task.managerId).toBe(a.manager.id);
+    expect(
+      await workspaces.updateTask(a.workspace.id, own.task.id, { managerId: b.manager.id }),
+    ).toMatchObject({ ok: false, invalid: true });
+    expect(
+      await workspaces.updateTask(a.workspace.id, own.task.id, { managerId: null }),
+    ).toMatchObject({ ok: true });
   });
 });
 

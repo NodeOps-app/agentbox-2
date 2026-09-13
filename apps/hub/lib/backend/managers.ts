@@ -2,7 +2,8 @@
 // workspace. A manager is either `external` (a claude/codex session in the
 // user's own terminal, registered when the CLI runs inside it) or `hub` (one
 // this hub started in tmux). State lives in @agentbox/relay's workspace store.
-import { hostname as osHostname } from 'node:os';
+import { stat } from 'node:fs/promises';
+import { homedir, hostname as osHostname } from 'node:os';
 import {
   addWorkspace,
   attachBoxToManager,
@@ -51,6 +52,11 @@ import type { ManagerView, WorkspaceView } from '../boxes/types';
 
 function err(message: string): { ok: false; error: string } {
   return { ok: false, error: message };
+}
+
+/** A refusal about the request itself: the route answers 400, not 409. */
+function invalid(message: string): { ok: false; error: string; invalid: true } {
+  return { ok: false, error: message, invalid: true };
 }
 
 function messageOf(e: unknown): string {
@@ -126,6 +132,29 @@ export function createManagerBackend(
     return (await viewsOf(ws, await reconcileContext(deps))).find((m) => m.id === id) ?? null;
   }
 
+  /**
+   * Why a detect must not create a workspace at `cwd`, or null. A session run
+   * from `/` or the home folder would otherwise claim every project under it,
+   * and a caller's path that is not a folder here would register a phantom.
+   */
+  async function autoWorkspaceRefusal(cwd: string): Promise<string | null> {
+    const home = await canonicalWorkspaceRoot(homedir());
+    const what =
+      cwd === '/'
+        ? 'is the filesystem root'
+        : cwd === home
+          ? 'is your home folder'
+          : home.startsWith(`${cwd}/`)
+            ? 'contains your home folder'
+            : null;
+    if (what) {
+      return `not creating a workspace at ${cwd}: it ${what}. Register the project folder instead: agentbox workspace add <project folder>`;
+    }
+    const st = await stat(cwd).catch(() => null);
+    if (!st?.isDirectory()) return `folder does not exist on this hub: ${cwd}`;
+    return null;
+  }
+
   /** Running first, then the most recently seen. */
   function sortViews(views: ManagerView[]): ManagerView[] {
     return [...views].sort((a, b) => {
@@ -152,6 +181,8 @@ export function createManagerBackend(
       if (!ws) {
         ws = findWorkspaceContaining(await listWorkspaces(), cwd);
         if (!ws) {
+          const refusal = await autoWorkspaceRefusal(cwd);
+          if (refusal) return invalid(refusal);
           try {
             ws = await addWorkspace(cwd);
             workspaceCreated = true;

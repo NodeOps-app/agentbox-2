@@ -48,6 +48,6 @@ export async function POST(
   if (!parsed.ok) return fail('invalid_request', parsed.message);
 
   const res = await backend.addTask(id, parsed.value);
-  if (!res.ok) return failFromAction(res.error);
+  if (!res.ok) return res.invalid ? fail('invalid_request', res.error) : failFromAction(res.error);
   return ok(res.task, 201);
 }

@@ -14,7 +14,7 @@
  * match. That is correct: the folder is on the hub's machine.
  */
 import { findWorkspaceContaining } from '@agentbox/relay';
-import { detectHostSession, registerHostManager } from './host-session.js';
+import { detectHostSession, registerHostManager, type HostSessionHint } from './host-session.js';
 import type { HubApiClient, HubApiWorkspace } from '../control-plane/hub-api-client.js';
 
 export class WorkspaceRefError extends Error {}
@@ -58,28 +58,53 @@ export async function resolveWorkspace(
  * first. `register` also registers when a workspace was found, for a caller that
  * needs the manager id (a task added from inside a session belongs to it).
  */
+export interface WorkspaceRefDeps {
+  env?: NodeJS.ProcessEnv;
+  cwd?: string;
+  detect?: () => HostSessionHint | undefined;
+}
+
 export async function resolveWorkspaceAndManager(
-  client: HubApiClient,
+  client: Pick<HubApiClient, 'listWorkspaces' | 'detectManager'>,
   ref?: string,
   opts: { register?: boolean } = {},
+  deps: WorkspaceRefDeps = {},
 ): Promise<{ workspace: HubApiWorkspace; managerId?: string }> {
   const workspaces = await client.listWorkspaces();
-  const env = process.env['AGENTBOX_WORKSPACE'];
+  const env = (deps.env ?? process.env)['AGENTBOX_WORKSPACE'];
+  const cwd = deps.cwd ?? process.cwd();
+  const explicit = ref ?? env;
   const picked = pickWorkspace(workspaces, {
     ...(ref ? { ref } : {}),
     ...(env ? { env } : {}),
-    cwd: process.cwd(),
+    cwd,
   });
-  if (!picked && (ref ?? env)) {
+  if (!picked && explicit) {
     throw new WorkspaceRefError(
-      `no workspace matches "${ref ?? env ?? ''}". List them with \`agentbox workspace list\`.`,
+      `no workspace matches "${explicit}". List them with \`agentbox workspace list\`.`,
     );
   }
-  const hint = !picked || opts.register ? detectHostSession() : undefined;
+  let hint = !picked || opts.register ? (deps.detect ?? detectHostSession)() : undefined;
+  // A workspace the user named is the one they want: registering a session that
+  // lives elsewhere would create a second workspace at its folder, and hand the
+  // task a manager from it.
+  if (
+    hint &&
+    picked &&
+    explicit &&
+    findWorkspaceContaining(workspaces, hint.cwd)?.id !== picked.id
+  ) {
+    hint = undefined;
+  }
   if (hint) {
     const registered = await registerHostManager(client, hint);
-    if (registered) {
-      return { workspace: picked ?? registered.workspace, managerId: registered.managerId };
+    if (registered && !picked) {
+      return { workspace: registered.workspace, managerId: registered.managerId };
+    }
+    // The hub keeps an already-registered session in its own workspace, which
+    // need not be the one picked here.
+    if (registered && registered.workspace.id === picked?.id) {
+      return { workspace: picked, managerId: registered.managerId };
     }
   }
   if (picked) return { workspace: picked };
@@ -89,6 +114,6 @@ export async function resolveWorkspaceAndManager(
     );
   }
   throw new WorkspaceRefError(
-    `no registered workspace contains ${process.cwd()}. Pass --workspace <id|path>, or register this folder with \`agentbox workspace add\`.`,
+    `no registered workspace contains ${cwd}. Pass --workspace <id|path>, or register this folder with \`agentbox workspace add\`.`,
   );
 }

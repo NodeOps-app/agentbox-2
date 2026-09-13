@@ -9,6 +9,7 @@ import {
   addWorkspace,
   assignTasks,
   filterTasks,
+  findManager,
   listWorkspaces,
   managerStatus,
   patchTask,
@@ -92,6 +93,20 @@ export function createWorkspaceBackend(deps: BackendDeps): WorkspaceBackend {
       },
       managers,
     };
+  }
+
+  /**
+   * A task's manager must be one of its own workspace's: a manager from another
+   * workspace would list tasks it can never see in its folder.
+   */
+  async function managerRefusal(wsId: string, managerId: string | null | undefined) {
+    if (!managerId) return null;
+    const rec = await findManager(managerId);
+    if (!rec) return `unknown manager ${managerId}`;
+    if (rec.workspaceId !== wsId) {
+      return `manager ${managerId} belongs to workspace ${rec.workspaceId}, not ${wsId}`;
+    }
+    return null;
   }
 
   /** A box id must exist; a job id must be a create job that has not failed. */
@@ -186,6 +201,8 @@ export function createWorkspaceBackend(deps: BackendDeps): WorkspaceBackend {
 
     async addTask(wsId: string, input: AddTaskInput): Promise<TaskResult> {
       if (!(await readWorkspace(wsId))) return unknownWorkspace(wsId);
+      const wrongManager = await managerRefusal(wsId, input.managerId);
+      if (wrongManager) return { ok: false, error: wrongManager, invalid: true };
       if (input.boxId || input.boxJobId) {
         const bad = await validateTarget(
           input.boxId ? { boxId: input.boxId } : { boxJobId: input.boxJobId! },
@@ -203,6 +220,8 @@ export function createWorkspaceBackend(deps: BackendDeps): WorkspaceBackend {
 
     async updateTask(wsId: string, taskId: string, patch: UpdateTaskInput): Promise<TaskResult> {
       if (!(await readWorkspace(wsId))) return unknownWorkspace(wsId);
+      const wrongManager = await managerRefusal(wsId, patch.managerId);
+      if (wrongManager) return { ok: false, error: wrongManager, invalid: true };
       try {
         const task = await patchTask(wsId, taskId, patch);
         if (!task) return err(`unknown task ${taskId}`);

@@ -343,12 +343,19 @@ export async function findManagerBySession(
   return (await allManagers()).find((m) => m.agent === agent && m.sessionId === sessionId) ?? null;
 }
 
-/** The manager that created this box (or the job that will become it), in any workspace. */
+/**
+ * The manager that created this box (or the job that will become it). With
+ * `workspaceId`, only a manager of that workspace: a task inherits nothing from
+ * a session that belongs to another one.
+ */
 export async function managerIdForTarget(
   target: { boxId: string } | { boxJobId: string },
+  opts: { workspaceId?: string } = {},
 ): Promise<string | undefined> {
-  const hit = (await allManagers()).find((m) =>
-    'boxId' in target ? m.boxIds.includes(target.boxId) : m.boxJobIds.includes(target.boxJobId),
+  const hit = (await allManagers()).find(
+    (m) =>
+      (opts.workspaceId === undefined || m.workspaceId === opts.workspaceId) &&
+      ('boxId' in target ? m.boxIds.includes(target.boxId) : m.boxJobIds.includes(target.boxJobId)),
   );
   return hit?.id;
 }

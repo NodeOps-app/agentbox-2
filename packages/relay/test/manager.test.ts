@@ -360,6 +360,20 @@ describe('reconcileManagers', () => {
     expect(reconcileManagers([rec], ctx).changed).toBe(false);
   });
 
+  it("inherits a box's manager only inside that manager's workspace", async () => {
+    const a = await makeWorkspace();
+    const b = await makeWorkspace();
+    const { manager } = await upsertDetectedManager(a.id, {
+      agent: 'claude',
+      sessionId: 's',
+      cwd: a.root,
+    });
+    await attachBoxToManager(a.id, manager.id, { boxId: 'box-1' });
+    expect(await managerIdForTarget({ boxId: 'box-1' })).toBe(manager.id);
+    expect(await managerIdForTarget({ boxId: 'box-1' }, { workspaceId: a.id })).toBe(manager.id);
+    expect(await managerIdForTarget({ boxId: 'box-1' }, { workspaceId: b.id })).toBeUndefined();
+  });
+
   it('heals on read and remembers which manager made a box', async () => {
     const { id, root } = await makeWorkspace();
     const { manager } = await upsertDetectedManager(id, {

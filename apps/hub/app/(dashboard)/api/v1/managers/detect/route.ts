@@ -1,7 +1,8 @@
 // POST /api/v1/managers/detect — register the host agent session a CLI call came
 // from. Matched by (agent, sessionId), so repeating it refreshes one record. When
 // no workspace contains `cwd`, one is created there, named after the folder:
-// nobody declares a workspace before a session can manage boxes.
+// nobody declares a workspace before a session can manage boxes. 400 instead
+// when that folder is `/`, the home folder or above it, or not a folder here.
 import { backendOrNull } from '../../lib/backend';
 import { fail, failFromAction, ok } from '../../lib/envelope';
 import { MANAGER_AGENT_NAMES, parseManagerDetect, readJson } from '../../lib/validate';
@@ -27,6 +28,6 @@ export async function POST(req: Request): Promise<Response> {
   const parsed = parseManagerDetect(parsedBody.value, allowedAgents);
   if (!parsed.ok) return fail('invalid_request', parsed.message);
   const res = await backend.detectManager(parsed.value);
-  if (!res.ok) return failFromAction(res.error);
+  if (!res.ok) return res.invalid ? fail('invalid_request', res.error) : failFromAction(res.error);
   return ok({ manager: res.manager, workspace: res.workspace }, res.created ? 201 : 200);
 }

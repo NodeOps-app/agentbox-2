@@ -1123,7 +1123,7 @@ export function buildOpenApi(): Record<string, unknown> {
                       type: 'string',
                       pattern: '^[0-9a-f]{16}$',
                       description:
-                        "The manager session this task belongs to. Omitted with a box: the box's manager.",
+                        "The manager session this task belongs to; 400 when it belongs to another workspace (or is unknown). Omitted with a box: the box's manager, when it is this workspace's.",
                     },
                   },
                   required: ['title'],
@@ -1317,7 +1317,8 @@ export function buildOpenApi(): Record<string, unknown> {
                     managerId: {
                       type: 'string',
                       nullable: true,
-                      description: '`null` clears the manager.',
+                      description:
+                        '`null` clears the manager; 400 for a manager of another workspace (or an unknown one).',
                     },
                   },
                 },
@@ -1522,7 +1523,7 @@ export function buildOpenApi(): Record<string, unknown> {
           tags: ['Managers'],
           summary: 'Register the host session a CLI call came from',
           description:
-            "Matched by `(agent, sessionId)`, so repeating it refreshes one record (`lastSeenAt`, `pid`). A `managerId` (the caller's `$AGENTBOX_MANAGER`) joins the session to the hub-run manager it runs in. When no workspace contains `cwd`, one is created there, named after the folder; a session already registered stays in its workspace. `boxId` / `boxJobId` attaches a box this session just made in the same call. 201 when a manager or workspace was created, 200 when an existing one was refreshed.",
+            "Matched by `(agent, sessionId)`, so repeating it refreshes one record (`lastSeenAt`, `pid`). A `managerId` (the caller's `$AGENTBOX_MANAGER`) joins the session to the hub-run manager it runs in. When no workspace contains `cwd`, one is created there, named after the folder — except at `/`, the hub user's home folder or a folder above it, or a `cwd` that is not a folder on this hub, which answer 400. A session already registered stays in its workspace. `boxId` / `boxJobId` attaches a box this session just made in the same call. 201 when a manager or workspace was created, 200 when an existing one was refreshed.",
           requestBody: {
             required: true,
             content: {

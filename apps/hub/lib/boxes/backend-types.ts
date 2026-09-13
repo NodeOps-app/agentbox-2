@@ -958,12 +958,15 @@ export interface RemoteDockerHostView {
 // ── workspaces / tasks / manager ──
 
 export type WorkspaceResult = { ok: true; workspace: WorkspaceView } | { ok: false; error: string };
-export type TaskResult = { ok: true; task: WorkTask } | { ok: false; error: string };
+/** `invalid`: the request itself is wrong (400), not the resource's state (409). */
+export type TaskResult =
+  | { ok: true; task: WorkTask }
+  | { ok: false; error: string; invalid?: true };
 export type TasksResult = { ok: true; tasks: WorkTask[] } | { ok: false; error: string };
 export type ManagerResult = { ok: true; manager: ManagerView } | { ok: false; error: string };
 export type DetectManagerResult =
   | { ok: true; manager: ManagerView; workspace: WorkspaceView; created: boolean }
-  | { ok: false; error: string };
+  | { ok: false; error: string; invalid?: true };
 
 /** What `listResumableHostSessions` answers: the picker's rows, plus whether this agent has any. */
 export interface ManagerSessionsResult {

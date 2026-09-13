@@ -1,5 +1,6 @@
-import { describe, expect, it } from 'vitest';
-import { pickWorkspace } from '../src/lib/workspace-ref.js';
+import { describe, expect, it, vi } from 'vitest';
+import { pickWorkspace, resolveWorkspaceAndManager } from '../src/lib/workspace-ref.js';
+import type { HostSessionHint } from '../src/lib/host-session.js';
 import type { HubApiWorkspace } from '../src/control-plane/hub-api-client.js';
 
 function ws(over: Partial<HubApiWorkspace> & { id: string; root: string }): HubApiWorkspace {
@@ -50,5 +51,71 @@ describe('pickWorkspace', () => {
   it('is null when nothing matches', () => {
     expect(pickWorkspace(all, { cwd: '/somewhere/else' })).toBeNull();
     expect(pickWorkspace(all, { ref: 'nope', cwd: '/code/store' })).toBeNull();
+  });
+});
+
+describe('resolveWorkspaceAndManager', () => {
+  const hint = (cwd: string): HostSessionHint => ({
+    agent: 'claude',
+    sessionId: '5edc0ee0-ce9a-4e30-962d-bc630388d8bc',
+    cwd,
+    host: 'laptop',
+  });
+  // Every seam injected: nothing reads the real env, cwd or ~/.claude.
+  function client(detected?: HubApiWorkspace) {
+    return {
+      listWorkspaces: vi.fn(async () => all),
+      detectManager: vi.fn(async () => ({
+        manager: { id: 'm1' } as never,
+        workspace: detected ?? all[0]!,
+      })),
+    };
+  }
+
+  it('skips detection for an explicit workspace the session does not live in', async () => {
+    const c = client();
+    const res = await resolveWorkspaceAndManager(
+      c,
+      'w3',
+      { register: true },
+      { env: {}, cwd: '/code/storefront', detect: () => hint('/elsewhere/repo') },
+    );
+    expect(res).toEqual({ workspace: all[2] });
+    expect(c.detectManager).not.toHaveBeenCalled();
+  });
+
+  it('attaches the manager when the session lives in the explicit workspace', async () => {
+    const c = client(all[2]);
+    const res = await resolveWorkspaceAndManager(
+      c,
+      'w3',
+      { register: true },
+      { env: {}, cwd: '/tmp', detect: () => hint('/code/storefront/pkg') },
+    );
+    expect(res).toEqual({ workspace: all[2], managerId: 'm1' });
+  });
+
+  it('drops a manager the hub keeps in another workspace', async () => {
+    const c = client(all[1]);
+    const res = await resolveWorkspaceAndManager(
+      c,
+      undefined,
+      { register: true },
+      { env: {}, cwd: '/code/store', detect: () => hint('/code/store') },
+    );
+    expect(c.detectManager).toHaveBeenCalled();
+    expect(res).toEqual({ workspace: all[0] });
+  });
+
+  it('takes the workspace a detect created when none was picked', async () => {
+    const created = ws({ id: 'w9', root: '/new/repo' });
+    const c = client(created);
+    const res = await resolveWorkspaceAndManager(
+      c,
+      undefined,
+      {},
+      { env: {}, cwd: '/new/repo', detect: () => hint('/new/repo') },
+    );
+    expect(res).toEqual({ workspace: created, managerId: 'm1' });
   });
 });
