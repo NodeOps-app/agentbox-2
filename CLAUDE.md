@@ -92,7 +92,9 @@ session); building it needs a Swift 6 toolchain:
   github}`) and its Approve posts `POST /api/v1/managers/{id}/message` (`{text, prNumber?, repo?}`; `409`
   `manager_unreachable` means copy the text for the user to paste). Boxes group under
   their manager session in the menu: `Box.managerId` joins a box to a row of `GET /api/v1/managers`
-  (host claude/codex sessions, detected or hub-run; `…/{id}/resume` reopens one in the hub's tmux). **Auth to
+  (host claude/codex sessions, detected or hub-run; `…/{id}/resume` reopens one in the hub's tmux), and
+  `Box.pr` (`{repo, number, url?, state: open|ready|merged|closed}`, from the workspace timeline) labels a
+  row with its pull request. **Auth to
   remember when changing the hub:** both `/api/v1/*` and `/api/events` go through the same gate
   (`apps/hub/proxy.ts`) and accept `Authorization: Bearer <token>` — a headless client (the tray
   against a remote control box) subscribes to events with the same Bearer key it uses for `/api/v1`.

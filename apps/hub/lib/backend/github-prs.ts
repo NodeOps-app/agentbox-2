@@ -35,6 +35,8 @@ export interface GithubPrSync {
   syncNow(ws: WorkspaceRecord): Promise<GithubSyncStatus>;
   /** The state a PR had at the last sync, when this hub has seen it. */
   prState(repo: string, number: number): PrLiveState | undefined;
+  /** Bumped whenever a sync changes a PR's state, so a reader can drop what it derived from them. */
+  statesVersion(): number;
   /**
    * Whether a sync of this workspace has completed since the hub started. PR
    * states live in memory, so before that no logged `pr.ready` is confirmed.
@@ -85,6 +87,7 @@ export function createGithubPrSync(
   const repoByRoot = new Map<string, RepoRef | null>();
   let ghUser: { login: string | null; at: number } | null = null;
   const prStates = new Map<string, PrLiveState>();
+  let statesVersion = 0;
 
   async function currentUser(): Promise<string | null> {
     if (ghUser && (ghUser.login !== null || now() - ghUser.at < interval)) return ghUser.login;
@@ -174,16 +177,19 @@ export function createGithubPrSync(
         continue;
       }
       for (const pr of prs) {
-        prStates.set(
-          `${ref.nameWithOwner}#${String(pr.number)}`,
+        const prKey = `${ref.nameWithOwner}#${String(pr.number)}`;
+        const live: PrLiveState =
           pr.state === 'MERGED'
             ? 'merged'
             : pr.state === 'CLOSED'
               ? 'closed'
               : isPrReady(pr)
                 ? 'ready'
-                : 'open',
-        );
+                : 'open';
+        if (prStates.get(prKey) !== live) {
+          prStates.set(prKey, live);
+          statesVersion += 1;
+        }
         // A PR is the workspace's when its branch is one the workspace worked
         // on, or when the gh user opened it — which is how the manager's own
         // host-side PRs get in.
@@ -253,6 +259,7 @@ export function createGithubPrSync(
     prState(repo, number) {
       return prStates.get(`${repo}#${String(number)}`);
     },
+    statesVersion: () => statesVersion,
     synced(wsId) {
       return states.get(wsId)?.confirmed ?? false;
     },

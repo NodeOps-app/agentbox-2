@@ -43,6 +43,14 @@ export interface WorkspaceView extends Workspace {
 
 export type BoxStatus = 'running' | 'paused' | 'stopped' | 'creating' | 'error';
 
+export interface BoxPr {
+  /** `owner/name`. */
+  repo: string;
+  number: number;
+  url?: string;
+  state: 'open' | 'ready' | 'merged' | 'closed';
+}
+
 export interface Box {
   id: string;
   projectId: string;
@@ -108,6 +116,10 @@ export interface Box {
   // created this box. Like `tasks`, silence means "no data": a box made from the
   // web UI or the tray has no manager, and the hosted path holds none at all.
   managerId?: string;
+  // The box's pull request, from the workspace timeline (matched by box id, else
+  // by branch) and the last GitHub sync. Like `tasks`, silence means "no data":
+  // no known PR, no workspace, or the hosted path.
+  pr?: BoxPr;
   // The box's agent declares a state backup (`AgentSyncSpec.stateBackup`), so
   // `POST /boxes/{id}/backup` captures its IDENTITY and not merely a workspace.
   // True for a service bot (openclaw); absent for a coding-agent box, whose

@@ -42,6 +42,8 @@ import {
 } from '@agentbox/core';
 import type { BoxStatus as CtlBoxStatus, StatusReply } from '@agentbox/ctl';
 import { createBoxFactSeams } from './backend/box-facts';
+import { createBoxPrLookup } from './backend/box-prs';
+import { createGithubPrSync } from './backend/github-prs';
 import { createManagerBackend } from './backend/managers';
 import { createTimelineBackend, withBoxTimeline } from './backend/timeline';
 import { createWorkspaceBackend } from './backend/workspaces';
@@ -2103,7 +2105,9 @@ export function createHubBackend(handle: RelayServerHandle): HubBackend {
     pendingApprovalBoxIds: () => handle.prompts.all().map((p) => p.boxId),
   };
   const workspaces = createWorkspaceBackend(backendDeps);
-  const timeline = createTimelineBackend(backendDeps);
+  const prSync = createGithubPrSync(backendDeps);
+  const timeline = createTimelineBackend(backendDeps, { sync: prSync });
+  const boxPrs = createBoxPrLookup({ sync: prSync });
   const managers = createManagerBackend(backendDeps, {
     workspaceView: (id) => workspaces.getWorkspace(id),
   });
@@ -2188,6 +2192,7 @@ export function createHubBackend(handle: RelayServerHandle): HubBackend {
         })),
         managers.managerByBox().catch(() => new Map<string, string>()),
       ]);
+      const prOf = await boxPrs.resolver(wsByProject);
       // `?live=1` (opt-in, expensive — mirrors providers' `?freshness=1`): refresh
       // each cloud box's `state` with an authoritative SDK probe before mapping.
       // Off the default path — a plain listing shows the fast persisted state.
@@ -2285,10 +2290,12 @@ export function createHubBackend(handle: RelayServerHandle): HubBackend {
       const withTasks = (box: Box): Box => {
         const summary = taskSummaries.byBox.get(box.id);
         const managerId = managerByBox.get(box.id);
+        const pr = prOf(box);
         return {
           ...box,
           ...(summary ? { tasks: summary } : {}),
           ...(managerId ? { managerId } : {}),
+          ...(pr ? { pr } : {}),
         };
       };
       const listedBoxes = await Promise.all(

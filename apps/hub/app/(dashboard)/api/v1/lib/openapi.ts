@@ -3464,6 +3464,18 @@ export function buildOpenApi(): Record<string, unknown> {
               description:
                 "The box's agent declares a state backup, so `POST /boxes/{id}/backup` captures its IDENTITY (gateway token, pairings, history) and not just a workspace. Present for a service bot (openclaw); absent for a coding-agent box.",
             },
+            pr: {
+              type: 'object',
+              description:
+                "The box's pull request: matched in its workspace timeline by box id, else by the box branch against the PR head; the newest wins, an open one over a merged or closed one. `state` is the last GitHub sync's when the hub has one, else the log's. ABSENT means no data: no known PR, no workspace, or the hosted plane.",
+              properties: {
+                repo: { type: 'string', description: '`owner/name`.' },
+                number: { type: 'number' },
+                url: { type: 'string' },
+                state: { type: 'string', enum: ['open', 'ready', 'merged', 'closed'] },
+              },
+              required: ['repo', 'number', 'state'],
+            },
             agentStatus: {
               type: 'object',
               description:
