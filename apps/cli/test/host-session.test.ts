@@ -136,6 +136,27 @@ describe('detectHostSession: codex and refusals', () => {
     expect(hint).not.toHaveProperty('pid');
   });
 
+  it('picks the nearest agent when one runs inside the other and inherited its variables', () => {
+    const tree: Record<number, { ppid: number; comm: string }> = {
+      100: { ppid: 90, comm: '/bin/zsh' },
+      90: { ppid: 80, comm: '/usr/local/bin/codex' },
+      80: { ppid: 70, comm: 'claude' },
+    };
+    const env = { CLAUDECODE: '1', CLAUDE_CODE_SESSION_ID: ID, CODEX_THREAD_ID: 'thread-1' };
+    const inner = detectHostSession(deps({ env, ppid: 100, ps: (pid) => tree[pid] }));
+    expect(inner).toMatchObject({ agent: 'codex', sessionId: 'thread-1', pid: 90 });
+
+    const refused = detectHostSession(deps({ env, ppid: 100, ps: () => undefined }));
+    expect(refused).toMatchObject({ agent: 'codex', sessionId: 'thread-1' });
+
+    const files = { [join(transcriptDir('/work/repo'), `${ID}.jsonl`)]: NOW };
+    const outerFirst = { 100: { ppid: 80, comm: 'zsh' }, 80: { ppid: 90, comm: 'claude' } };
+    const claude = detectHostSession(
+      deps({ env, files, ppid: 100, ps: (pid) => outerFirst[pid as 100 | 80] }),
+    );
+    expect(claude).toMatchObject({ agent: 'claude', sessionId: ID });
+  });
+
   it('refuses inside a box and outside any agent session', () => {
     expect(
       detectHostSession(deps({ env: { CODEX_THREAD_ID: 'x', AGENTBOX_RELAY_URL: 'http://r' } })),

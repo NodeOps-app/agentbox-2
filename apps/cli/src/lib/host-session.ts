@@ -131,6 +131,16 @@ export function findAncestorPid(
   ps: NonNullable<HostSessionDeps['ps']>,
   now: () => number = Date.now,
 ): number | undefined {
+  return findNearestAncestor([name], startPid, ps, now)?.pid;
+}
+
+/** The nearest ancestor whose process name is one of `names`. */
+export function findNearestAncestor(
+  names: readonly string[],
+  startPid: number,
+  ps: NonNullable<HostSessionDeps['ps']>,
+  now: () => number = Date.now,
+): { pid: number; name: string } | undefined {
   const deadline = now() + PS_BUDGET_MS;
   let pid = startPid;
   for (let hop = 0; hop < MAX_PARENT_HOPS && pid > 1; hop++) {
@@ -138,7 +148,8 @@ export function findAncestorPid(
     if (left <= 0) return undefined;
     const row = ps(pid, left);
     if (!row) return undefined;
-    if (basename(row.comm) === name) return pid;
+    const name = basename(row.comm);
+    if (names.includes(name)) return { pid, name };
     pid = row.ppid;
   }
   return undefined;
@@ -165,8 +176,20 @@ export function detectHostSession(deps: HostSessionDeps = {}): HostSessionHint |
   // Inside a box: that agent is not a host session, and the hub it would register
   // with is the box's relay view of the host, not a terminal the user sits at.
   if ((env['AGENTBOX_RELAY_URL'] ?? '').trim().length > 0) return undefined;
-  const agent = detectAgentFromEnv(env);
+  let agent = detectAgentFromEnv(env);
   if (!agent) return undefined;
+  if (agent === 'claude' && (env['CODEX_THREAD_ID'] ?? '').trim().length > 0) {
+    // Both set: one agent runs inside the other and inherited the outer one's
+    // variables, so the nearest ancestor is the one issuing this command. A `ps`
+    // that is refused means codex's sandbox, which claude does not impose.
+    const nearest = findNearestAncestor(
+      ['claude', 'codex'],
+      deps.ppid ?? process.ppid,
+      deps.ps ?? defaultPs,
+      deps.now,
+    );
+    agent = nearest?.name === 'claude' ? 'claude' : 'codex';
+  }
   const cwd = deps.cwd ?? process.cwd();
   const host = (deps.hostname ?? hostname)();
   const hint = env['AGENTBOX_MANAGER']?.trim();
