@@ -82,6 +82,22 @@ the manager's own instructions come after.
   permitted" there, so the ancestor walk that finds the codex pid fails soft and a sandboxed codex
   manager never has a pid: its liveness is the 30-minute `lastSeenAt` window. `CODEX_THREAD_ID` itself
   is exported (a uuid-v7, verified on codex 0.142).
+- **A create registers its session only against a hub that is already up.** The registration around
+  a docker/cloud create goes through `withHubClientQuiet`: no autostart, no error output, no exit
+  code. With no full hub running (a lean `agentbox relay` holds the port) it is one warning, and the
+  boxes land in "Other boxes" until a later `agentbox` call from that session registers it.
+- **A session is only resumable where its transcript is.** An external manager reported from another
+  host answers `409` on resume (`resumable: false`, `resumeBlockedBy: 'other-host'`); `resumeBlockedBy`
+  is checked in the order the resume checks (`other-host`, `running`, `no-session`,
+  `unsupported-agent`) so a client words its disabled button the way the error would.
+- **A pid is matched with its start time.** At detect from the hub's own host the hub records
+  `pidStartedAt` (`ps -o lstart=`, `LC_ALL=C`, fail soft); a live pid whose start time changed reads as
+  stopped. An unreadable start time is not evidence of a new process. When the status is still wrong,
+  `manager forget --force` / `workspace remove --force` (`?force=1`) pass the "is running" refusal and
+  leave any process alone.
+- **Titles are cached only when real.** `(untitled)` and a failed lookup are never written to the
+  record; a miss is remembered in the hub's memory for 10 minutes per manager (keyed by its session
+  id, so a `/clear` retries at once).
 - **A remote hub probes no pid and scrapes no title.** A pid is only probed when the detect reported
   the hub's own hostname, and a title is read from the agent's store on the hub's disk; a PC session
   registered with a control box falls back to the `lastSeenAt` window and shows its short session id.
@@ -171,7 +187,9 @@ workspace first.
 
 When the CLI runs inside a session it sends that session's identity (`POST /api/v1/managers/detect`);
 the hub registers it and, if no workspace contains the session's folder, creates one there named after
-the folder. A session already registered stays in its workspace. An external manager whose process
+the folder — never at `/`, the hub user's home folder or a folder above it, nor at a path that is not a
+folder on the hub: those answer `400` and the CLI shows the refusal as a warning (register the project
+folder with `agentbox workspace add` instead). A session already registered stays in its workspace. An external manager whose process
 has ended is **resumable by the hub** (`POST /managers/:id/resume` → `claude --resume <id>` /
 `codex resume <id>` in the recorded `cwd`), after which it is `hub`-run — that is what turns "the
 session that made these boxes" into a manager any client can reopen.
@@ -187,15 +205,28 @@ walking up from the cwd so a command run in a subfolder records the folder the s
 transcript; the fallback is the single session in that folder touched in the last five minutes, else
 nothing is sent. `AGENTBOX_MANAGER=<managerId>` is exported into a hub-run manager's shell, so its
 agent's own `agentbox` calls join that record instead of registering a second one. Inside a box
-(`AGENTBOX_RELAY_URL` set) nothing is detected. Registration is best-effort everywhere: a failure is a
-warning, never a failed create.
+(`AGENTBOX_RELAY_URL` set) nothing is detected. Registration is best-effort everywhere: a failure is at
+most one warning, never a failed create or a changed exit code.
+
+**Rules for a workspace the user named.** With `-w`/`--workspace` (or `$AGENTBOX_WORKSPACE`), a command
+never creates another workspace: the session is only registered when the workspace containing its
+folder is the named one, and a manager the hub keeps in a different workspace is not attached. The hub
+enforces the same invariant: `addTask` / `updateTask` answer `400` for a `managerId` of another
+workspace (or an unknown one), and a task inherits its box's manager only when that manager belongs to
+the task's workspace.
 
 **Store.** `managers.json` `{version:1, managers: ManagerRecord[]}` replaces `manager.json`, with the
 same locked temp+rename writes as `tasks.json`; exit codes move to `managers/<managerId>.exit`. A
 legacy `manager.json` is read once into a `hub` record — keeping its old tmux session name, so a
-session still running under it reads running — and then deleted. `status` is derived, never stored:
+session still running under it reads running — and then deleted. While that record still runs under
+the old name its agent writes its exit code to the old `manager.exit`, so the view and `stop` read it
+there; the migration deletes that file only when it read a code from it, and the next stop drops it.
+That layout exported `AGENTBOX_MANAGER=1`, which names no record, so a detect with no `managerId`
+joins the single running migrated record with the same agent and folder (and no session id yet)
+instead of registering a duplicate; a record on the current tmux name is never adopted this way. `status` is derived, never stored:
 tmux for `hub`; for `external` a `kill(pid, 0)` (ESRCH = stopped, EPERM = running) when the detect
-reported this host's name, else running while `lastSeenAt` is under 30 minutes old.
+reported this host's name — and a live pid whose start time differs from the recorded `pidStartedAt`
+counts as stopped — else running while `lastSeenAt` is under 30 minutes old.
 
 **Boxes and tasks.** A manager keeps `boxIds` and `boxJobIds`, reconciled on read with the same rules
 as a task's assignment (job → box, a failed job dropped, a gone box dropped unless a create in flight
@@ -204,7 +235,7 @@ cloud paths create inline, attach through the detect call itself (`boxId` / `box
 `GET /boxes` stamps `Box.managerId`. `WorkTask.managerId` is set by `agentbox tasks add` inside a
 session and inherited from the box on assignment; `?managerId=` filters both task listings.
 `WorkspaceView.manager` became `managers: { running, total }`, and a workspace cannot be removed while
-any of its managers runs.
+any of its managers runs (unless `--force`).
 
 **API.** The three `workspaces/:id/manager*` routes are gone. `GET /managers`
 (`?workspaceId=&status=`), `POST /managers/detect`, `GET|DELETE /managers/:id`,

@@ -448,7 +448,10 @@ agentbox workspace rm -y --force      # even while one of its managers reads as 
 Every command below finds its workspace the same way: `--workspace <id|path>` if you pass one, else
 `$AGENTBOX_WORKSPACE` (which a hub-run manager's session has set), else the registered workspace
 containing your current directory — and, inside a Claude Code or Codex session with none of those,
-the workspace registering that session creates.
+the workspace registering that session creates. That never happens at `/`, your home folder or a
+folder above it (you get a warning: run `agentbox workspace add <project folder>` instead), and a
+workspace you name with `--workspace` never gets another one created beside it: a session from a
+different workspace just isn't attached to the task.
 
 ```bash
 # Plan the work. List order is the priority.
