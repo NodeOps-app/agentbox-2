@@ -3,6 +3,7 @@
 //   against live boxes and create jobs on the way out.
 // POST /api/v1/workspaces/:id/tasks — add a task.
 import { backendOrNull } from '../../../lib/backend';
+import { timelineMeta } from '../../../lib/actor';
 import { fail, failFromAction, ok } from '../../../lib/envelope';
 import { isTaskStatus, parseTaskCreate, readJson } from '../../../lib/validate';
 import type { TaskFilter } from '@/lib/boxes/backend-types';
@@ -47,7 +48,12 @@ export async function POST(
   const parsed = parseTaskCreate(parsedBody.value);
   if (!parsed.ok) return fail('invalid_request', parsed.message);
 
-  const res = await backend.addTask(id, parsed.value);
+  const { note, ...input } = parsed.value;
+  const res = await backend.addTask(
+    id,
+    input,
+    await timelineMeta(req, backend, { wsId: id, note }),
+  );
   if (!res.ok) return res.invalid ? fail('invalid_request', res.error) : failFromAction(res.error);
   return ok(res.task, 201);
 }

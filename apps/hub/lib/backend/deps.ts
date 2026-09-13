@@ -7,6 +7,30 @@ import type { ManagerExec } from '@agentbox/relay';
 // reading the box/provider code it does not touch.
 import type { QueueJob, ReconcileContext } from '@agentbox/relay';
 
+/** What the timeline needs to know about one box, read from the host's records. */
+export interface TimelineBoxFact {
+  id: string;
+  name: string;
+  /** The box's create-time branch and its host-sanctioned one, deduplicated. */
+  branches: string[];
+  /** Persisted runtime state (`running`, `paused`, ...); absent when unknown. */
+  state?: string;
+  agent?: string;
+  projectRoot: string;
+  projectId: string;
+}
+
+export interface DiffStat {
+  filesChanged: number;
+  additions: number;
+  deletions: number;
+}
+
+export type GhExec = (
+  args: string[],
+  opts?: { cwd?: string },
+) => Promise<{ exitCode: number; stdout: string; stderr: string }>;
+
 export interface BackendDeps {
   /**
    * How the manager's tmux commands are run. Present only so a test can drive
@@ -40,6 +64,14 @@ export interface BackendDeps {
   isPidAlive?: (pid: number) => boolean;
   /** `ps -o lstart=` of a pid; faked in tests like the pid probe. */
   processStartTime?: (pid: number) => Promise<string | undefined>;
+  /** Every box this hub has a record for. Absent: the timeline names no boxes. */
+  boxFacts?(): Promise<TimelineBoxFact[]>;
+  /** `git diff --shortstat` in a running box; null when the exec fails. */
+  boxDiffStat?(boxId: string): Promise<DiffStat | null>;
+  /** Box ids with a pending host-action approval. */
+  pendingApprovalBoxIds?(): string[];
+  /** How the GitHub sync runs `gh`; tests fake it, production spawns the host's gh. */
+  ghExec?: GhExec;
 }
 
 /**

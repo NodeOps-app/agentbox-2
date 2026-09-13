@@ -15,6 +15,7 @@ import {
   isResumableManagerAgent,
   listResumableHostSessions,
   listWorkspaces,
+  managerSessionName,
   managerStatus,
   newManagerId,
   patchManager,
@@ -23,10 +24,15 @@ import {
   readManagers,
   readReconciledManagers,
   readTasks,
+  readTimeline,
   readWorkspace,
+  recordTimelineEvent,
   removeManagerRecord,
   resumeManagerSession,
+  sendKeysToManager,
   sessionTitle,
+  sessionTurn,
+  stampFields,
   startManagerSession,
   stopManagerSession,
   tmuxAvailable,
@@ -38,6 +44,10 @@ import {
   type ManagerProbe,
   type ManagerRecord,
   type ReconcileContext,
+  type TimelineEvent,
+  type TimelineEventType,
+  type TimelinePr,
+  type TimelineStamp,
   type WorkspaceRecord,
 } from '@agentbox/relay';
 import { reconcileContext, type BackendDeps } from './deps';
@@ -48,9 +58,13 @@ import type {
   DetectManagerResult,
   ManagerBackend,
   ManagerFilter,
+  ManagerMessageDelivery,
+  ManagerMessageResult,
+  ManagerNoteResult,
   ManagerResult,
   ManagerSessionsResult,
   StartManagerInput,
+  TimelineMeta,
 } from '../boxes/backend-types';
 import type { ManagerView, WorkspaceView } from '../boxes/types';
 
@@ -73,6 +87,10 @@ export interface ManagerBackendOptions {
   /** Seams for the title lookup and its retry clock; production reads the agent's store. */
   sessionTitle?: typeof sessionTitle;
   now?: () => number;
+  /** Seam for the turn lookup that stamps timeline events. */
+  sessionTurn?: typeof sessionTurn;
+  /** The pause between typing a message and submitting it; tests pass a no-op. */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 /**
@@ -136,6 +154,43 @@ export function createManagerBackend(
         : cur,
     ).catch(() => null);
     return { ...rec, title };
+  }
+
+  const lookupTurn = opts.sessionTurn ?? sessionTurn;
+
+  /** A manager as a timeline actor, with its current turn when its transcript is here. */
+  async function managerStamp(rec: ManagerRecord): Promise<TimelineStamp> {
+    const turn =
+      rec.sessionId && storeIsLocal(rec)
+        ? await lookupTurn(rec.agent, rec.cwd, rec.sessionId).catch(() => undefined)
+        : undefined;
+    return {
+      actor: 'manager',
+      managerId: rec.id,
+      ...(turn ? { turn: turn.turn, ...(turn.prompt ? { prompt: turn.prompt } : {}) } : {}),
+    };
+  }
+
+  /** A lifecycle event about `rec`, by whoever the stamp names. Best-effort. */
+  async function recordManagerEvent(
+    rec: ManagerRecord,
+    type: TimelineEventType,
+    stamp: TimelineStamp | undefined,
+  ): Promise<void> {
+    await recordTimelineEvent(rec.workspaceId, {
+      type,
+      ...stampFields(stamp),
+      managerId: rec.id,
+      agent: rec.agent,
+    });
+  }
+
+  /** The PR a message is about, as the log last saw it. */
+  async function knownPr(wsId: string, number: number): Promise<TimelinePr> {
+    const hit = (await readTimeline(wsId).catch((): TimelineEvent[] => [])).find(
+      (ev) => ev.pr?.number === number,
+    );
+    return hit?.pr ?? { repo: '', number, title: '', url: '', base: '', head: '' };
   }
 
   async function viewsOf(ws: WorkspaceRecord, ctx: ReconcileContext): Promise<ManagerView[]> {
@@ -258,7 +313,7 @@ export function createManagerBackend(
           : undefined;
       const managerId =
         input.managerId ?? (known ? undefined : await legacyManagerFor(ws.id, input.agent, cwd));
-      const { manager, created } = await upsertDetectedManager(ws.id, {
+      const { manager, created, sessionChanged } = await upsertDetectedManager(ws.id, {
         agent: input.agent,
         sessionId: input.sessionId,
         cwd,
@@ -266,10 +321,16 @@ export function createManagerBackend(
         ...(pidStartedAt ? { pidStartedAt } : {}),
         ...(input.host ? { host: input.host } : {}),
         ...(managerId ? { managerId } : {}),
+        ...(input.tmuxPane ? { tmuxPane: input.tmuxPane } : {}),
       });
       if (input.boxId) await attachBoxToManager(ws.id, manager.id, { boxId: input.boxId });
       else if (input.boxJobId) {
         await attachBoxToManager(ws.id, manager.id, { boxJobId: input.boxJobId });
+      }
+      // A detect runs on nearly every CLI call; only a new record or a new
+      // session in an existing one (`/clear`, a hub-run agent's first call) is news.
+      if (created || sessionChanged) {
+        await recordManagerEvent(manager, 'manager.joined', { actor: 'manager' });
       }
       deps.notify();
       const [view, workspace] = await Promise.all([viewOf(manager.id), opts.workspaceView(ws.id)]);
@@ -294,7 +355,11 @@ export function createManagerBackend(
       return sortViews(await viewsOf(ws, await reconcileContext(deps)));
     },
 
-    async startManager(wsId: string, input: StartManagerInput): Promise<ManagerResult> {
+    async startManager(
+      wsId: string,
+      input: StartManagerInput,
+      meta?: TimelineMeta,
+    ): Promise<ManagerResult> {
       const ws = await readWorkspace(wsId);
       if (!ws) return err(`unknown workspace ${wsId}`);
       if (!(await tmuxAvailable(deps.managerExec))) return err(TMUX_MISSING);
@@ -323,6 +388,7 @@ export function createManagerBackend(
           } catch (e) {
             return err(messageOf(e));
           }
+          await recordManagerEvent(existing, 'manager.resumed', meta?.stamp);
           deps.notify();
           return answer(existing.id);
         }
@@ -350,11 +416,12 @@ export function createManagerBackend(
       } catch (e) {
         return err(`could not start the manager: ${messageOf(e)}`);
       }
+      await recordManagerEvent(manager, 'manager.started', meta?.stamp);
       deps.notify();
       return answer(manager.id);
     },
 
-    async resumeManager(id: string): Promise<ManagerResult> {
+    async resumeManager(id: string, meta?: TimelineMeta): Promise<ManagerResult> {
       const rec = await findManager(id);
       if (!rec) return err(`unknown manager ${id}`);
       if (!(await tmuxAvailable(deps.managerExec))) return err(TMUX_MISSING);
@@ -363,18 +430,22 @@ export function createManagerBackend(
       } catch (e) {
         return err(messageOf(e));
       }
+      await recordManagerEvent(rec, 'manager.resumed', meta?.stamp);
       deps.notify();
       return answer(id);
     },
 
-    async stopManager(id: string): Promise<ManagerResult> {
+    async stopManager(id: string, meta?: TimelineMeta): Promise<ManagerResult> {
       const rec = await findManager(id);
       if (!rec) return err(`unknown manager ${id}`);
+      const wasRunning = (await managerStatus(rec, probe)) === 'running';
       try {
         await stopManagerSession(rec.workspaceId, id, probe);
       } catch (e) {
         return err(messageOf(e));
       }
+      // Stop is idempotent: stopping a session that had already ended is not an event.
+      if (wasRunning) await recordManagerEvent(rec, 'manager.stopped', meta?.stamp);
       deps.notify();
       return answer(id);
     },
@@ -398,6 +469,78 @@ export function createManagerBackend(
       const ws = await readWorkspace(wsId);
       if (!ws) return null;
       return listResumableHostSessions(ws.root, agent ?? 'claude');
+    },
+
+    async timelineStamp(ref, wsId) {
+      const rec =
+        'managerId' in ref
+          ? await findManager(ref.managerId)
+          : await findManagerBySession(ref.agent, ref.sessionId);
+      if (!rec || (wsId !== undefined && rec.workspaceId !== wsId)) return undefined;
+      return managerStamp(rec);
+    },
+
+    async addManagerNote(id, input): Promise<ManagerNoteResult> {
+      const rec = await findManager(id);
+      if (!rec) return err(`unknown manager ${id}`);
+      const event = await recordTimelineEvent(rec.workspaceId, {
+        type: 'manager.note',
+        ...stampFields(await managerStamp(rec)),
+        text: input.text,
+        noteKind: input.kind ?? 'note',
+      });
+      // Here the log write IS the mutation, so unlike every other writer a miss is an error.
+      if (!event) return err(`the note for manager ${id} was not recorded`);
+      deps.notify();
+      return { ok: true, event };
+    },
+
+    async sendManagerMessage(id, input, meta): Promise<ManagerMessageResult> {
+      const rec = await findManager(id);
+      if (!rec) return err(`unknown manager ${id}`);
+      const status = await managerStatus(rec, probe);
+      let delivered: ManagerMessageDelivery;
+      try {
+        if (status === 'running' && rec.kind === 'hub') {
+          await sendKeysToManager(
+            { session: rec.tmuxSession ?? managerSessionName(rec.id) },
+            input.text,
+            deps.managerExec,
+            opts.sleep,
+          );
+          delivered = 'session';
+        } else if (status === 'running') {
+          // A pane is only reachable on the machine whose tmux server holds it.
+          if (!rec.tmuxPane || !storeIsLocal(rec)) {
+            return {
+              ok: false,
+              code: 'manager_unreachable',
+              error: `manager ${id} runs in your terminal${rec.tmuxPane ? ' on another machine' : ' outside tmux'}, where the hub cannot type; paste the message into that session`,
+            };
+          }
+          await sendKeysToManager({ pane: rec.tmuxPane }, input.text, deps.managerExec, opts.sleep);
+          delivered = 'pane';
+        } else {
+          if (!(await tmuxAvailable(deps.managerExec))) return err(TMUX_MISSING);
+          await resumeManagerSession(rec.workspaceId, id, probe, { prompt: input.text });
+          delivered = 'resumed';
+        }
+      } catch (e) {
+        return err(messageOf(e));
+      }
+      const pr =
+        input.prNumber !== undefined ? await knownPr(rec.workspaceId, input.prNumber) : undefined;
+      const event = await recordTimelineEvent(rec.workspaceId, {
+        type: 'manager.message',
+        ...stampFields(meta?.stamp),
+        managerId: rec.id,
+        text: input.text,
+        ...(pr ? { pr } : {}),
+      });
+      deps.notify();
+      const view = await viewOf(id);
+      if (!view) return err(`unknown manager ${id}`);
+      return { ok: true, delivered, manager: view, event };
     },
 
     async attachJob(managerId: string, jobId: string): Promise<ActionResult> {

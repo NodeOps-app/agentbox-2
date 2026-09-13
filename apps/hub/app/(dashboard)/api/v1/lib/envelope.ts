@@ -9,6 +9,7 @@ export type ApiErrorCode =
   | 'unauthorized'
   | 'backend_unavailable'
   | 'conflict'
+  | 'manager_unreachable'
   | 'internal';
 
 const STATUS_HINT: Record<ApiErrorCode, number> = {
@@ -16,6 +17,7 @@ const STATUS_HINT: Record<ApiErrorCode, number> = {
   unauthorized: 401,
   not_found: 404,
   conflict: 409,
+  manager_unreachable: 409,
   backend_unavailable: 503,
   internal: 500,
 };

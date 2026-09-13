@@ -15,6 +15,8 @@ import {
   patchTask,
   readManagers,
   readReconciledTasks,
+  readTasks,
+  recordTimelineEvent,
   readWorkspace,
   removeTask,
   removeWorkspace,
@@ -22,12 +24,15 @@ import {
   reorderTasks,
   rescanWorkspace,
   setTaskDone,
+  stampFields,
   taskSummaryForBox,
   toWorkspaceView,
   unassignTasks,
   type BoxTaskSummary,
   type ManagerProbe,
   type ReconcileContext,
+  type TimelineEventInput,
+  type TimelineNoteKind,
   type Workspace,
   type WorkTask,
 } from '@agentbox/relay';
@@ -39,6 +44,7 @@ import type {
   TaskFilter,
   TaskResult,
   TasksResult,
+  TimelineMeta,
   UpdateTaskInput,
   WorkspaceBackend,
   WorkspaceResult,
@@ -108,6 +114,36 @@ export function createWorkspaceBackend(deps: BackendDeps): WorkspaceBackend {
       return `manager ${managerId} belongs to workspace ${rec.workspaceId}, not ${wsId}`;
     }
     return null;
+  }
+
+  /**
+   * Log a task event. Awaited before `notify()` so a client refetching on the
+   * change event already sees it; best-effort inside the store, so a log failure
+   * never fails the mutation that already happened.
+   */
+  async function record(wsId: string, input: TimelineEventInput): Promise<void> {
+    await recordTimelineEvent(wsId, input);
+  }
+
+  /** The note a mutation carried, as its own event right after the mutation's. */
+  async function recordNote(
+    wsId: string,
+    meta: TimelineMeta | undefined,
+    taskIds: string[],
+    kind: TimelineNoteKind = 'note',
+  ): Promise<void> {
+    if (!meta?.note) return;
+    await record(wsId, {
+      type: 'manager.note',
+      ...stampFields(meta.stamp),
+      text: meta.note,
+      noteKind: kind,
+      ...(taskIds.length ? { taskIds } : {}),
+    });
+  }
+
+  async function taskBefore(wsId: string, taskId: string): Promise<WorkTask | undefined> {
+    return (await readTasks(wsId).catch(() => [])).find((t) => t.id === taskId);
   }
 
   /** A box id must exist; a job id must be a create job that has not failed. */
@@ -202,7 +238,7 @@ export function createWorkspaceBackend(deps: BackendDeps): WorkspaceBackend {
       return (await tasksOf(wsId)).find((t) => t.id === taskId) ?? null;
     },
 
-    async addTask(wsId: string, input: AddTaskInput): Promise<TaskResult> {
+    async addTask(wsId: string, input: AddTaskInput, meta?: TimelineMeta): Promise<TaskResult> {
       if (!(await readWorkspace(wsId))) return unknownWorkspace(wsId);
       const wrongManager = await managerRefusal(wsId, input.managerId);
       if (wrongManager) return { ok: false, error: wrongManager, invalid: true };
@@ -214,6 +250,16 @@ export function createWorkspaceBackend(deps: BackendDeps): WorkspaceBackend {
       }
       try {
         const task = await addTask(wsId, input);
+        await record(wsId, {
+          type: 'task.created',
+          ...stampFields(meta?.stamp),
+          ...(!meta?.stamp?.managerId && task.managerId ? { managerId: task.managerId } : {}),
+          task: { id: task.id, title: task.title, to: task.status },
+          taskIds: [task.id],
+          ...(task.projectId ? { projectId: task.projectId } : {}),
+          ...(task.boxId ? { boxId: task.boxId } : {}),
+        });
+        await recordNote(wsId, meta, [task.id]);
         deps.notify();
         return { ok: true, task };
       } catch (e) {
@@ -221,13 +267,29 @@ export function createWorkspaceBackend(deps: BackendDeps): WorkspaceBackend {
       }
     },
 
-    async updateTask(wsId: string, taskId: string, patch: UpdateTaskInput): Promise<TaskResult> {
+    async updateTask(
+      wsId: string,
+      taskId: string,
+      patch: UpdateTaskInput,
+      meta?: TimelineMeta,
+    ): Promise<TaskResult> {
       if (!(await readWorkspace(wsId))) return unknownWorkspace(wsId);
       const wrongManager = await managerRefusal(wsId, patch.managerId);
       if (wrongManager) return { ok: false, error: wrongManager, invalid: true };
       try {
+        const prev = await taskBefore(wsId, taskId);
         const task = await patchTask(wsId, taskId, patch);
         if (!task) return err(`unknown task ${taskId}`);
+        if (prev && prev.status !== task.status) {
+          await record(wsId, {
+            type: 'task.status',
+            ...stampFields(meta?.stamp),
+            task: { id: task.id, title: task.title, from: prev.status, to: task.status },
+            taskIds: [task.id],
+            ...(task.boxId ? { boxId: task.boxId } : {}),
+          });
+        }
+        await recordNote(wsId, meta, [task.id]);
         deps.notify();
         return { ok: true, task };
       } catch (e) {
@@ -235,27 +297,66 @@ export function createWorkspaceBackend(deps: BackendDeps): WorkspaceBackend {
       }
     },
 
-    async completeTask(wsId: string, taskId: string): Promise<TaskResult> {
+    async completeTask(wsId: string, taskId: string, meta?: TimelineMeta): Promise<TaskResult> {
       if (!(await readWorkspace(wsId))) return unknownWorkspace(wsId);
+      const prev = await taskBefore(wsId, taskId);
       const task = await setTaskDone(wsId, taskId);
       if (!task) return err(`unknown task ${taskId}`);
+      if (prev && prev.status !== 'done') {
+        await record(wsId, {
+          type: 'task.status',
+          ...stampFields(meta?.stamp),
+          task: { id: task.id, title: task.title, from: prev.status, to: 'done' },
+          taskIds: [task.id],
+          ...(task.boxId ? { boxId: task.boxId } : {}),
+        });
+      }
       deps.notify();
       return { ok: true, task };
     },
 
-    async removeTask(wsId: string, taskId: string): Promise<ActionResult> {
+    async removeTask(wsId: string, taskId: string, meta?: TimelineMeta): Promise<ActionResult> {
       if (!(await readWorkspace(wsId))) return unknownWorkspace(wsId);
+      const prev = await taskBefore(wsId, taskId);
       if (!(await removeTask(wsId, taskId))) return err(`unknown task ${taskId}`);
+      await record(wsId, {
+        type: 'task.removed',
+        ...stampFields(meta?.stamp),
+        task: { id: taskId, title: prev?.title ?? taskId, ...(prev ? { from: prev.status } : {}) },
+        taskIds: [taskId],
+      });
       deps.notify();
       return { ok: true };
     },
 
-    async assignTasks(wsId: string, ids: string[], target: AssignTarget): Promise<TasksResult> {
+    async assignTasks(
+      wsId: string,
+      ids: string[],
+      target: AssignTarget,
+      meta?: TimelineMeta,
+    ): Promise<TasksResult> {
       if (!(await readWorkspace(wsId))) return unknownWorkspace(wsId);
       const bad = await validateTarget(target);
       if (bad) return err(bad);
       try {
         const tasks = await assignTasks(wsId, ids, target);
+        const box =
+          'boxId' in target && deps.boxFacts
+            ? (await deps.boxFacts().catch(() => [])).find((b) => b.id === target.boxId)
+            : undefined;
+        await record(wsId, {
+          type: 'task.assigned',
+          ...stampFields(meta?.stamp),
+          taskIds: tasks.map((t) => t.id),
+          ...(tasks.length === 1 ? { task: { id: tasks[0]!.id, title: tasks[0]!.title } } : {}),
+          ...('boxId' in target ? { boxId: target.boxId } : {}),
+          ...(box ? { boxName: box.name } : {}),
+          ...(box?.agent ? { agent: box.agent } : {}),
+          ...(box?.branches[0] ? { branch: box.branches[0] } : {}),
+          // "Gave more work to a running box" rather than "planned into a new one".
+          boxRunning: box?.state === 'running',
+        });
+        await recordNote(wsId, meta, ids);
         deps.notify();
         return { ok: true, tasks };
       } catch (e) {
@@ -263,10 +364,16 @@ export function createWorkspaceBackend(deps: BackendDeps): WorkspaceBackend {
       }
     },
 
-    async unassignTasks(wsId: string, ids: string[]): Promise<TasksResult> {
+    async unassignTasks(wsId: string, ids: string[], meta?: TimelineMeta): Promise<TasksResult> {
       if (!(await readWorkspace(wsId))) return unknownWorkspace(wsId);
       try {
         const tasks = await unassignTasks(wsId, ids);
+        await record(wsId, {
+          type: 'task.unassigned',
+          ...stampFields(meta?.stamp),
+          taskIds: tasks.map((t) => t.id),
+          ...(tasks.length === 1 ? { task: { id: tasks[0]!.id, title: tasks[0]!.title } } : {}),
+        });
         deps.notify();
         return { ok: true, tasks };
       } catch (e) {
@@ -274,10 +381,12 @@ export function createWorkspaceBackend(deps: BackendDeps): WorkspaceBackend {
       }
     },
 
-    async reorderTasks(wsId: string, ids: string[]): Promise<TasksResult> {
+    async reorderTasks(wsId: string, ids: string[], meta?: TimelineMeta): Promise<TasksResult> {
       if (!(await readWorkspace(wsId))) return unknownWorkspace(wsId);
       try {
         const tasks = await reorderTasks(wsId, ids);
+        // An order change alone is not news; the reason for it is.
+        await recordNote(wsId, meta, ids, 'replan');
         deps.notify();
         return { ok: true, tasks };
       } catch (e) {

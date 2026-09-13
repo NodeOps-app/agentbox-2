@@ -4,6 +4,7 @@
 // one rather than the hub proxying a PTY. A `sessionId` some manager already
 // holds resumes THAT manager instead of creating a second one.
 import { backendOrNull } from '../../../../lib/backend';
+import { timelineMeta } from '../../../../lib/actor';
 import { fail, failFromAction, ok } from '../../../../lib/envelope';
 import { MANAGER_AGENT_NAMES, parseManagerStart, readJson } from '../../../../lib/validate';
 import { TMUX_MISSING } from '@/lib/backend/errors';
@@ -45,7 +46,11 @@ export async function POST(
   const parsed = parseManagerStart(parsedBody.value, allowedAgents);
   if (!parsed.ok) return fail('invalid_request', parsed.message);
 
-  const res = await backend.startManager(id, parsed.value);
+  const res = await backend.startManager(
+    id,
+    parsed.value,
+    await timelineMeta(req, backend, { wsId: id }),
+  );
   if (!res.ok) {
     // A host without tmux cannot host a manager at all — that is an environment
     // gap on the hub's machine, not a bad request.

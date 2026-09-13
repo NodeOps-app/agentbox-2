@@ -3,6 +3,7 @@
 // Mutations need the in-process host backend; the Postgres/plane path 503s (hosted
 // writes are a documented follow-up).
 import { backendOrNull } from '../../../lib/backend';
+import { timelineMeta } from '../../../lib/actor';
 import { fail, failFromAction, ok } from '../../../lib/envelope';
 import { isLifecycleAction, LIFECYCLE_ACTIONS, readJson } from '../../../lib/validate';
 
@@ -31,6 +32,7 @@ export async function POST(
   }
   const backend = backendOrNull();
   if (!backend) return fail('backend_unavailable', 'hub backend unavailable (run the hub server)');
+  const meta = await timelineMeta(req, backend);
 
   // `destroy` carries an optional `keepSnapshot` (mirrors the CLI's flag — a
   // docker box's snapshot dir is kept when true); every other action is body-less.
@@ -41,12 +43,12 @@ export async function POST(
       typeof parsed.value === 'object' &&
       parsed.value !== null &&
       (parsed.value as { keepSnapshot?: unknown }).keepSnapshot === true;
-    const res = await backend.destroy(id, { keepSnapshot });
+    const res = await backend.destroy(id, { keepSnapshot }, meta);
     if (!res.ok) return failFromAction(res.error);
     return ok({ ok: true });
   }
 
-  const res = await backend[action](id);
+  const res = await backend[action](id, meta);
   if (!res.ok) return failFromAction(res.error);
   return ok({ ok: true });
 }

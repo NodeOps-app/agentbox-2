@@ -37,6 +37,85 @@ const detectSchema = {
   required: ['manager', 'workspace'],
 };
 
+const NOTE_DESCRIPTION =
+  "Why: recorded on the workspace timeline as a `manager.note` next to this change (stamped with the caller's manager and turn when the CLI sends `X-AgentBox-Session`).";
+
+const timelineEventTypes = [
+  'task.created',
+  'task.status',
+  'task.assigned',
+  'task.unassigned',
+  'task.removed',
+  'manager.joined',
+  'manager.started',
+  'manager.resumed',
+  'manager.stopped',
+  'manager.note',
+  'manager.message',
+  'box.created',
+  'box.ready',
+  'box.failed',
+  'box.started',
+  'box.stopped',
+  'box.destroyed',
+  'git.push',
+  'pr.opened',
+  'pr.ready',
+  'pr.merged',
+  'pr.closed',
+];
+
+const taskStatusEnum = { type: 'string', enum: ['todo', 'in_progress', 'blocked', 'done'] };
+
+const timelineEventProperties = {
+  id: {
+    type: 'string',
+    description: 'Time-sortable: zero-padded base-36 ms, then a random suffix.',
+  },
+  at: { type: 'string', description: 'ISO time.' },
+  type: { type: 'string', enum: timelineEventTypes },
+  actor: { type: 'string', enum: ['human', 'manager', 'box', 'hub', 'github'] },
+  managerId: { type: 'string' },
+  turn: {
+    type: 'number',
+    description:
+      "The manager session's turn when this happened; only when its transcript is on the hub's disk.",
+  },
+  prompt: { type: 'string', description: "That turn's prompt, as a one-line title." },
+  boxId: { type: 'string' },
+  boxName: { type: 'string' },
+  agent: { type: 'string' },
+  branch: { type: 'string' },
+  projectId: { type: 'string' },
+  taskIds: {
+    type: 'array',
+    items: { type: 'string' },
+    description: 'Captured when the event was written (a task later leaves its box).',
+  },
+  task: {
+    type: 'object',
+    properties: {
+      id: { type: 'string' },
+      title: { type: 'string' },
+      from: taskStatusEnum,
+      to: taskStatusEnum,
+    },
+    required: ['id', 'title'],
+  },
+  pr: { $ref: '#/components/schemas/TimelinePr' },
+  text: { type: 'string', description: 'A note, or the message sent to a manager.' },
+  noteKind: { type: 'string', enum: ['note', 'replan', 'plan'] },
+  boxRunning: {
+    type: 'boolean',
+    description: '`task.assigned`: the box was already running (it was given more work).',
+  },
+  key: {
+    type: 'string',
+    description:
+      'Dedupe key (`pr:<repo>#<n>:merged`, `job:<jobId>:ready`); an event whose key is already logged is not appended again.',
+  },
+};
+
 export function buildOpenApi(): Record<string, unknown> {
   return {
     openapi: '3.1.0',
@@ -1131,6 +1210,11 @@ export function buildOpenApi(): Record<string, unknown> {
                       description:
                         "The manager session this task belongs to; 400 when it belongs to another workspace (or is unknown). Omitted with a box: the box's manager, when it is this workspace's.",
                     },
+                    note: {
+                      type: 'string',
+                      maxLength: 2000,
+                      description: NOTE_DESCRIPTION,
+                    },
                   },
                   required: ['title'],
                 },
@@ -1175,6 +1259,11 @@ export function buildOpenApi(): Record<string, unknown> {
                   type: 'object',
                   properties: {
                     ids: { type: 'array', items: { type: 'string', pattern: '^T-\\d+$' } },
+                    note: {
+                      type: 'string',
+                      maxLength: 2000,
+                      description: NOTE_DESCRIPTION,
+                    },
                   },
                   required: ['ids'],
                 },
@@ -1228,6 +1317,11 @@ export function buildOpenApi(): Record<string, unknown> {
                     ids: { type: 'array', items: { type: 'string', pattern: '^T-\\d+$' } },
                     boxId: { type: 'string' },
                     boxJobId: { type: 'string' },
+                    note: {
+                      type: 'string',
+                      maxLength: 2000,
+                      description: NOTE_DESCRIPTION,
+                    },
                   },
                   required: ['ids'],
                 },
@@ -1325,6 +1419,11 @@ export function buildOpenApi(): Record<string, unknown> {
                       nullable: true,
                       description:
                         '`null` clears the manager; 400 for a manager of another workspace (or an unknown one).',
+                    },
+                    note: {
+                      type: 'string',
+                      maxLength: 2000,
+                      description: NOTE_DESCRIPTION,
                     },
                   },
                 },
@@ -1437,7 +1536,11 @@ export function buildOpenApi(): Record<string, unknown> {
               'application/json': {
                 schema: {
                   type: 'object',
-                  properties: { boxId: { type: 'string' }, boxJobId: { type: 'string' } },
+                  properties: {
+                    boxId: { type: 'string' },
+                    boxJobId: { type: 'string' },
+                    note: { type: 'string', maxLength: 2000, description: NOTE_DESCRIPTION },
+                  },
                 },
               },
             },
@@ -1557,6 +1660,12 @@ export function buildOpenApi(): Record<string, unknown> {
                       description: 'Hostname of the machine the session runs on.',
                     },
                     managerId: { type: 'string', pattern: '^[0-9a-f]{16}$' },
+                    tmuxPane: {
+                      type: 'string',
+                      pattern: '^%\\d+$',
+                      description:
+                        "`$TMUX_PANE` of the session's terminal, so POST /managers/{id}/message can type into it.",
+                    },
                     boxId: { type: 'string' },
                     boxJobId: { type: 'string' },
                   },
@@ -1663,6 +1772,131 @@ export function buildOpenApi(): Record<string, unknown> {
             '404': errorResponse,
             '409': errorResponse,
             '503': errorResponse,
+          },
+        },
+      },
+      '/managers/{id}/notes': {
+        post: {
+          tags: ['Managers', 'Timeline'],
+          summary: 'Record a manager note on the timeline',
+          description:
+            "A note explaining what the manager decided (`kind`: `note`, `replan` when it re-planned, `plan` when it made one). Stamped with the manager's current turn and that turn's prompt when its transcript is on this hub's disk.",
+          parameters: [managerIdParam],
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    text: { type: 'string', maxLength: 2000 },
+                    kind: { type: 'string', enum: ['note', 'replan', 'plan'] },
+                  },
+                  required: ['text'],
+                },
+              },
+            },
+          },
+          responses: {
+            '201': {
+              description: 'The recorded event',
+              content: {
+                'application/json': { schema: { $ref: '#/components/schemas/TimelineEvent' } },
+              },
+            },
+            '400': errorResponse,
+            '401': errorResponse,
+            '404': errorResponse,
+            '409': errorResponse,
+            '503': errorResponse,
+          },
+        },
+      },
+      '/managers/{id}/message': {
+        post: {
+          tags: ['Managers', 'Timeline'],
+          summary: "Type a message into a manager's session",
+          description:
+            "Types `text` into the session and submits it (newlines are flattened to spaces). A running hub-run manager gets it in its tmux session (`delivered: session`); a running external manager in the tmux pane it reported at detect (`pane`, only when it runs on this hub's machine); a stopped manager with a session is resumed in the hub's tmux with the text as its prompt (`resumed`). A running external manager outside tmux answers 409 with code `manager_unreachable` — a client offers the text to paste instead. `prNumber` ties the message to a PR, which is how a later merge shows `approvedByYou`. Records `manager.message` on success.",
+          parameters: [managerIdParam],
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    text: { type: 'string', maxLength: 2000 },
+                    prNumber: { type: 'integer', minimum: 1 },
+                  },
+                  required: ['text'],
+                },
+              },
+            },
+          },
+          responses: {
+            '200': {
+              description: 'Delivered',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    properties: {
+                      delivered: { type: 'string', enum: ['session', 'pane', 'resumed'] },
+                      manager: { $ref: '#/components/schemas/Manager' },
+                      event: {
+                        oneOf: [{ $ref: '#/components/schemas/TimelineEvent' }, { type: 'null' }],
+                      },
+                    },
+                    required: ['delivered', 'manager', 'event'],
+                  },
+                },
+              },
+            },
+            '400': errorResponse,
+            '401': errorResponse,
+            '404': errorResponse,
+            '409': errorResponse,
+            '503': errorResponse,
+          },
+        },
+      },
+      '/workspaces/{id}/timeline': {
+        get: {
+          tags: ['Timeline'],
+          summary: "A workspace's timeline",
+          description:
+            "What happened in the workspace, newest first: task, manager, box, push and PR events from its append-only log, with 3+ task creates from one manager turn (within 10 minutes) collapsed into one `plan` item. `live` holds the rows true right now, never stored: a box working an in-progress task (with its uncommitted diff when running) and a ready PR nobody merged yet (`awaiting`, `approved` once a message about it was sent). `?since=` adds a `summary` of what changed since then. A GitHub sync (`gh pr list` on the repos behind the workspace's projects) starts in the background when the last one is over a minute old; `github` reports it, and rows it adds fire the usual change event.",
+          parameters: [
+            workspaceIdParam,
+            {
+              name: 'before',
+              in: 'query',
+              schema: { type: 'string' },
+              description: 'Only items strictly older than this ISO time (paging).',
+            },
+            {
+              name: 'limit',
+              in: 'query',
+              schema: { type: 'integer', minimum: 1, maximum: 500, default: 100 },
+            },
+            {
+              name: 'since',
+              in: 'query',
+              schema: { type: 'string' },
+              description: 'ISO time the summary counts from; items are not filtered by it.',
+            },
+          ],
+          responses: {
+            '200': {
+              description: 'Timeline',
+              content: {
+                'application/json': { schema: { $ref: '#/components/schemas/Timeline' } },
+              },
+            },
+            '400': errorResponse,
+            '401': errorResponse,
+            '404': errorResponse,
           },
         },
       },
@@ -3335,6 +3569,103 @@ export function buildOpenApi(): Record<string, unknown> {
           },
           required: ['kind', 'id'],
         },
+        TimelinePr: {
+          type: 'object',
+          properties: {
+            repo: { type: 'string', description: '`owner/name`.' },
+            number: { type: 'number' },
+            title: { type: 'string' },
+            url: { type: 'string' },
+            base: { type: 'string' },
+            head: { type: 'string' },
+            additions: { type: 'number' },
+            deletions: { type: 'number' },
+            checks: { type: 'string', enum: ['pass', 'fail', 'pending', 'none'] },
+            mergeState: { type: 'string' },
+            autoMerge: { type: 'boolean' },
+            mergedBy: { type: 'string' },
+          },
+          required: ['repo', 'number', 'title', 'url', 'base', 'head'],
+        },
+        TimelineEvent: {
+          type: 'object',
+          description: "One line of a workspace's append-only timeline log.",
+          properties: timelineEventProperties,
+          required: ['id', 'at', 'type', 'actor'],
+        },
+        TimelineItem: {
+          type: 'object',
+          description:
+            'A timeline row: an event, or a `plan` that 3+ `task.created` events from one manager turn collapsed into.',
+          properties: {
+            ...timelineEventProperties,
+            type: { type: 'string', enum: [...timelineEventTypes, 'plan'] },
+            count: { type: 'number', description: '`plan`: how many tasks it created.' },
+            approvedByYou: {
+              type: 'boolean',
+              description: '`pr.merged`: a message about this PR was sent before it merged.',
+            },
+          },
+          required: ['id', 'at', 'type', 'actor'],
+        },
+        TimelineLiveItem: {
+          type: 'object',
+          description: 'A row true right now, built at read time.',
+          properties: {
+            id: { type: 'string' },
+            type: { type: 'string', enum: ['task.in_progress', 'pr.ready'] },
+            at: { type: 'string' },
+            boxId: { type: 'string' },
+            boxName: { type: 'string' },
+            agent: { type: 'string' },
+            branch: { type: 'string' },
+            managerId: { type: 'string' },
+            task: {
+              type: 'object',
+              properties: { id: { type: 'string' }, title: { type: 'string' } },
+              required: ['id', 'title'],
+            },
+            taskIds: { type: 'array', items: { type: 'string' } },
+            filesChanged: { type: 'number' },
+            additions: { type: 'number' },
+            deletions: { type: 'number' },
+            pr: { $ref: '#/components/schemas/TimelinePr' },
+            awaiting: { type: 'boolean' },
+            approved: { type: 'boolean' },
+          },
+          required: ['id', 'type', 'at'],
+        },
+        TimelineSummary: {
+          type: 'object',
+          properties: {
+            since: { type: 'string' },
+            merged: { type: 'number' },
+            additions: { type: 'number' },
+            deletions: { type: 'number' },
+            tasksDone: { type: 'number' },
+            awaiting: {
+              type: 'number',
+              description:
+                "Ready PRs not approved yet, plus pending approvals on the workspace's boxes.",
+            },
+          },
+          required: ['since', 'merged', 'additions', 'deletions', 'tasksDone', 'awaiting'],
+        },
+        Timeline: {
+          type: 'object',
+          properties: {
+            items: { type: 'array', items: { $ref: '#/components/schemas/TimelineItem' } },
+            live: { type: 'array', items: { $ref: '#/components/schemas/TimelineLiveItem' } },
+            summary: { $ref: '#/components/schemas/TimelineSummary' },
+            github: {
+              type: 'string',
+              enum: ['ok', 'syncing', 'unavailable'],
+              description:
+                '`unavailable`: no gh, not logged in, or no GitHub repo behind the workspace.',
+            },
+          },
+          required: ['items', 'live', 'github'],
+        },
         WorkTask: {
           type: 'object',
           properties: {
@@ -3416,6 +3747,11 @@ export function buildOpenApi(): Record<string, unknown> {
                 "The pid's start time (`ps -o lstart=`), recorded when the session reported the hub's own host. A live pid with a different start time is a reused pid, and the manager reads as stopped.",
             },
             tmuxSession: { type: 'string' },
+            tmuxPane: {
+              type: 'string',
+              description:
+                "External only: the tmux pane the session's terminal reported, where a message can be typed.",
+            },
             attachCommand: {
               type: 'string',
               description: 'Ready-to-run tmux attach command; only for a running hub-run manager.',

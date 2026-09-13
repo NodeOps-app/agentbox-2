@@ -41,7 +41,9 @@ import {
   type Provider,
 } from '@agentbox/core';
 import type { BoxStatus as CtlBoxStatus, StatusReply } from '@agentbox/ctl';
+import { createBoxFactSeams } from './backend/box-facts';
 import { createManagerBackend } from './backend/managers';
+import { createTimelineBackend, withBoxTimeline } from './backend/timeline';
 import { createWorkspaceBackend } from './backend/workspaces';
 import type { BackendDeps } from './backend/deps';
 import {
@@ -2093,8 +2095,11 @@ export function createHubBackend(handle: RelayServerHandle): HubBackend {
       return new Set([...local.map((b) => b.id), ...registered.map((r) => r.boxId)]);
     },
     jobs: () => loadQueue().catch(() => []),
+    ...createBoxFactSeams({ listBoxes: () => listBoxes(), providerForBox }),
+    pendingApprovalBoxIds: () => handle.prompts.all().map((p) => p.boxId),
   };
   const workspaces = createWorkspaceBackend(backendDeps);
+  const timeline = createTimelineBackend(backendDeps);
   const managers = createManagerBackend(backendDeps, {
     workspaceView: (id) => workspaces.getWorkspace(id),
   });
@@ -2163,6 +2168,7 @@ export function createHubBackend(handle: RelayServerHandle): HubBackend {
   const hub: HubBackend = {
     ...workspaces,
     ...managers,
+    ...timeline,
     // authMode is layered on by source.ts (an env-derived concern), so the host
     // backend produces everything else.
     async getData(opts): Promise<Omit<HubState, 'authMode'>> {
@@ -3864,8 +3870,8 @@ export function createHubBackend(handle: RelayServerHandle): HubBackend {
   // Wrapped here rather than threaded through create()'s many return paths, and
   // best-effort — a bookkeeping miss must never fail a create that succeeded.
   const createBox = hub.create;
-  hub.create = async (input) => {
-    const res = await createBox(input);
+  hub.create = async (input, meta) => {
+    const res = await createBox(input, meta);
     if (res.ok && input.managerId) {
       const attached = await managers
         .attachJob(input.managerId, res.jobId)
@@ -3874,5 +3880,8 @@ export function createHubBackend(handle: RelayServerHandle): HubBackend {
     }
     return res;
   };
-  return hub;
+  return withBoxTimeline(hub, {
+    deps: backendDeps,
+    managerStamp: (id) => managers.timelineStamp({ managerId: id }),
+  });
 }

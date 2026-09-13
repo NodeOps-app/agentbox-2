@@ -10,6 +10,11 @@ import type {
   BoxTaskSummary,
   HostSession,
   ManagerStatus,
+  TimelineEvent,
+  TimelineEventType,
+  TimelineNoteKind,
+  TimelinePr,
+  TimelineStamp,
   WorkTask,
   WorkTaskExternalRef,
   WorkTaskStatus,
@@ -502,7 +507,7 @@ export type BoxLogAttachSpec =
 // actions.ts) reaches it ONLY through that global, so the heavy Node/docker
 // packages never enter Next's bundle. This is a pure-type module (no runtime
 // imports) so both the implementation and the ambient global can share it.
-export interface HubBackend extends WorkspaceBackend, ManagerBackend {
+export interface HubBackend extends WorkspaceBackend, ManagerBackend, TimelineBackend {
   // authMode is an env-derived concern layered on by source.ts, not the host
   // backend — so the backend produces everything else. `live` (opt-in, expensive
   // — mirrors providers' `?freshness=1`) refreshes each cloud box's `state` with
@@ -513,13 +518,17 @@ export interface HubBackend extends WorkspaceBackend, ManagerBackend {
   // IO (it reads the box's per-box session pointers and relaunches a detached
   // tmux over exec), which stays on the direct IO plane — the CLI layers it on
   // after this returns, the way it layers its own-machine ssh-config write.
-  start(id: string): Promise<ActionResult>;
-  pause(id: string): Promise<ActionResult>;
-  resume(id: string): Promise<ActionResult>;
-  stop(id: string): Promise<ActionResult>;
+  start(id: string, meta?: TimelineMeta): Promise<ActionResult>;
+  pause(id: string, meta?: TimelineMeta): Promise<ActionResult>;
+  resume(id: string, meta?: TimelineMeta): Promise<ActionResult>;
+  stop(id: string, meta?: TimelineMeta): Promise<ActionResult>;
   // `keepSnapshot` preserves a docker box's local snapshot dir (the CLI's
   // `--keep-snapshot`); default (false) deletes it, matching `agentbox destroy`.
-  destroy(id: string, opts?: { keepSnapshot?: boolean }): Promise<ActionResult>;
+  destroy(
+    id: string,
+    opts?: { keepSnapshot?: boolean },
+    meta?: TimelineMeta,
+  ): Promise<ActionResult>;
   // Set (or clear, when displayName is empty) a box's cosmetic display label.
   // Pure state — does not touch the container, git branch, or URL.
   rename(id: string, displayName: string): Promise<ActionResult>;
@@ -560,7 +569,7 @@ export interface HubBackend extends WorkspaceBackend, ManagerBackend {
   // remote-docker entry with one `docker:<alias>` option per registered host.
   providersWithFreshness(opts?: { expandRemoteDockerHosts?: boolean }): Promise<ProviderOption[]>;
   // Enqueue a background create job for a registered project; returns the jobId.
-  create(input: CreateBoxInput): Promise<CreateBoxResult>;
+  create(input: CreateBoxInput, meta?: TimelineMeta): Promise<CreateBoxResult>;
   // What would a create for this project + agent ask the user? Runs the real
   // gates with a collecting asker, so the questions returned here are by
   // construction the questions `create` asks.
@@ -629,6 +638,7 @@ export interface HubBackend extends WorkspaceBackend, ManagerBackend {
   gitPush(
     id: string,
     input?: { remote?: string; force?: boolean; args?: string[] },
+    meta?: TimelineMeta,
   ): Promise<BoxOpResult>;
   // Fetch via the relay then merge locally in the box. `args` forward to the op.
   gitPull(
@@ -639,6 +649,7 @@ export interface HubBackend extends WorkspaceBackend, ManagerBackend {
   gitPushHost(
     id: string,
     input?: { as?: string; force?: boolean; args?: string[] },
+    meta?: TimelineMeta,
   ): Promise<BoxOpResult>;
   // Live git summary (current branch + dirty/ahead/behind) for the detail panel.
   getGit(id: string): Promise<GitInfo>;
@@ -957,6 +968,87 @@ export interface RemoteDockerHostView {
 
 // ── workspaces / tasks / manager ──
 
+/** Who made a mutation (for the timeline), and the note explaining it, if any. */
+export interface TimelineMeta {
+  stamp?: TimelineStamp;
+  note?: string;
+}
+
+/** A timeline row: an event, or a `plan` that several `task.created` events collapsed into. */
+export interface TimelineItem extends Omit<TimelineEvent, 'type'> {
+  type: TimelineEventType | 'plan';
+  /** `plan`: how many tasks it created. */
+  count?: number;
+  /** `pr.merged`: a message about this PR was sent to the manager before it merged. */
+  approvedByYou?: boolean;
+}
+
+/** A row that is true now, built at read time and never stored. */
+export interface TimelineLiveItem {
+  id: string;
+  type: 'task.in_progress' | 'pr.ready';
+  at: string;
+  boxId?: string;
+  boxName?: string;
+  agent?: string;
+  branch?: string;
+  managerId?: string;
+  task?: { id: string; title: string };
+  taskIds?: string[];
+  /** `task.in_progress` on a running box: its uncommitted diff. */
+  filesChanged?: number;
+  additions?: number;
+  deletions?: number;
+  pr?: TimelinePr;
+  /** `pr.ready`: waiting for someone to approve the merge. */
+  awaiting?: boolean;
+  /** `pr.ready`: a message about it was already sent to the manager. */
+  approved?: boolean;
+}
+
+export interface TimelineSummary {
+  since: string;
+  merged: number;
+  additions: number;
+  deletions: number;
+  tasksDone: number;
+  /** Ready PRs nobody approved yet, plus pending approvals on the workspace's boxes. */
+  awaiting: number;
+}
+
+export interface TimelineResponse {
+  items: TimelineItem[];
+  live: TimelineLiveItem[];
+  summary?: TimelineSummary;
+  github: 'ok' | 'syncing' | 'unavailable';
+}
+
+export interface TimelineQuery {
+  before?: string;
+  since?: string;
+  limit?: number;
+}
+
+export type ManagerNoteResult = { ok: true; event: TimelineEvent } | { ok: false; error: string };
+
+/** How a message reached the manager: its hub tmux session, its terminal's pane, or a resume. */
+export type ManagerMessageDelivery = 'session' | 'pane' | 'resumed';
+
+export type ManagerMessageResult =
+  | {
+      ok: true;
+      delivered: ManagerMessageDelivery;
+      manager: ManagerView;
+      event: TimelineEvent | null;
+    }
+  | { ok: false; error: string; code?: 'manager_unreachable' };
+
+/** The timeline domain slice (`lib/backend/timeline.ts`). */
+export interface TimelineBackend {
+  /** `null` = unknown workspace. */
+  getTimeline(wsId: string, q?: TimelineQuery): Promise<TimelineResponse | null>;
+}
+
 export type WorkspaceResult = { ok: true; workspace: WorkspaceView } | { ok: false; error: string };
 /** `invalid`: the request itself is wrong (400), not the resource's state (409). */
 export type TaskResult =
@@ -1030,6 +1122,8 @@ export interface DetectManagerInput {
   host?: string;
   /** `$AGENTBOX_MANAGER`: set inside a hub-run manager's own session. */
   managerId?: string;
+  /** `$TMUX_PANE` of the session's terminal, so a message can be typed into it. */
+  tmuxPane?: string;
   /** A box (or create job) this session just made, attached in the same call. */
   boxId?: string;
   boxJobId?: string;
@@ -1051,9 +1145,29 @@ export interface ManagerBackend {
   getManager(id: string): Promise<ManagerView | null>;
   /** `null` = unknown workspace. */
   listWorkspaceManagers(wsId: string): Promise<ManagerView[] | null>;
-  startManager(wsId: string, input: StartManagerInput): Promise<ManagerResult>;
-  resumeManager(id: string): Promise<ManagerResult>;
-  stopManager(id: string): Promise<ManagerResult>;
+  startManager(wsId: string, input: StartManagerInput, meta?: TimelineMeta): Promise<ManagerResult>;
+  resumeManager(id: string, meta?: TimelineMeta): Promise<ManagerResult>;
+  stopManager(id: string, meta?: TimelineMeta): Promise<ManagerResult>;
+  /**
+   * The timeline stamp for a session (the CLI's `X-AgentBox-Session`) or a
+   * manager id: its manager, turn and that turn's prompt. With `wsId`, only a
+   * manager of that workspace. Never writes.
+   */
+  timelineStamp(
+    ref: { agent: string; sessionId: string } | { managerId: string },
+    wsId?: string,
+  ): Promise<TimelineStamp | undefined>;
+  /** Record a manager note, stamped with the manager's current turn. */
+  addManagerNote(
+    id: string,
+    input: { text: string; kind?: TimelineNoteKind },
+  ): Promise<ManagerNoteResult>;
+  /** Type a message into the manager's session (resuming a stopped one with it). */
+  sendManagerMessage(
+    id: string,
+    input: { text: string; prNumber?: number },
+    meta?: TimelineMeta,
+  ): Promise<ManagerMessageResult>;
   /** Forget a manager record. Refused while it runs, unless `force`. */
   removeManager(id: string, opts?: { force?: boolean }): Promise<ActionResult>;
   listManagerSessions(wsId: string, agent?: string): Promise<ManagerSessionsResult | null>;
@@ -1082,14 +1196,24 @@ export interface WorkspaceBackend {
   listTasks(wsId: string, filter?: TaskFilter): Promise<WorkTask[] | null>;
   listAllTasks(filter?: TaskFilter & { workspaceId?: string }): Promise<WorkTask[]>;
   getTask(wsId: string, taskId: string): Promise<WorkTask | null>;
-  addTask(wsId: string, input: AddTaskInput): Promise<TaskResult>;
-  updateTask(wsId: string, taskId: string, patch: UpdateTaskInput): Promise<TaskResult>;
-  completeTask(wsId: string, taskId: string): Promise<TaskResult>;
-  removeTask(wsId: string, taskId: string): Promise<ActionResult>;
-  assignTasks(wsId: string, ids: string[], target: AssignTarget): Promise<TasksResult>;
-  unassignTasks(wsId: string, ids: string[]): Promise<TasksResult>;
+  addTask(wsId: string, input: AddTaskInput, meta?: TimelineMeta): Promise<TaskResult>;
+  updateTask(
+    wsId: string,
+    taskId: string,
+    patch: UpdateTaskInput,
+    meta?: TimelineMeta,
+  ): Promise<TaskResult>;
+  completeTask(wsId: string, taskId: string, meta?: TimelineMeta): Promise<TaskResult>;
+  removeTask(wsId: string, taskId: string, meta?: TimelineMeta): Promise<ActionResult>;
+  assignTasks(
+    wsId: string,
+    ids: string[],
+    target: AssignTarget,
+    meta?: TimelineMeta,
+  ): Promise<TasksResult>;
+  unassignTasks(wsId: string, ids: string[], meta?: TimelineMeta): Promise<TasksResult>;
   /** `ids` must be an exact permutation of the workspace's tasks. */
-  reorderTasks(wsId: string, ids: string[]): Promise<TasksResult>;
+  reorderTasks(wsId: string, ids: string[], meta?: TimelineMeta): Promise<TasksResult>;
 
   /** projectId -> workspaceId, for `Project.workspaceId` in getData(). */
   workspaceIdByProject(): Promise<Map<string, string>>;

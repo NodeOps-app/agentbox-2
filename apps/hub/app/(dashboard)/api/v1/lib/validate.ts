@@ -930,6 +930,90 @@ export const TASK_ID_RE = /^T-\d+$/;
 // bundle.
 export const MANAGER_AGENT_NAMES = ['claude', 'codex', 'opencode', 'pi'] as const;
 
+/** A timeline note or a message to a manager. */
+export const NOTE_MAX = 2000;
+export const NOTE_KINDS = ['note', 'replan', 'plan'] as const;
+export type NoteKindValue = (typeof NOTE_KINDS)[number];
+
+function optionalNote(v: unknown, field = 'note'): Parsed<string | undefined> {
+  if (v === undefined) return { ok: true, value: undefined };
+  if (typeof v !== 'string') return { ok: false, message: `${field} must be a string` };
+  if (v.length > NOTE_MAX) {
+    return { ok: false, message: `${field} too long (max ${String(NOTE_MAX)} chars)` };
+  }
+  const trimmed = v.trim();
+  return { ok: true, value: trimmed.length > 0 ? trimmed : undefined };
+}
+
+function requiredText(v: unknown): Parsed<string> {
+  const parsed = optionalNote(v, 'text');
+  if (!parsed.ok) return parsed;
+  if (!parsed.value) return { ok: false, message: 'text is required (non-empty string)' };
+  return { ok: true, value: parsed.value };
+}
+
+export function parseManagerNote(body: unknown): Parsed<{ text: string; kind?: NoteKindValue }> {
+  if (!isObject(body)) return { ok: false, message: 'body must be a JSON object' };
+  const text = requiredText(body['text']);
+  if (!text.ok) return text;
+  const { kind } = body;
+  if (kind !== undefined && !(NOTE_KINDS as readonly unknown[]).includes(kind)) {
+    return { ok: false, message: `kind must be one of ${NOTE_KINDS.join(', ')}` };
+  }
+  return {
+    ok: true,
+    value: { text: text.value, ...(kind ? { kind: kind as NoteKindValue } : {}) },
+  };
+}
+
+export function parseManagerMessage(body: unknown): Parsed<{ text: string; prNumber?: number }> {
+  if (!isObject(body)) return { ok: false, message: 'body must be a JSON object' };
+  const text = requiredText(body['text']);
+  if (!text.ok) return text;
+  const { prNumber } = body;
+  if (
+    prNumber !== undefined &&
+    (typeof prNumber !== 'number' || !Number.isInteger(prNumber) || prNumber <= 0)
+  ) {
+    return { ok: false, message: 'prNumber must be a positive integer' };
+  }
+  return {
+    ok: true,
+    value: {
+      text: text.value,
+      ...(prNumber !== undefined ? { prNumber: prNumber as number } : {}),
+    },
+  };
+}
+
+export const TIMELINE_LIMIT_MAX = 500;
+
+/** `?before=&since=` are ISO times (normalized, so they compare with stored ones); `?limit=` 1–500. */
+export function parseTimelineQuery(
+  url: URL,
+): Parsed<{ before?: string; since?: string; limit?: number }> {
+  const out: { before?: string; since?: string; limit?: number } = {};
+  for (const field of ['before', 'since'] as const) {
+    const raw = url.searchParams.get(field);
+    if (raw === null || raw === '') continue;
+    const ms = Date.parse(raw);
+    if (Number.isNaN(ms)) return { ok: false, message: `${field} must be an ISO date-time` };
+    out[field] = new Date(ms).toISOString();
+  }
+  const limit = url.searchParams.get('limit');
+  if (limit !== null && limit !== '') {
+    const n = Number(limit);
+    if (!Number.isInteger(n) || n < 1 || n > TIMELINE_LIMIT_MAX) {
+      return {
+        ok: false,
+        message: `limit must be an integer from 1 to ${String(TIMELINE_LIMIT_MAX)}`,
+      };
+    }
+    out.limit = n;
+  }
+  return { ok: true, value: out };
+}
+
 export function isTaskStatus(v: unknown): v is TaskStatusValue {
   return typeof v === 'string' && (TASK_STATUSES as readonly string[]).includes(v);
 }
@@ -1006,6 +1090,8 @@ export interface TaskCreateInput {
   boxId?: string;
   boxJobId?: string;
   managerId?: string;
+  /** Recorded on the timeline as a note next to the create. */
+  note?: string;
 }
 
 export function parseTaskCreate(body: unknown): Parsed<TaskCreateInput> {
@@ -1014,6 +1100,8 @@ export function parseTaskCreate(body: unknown): Parsed<TaskCreateInput> {
     body;
   const parsedManager = optionalManagerId(body['managerId'], 'managerId');
   if (!parsedManager.ok) return parsedManager;
+  const parsedNote = optionalNote(body['note']);
+  if (!parsedNote.ok) return parsedNote;
   if (typeof title !== 'string' || title.trim().length === 0) {
     return { ok: false, message: 'title is required (non-empty string)' };
   }
@@ -1059,6 +1147,7 @@ export function parseTaskCreate(body: unknown): Parsed<TaskCreateInput> {
       ...(parsedBox.value ? { boxId: parsedBox.value } : {}),
       ...(parsedJob.value ? { boxJobId: parsedJob.value } : {}),
       ...(parsedManager.value ? { managerId: parsedManager.value } : {}),
+      ...(parsedNote.value ? { note: parsedNote.value } : {}),
     },
   };
 }
@@ -1071,6 +1160,7 @@ export interface TaskUpdateInput {
   dependsOn?: string[];
   externalRef?: { kind: string; id: string; url?: string };
   managerId?: string | null;
+  note?: string;
 }
 
 export function parseTaskUpdate(body: unknown): Parsed<TaskUpdateInput> {
@@ -1123,6 +1213,9 @@ export function parseTaskUpdate(body: unknown): Parsed<TaskUpdateInput> {
   if (Object.keys(out).length === 0) {
     return { ok: false, message: 'no updatable field in body' };
   }
+  const parsedNote = optionalNote(body['note']);
+  if (!parsedNote.ok) return parsedNote;
+  if (parsedNote.value) out.note = parsedNote.value;
   return { ok: true, value: out };
 }
 
@@ -1131,6 +1224,7 @@ export interface TaskAssignInput {
   ids?: string[];
   boxId?: string;
   boxJobId?: string;
+  note?: string;
 }
 
 export function parseTaskAssign(
@@ -1155,21 +1249,29 @@ export function parseTaskAssign(
   if (parsedBox.value && parsedJob.value) {
     return { ok: false, message: 'send either boxId or boxJobId, not both' };
   }
+  const parsedNote = optionalNote(body['note']);
+  if (!parsedNote.ok) return parsedNote;
   return {
     ok: true,
     value: {
       ...(parsedIds ? { ids: parsedIds } : {}),
       ...(parsedBox.value ? { boxId: parsedBox.value } : {}),
       ...(parsedJob.value ? { boxJobId: parsedJob.value } : {}),
+      ...(parsedNote.value ? { note: parsedNote.value } : {}),
     },
   };
 }
 
-export function parseTaskReorder(body: unknown): Parsed<{ ids: string[] }> {
+export function parseTaskReorder(body: unknown): Parsed<{ ids: string[]; note?: string }> {
   if (!isObject(body)) return { ok: false, message: 'body must be a JSON object' };
   const parsed = parseTaskIdArray(body['ids'], 'ids');
   if (!parsed.ok) return parsed;
-  return { ok: true, value: { ids: parsed.value } };
+  const parsedNote = optionalNote(body['note']);
+  if (!parsedNote.ok) return parsedNote;
+  return {
+    ok: true,
+    value: { ids: parsed.value, ...(parsedNote.value ? { note: parsedNote.value } : {}) },
+  };
 }
 
 export interface ManagerStartInput {
@@ -1247,6 +1349,7 @@ export interface ManagerDetectInput {
   pid?: number;
   host?: string;
   managerId?: string;
+  tmuxPane?: string;
   boxId?: string;
   boxJobId?: string;
 }
@@ -1264,7 +1367,10 @@ export function parseManagerDetect(
   allowedAgents: readonly string[] = MANAGER_AGENT_NAMES,
 ): Parsed<ManagerDetectInput> {
   if (!isObject(body)) return { ok: false, message: 'body must be a JSON object' };
-  const { agent, sessionId, cwd, pid, host, managerId, boxId, boxJobId } = body;
+  const { agent, sessionId, cwd, pid, host, managerId, boxId, boxJobId, tmuxPane } = body;
+  if (tmuxPane !== undefined && (typeof tmuxPane !== 'string' || !/^%\d+$/.test(tmuxPane))) {
+    return { ok: false, message: 'tmuxPane must be a tmux pane id like %3' };
+  }
   if (typeof agent !== 'string' || !allowedAgents.includes(agent)) {
     return { ok: false, message: `agent must be one of ${allowedAgents.join(', ')}` };
   }
@@ -1300,6 +1406,7 @@ export function parseManagerDetect(
       ...(pid !== undefined ? { pid: pid as number } : {}),
       ...(parsedHost.value ? { host: parsedHost.value } : {}),
       ...(parsedManager.value ? { managerId: parsedManager.value } : {}),
+      ...(typeof tmuxPane === 'string' ? { tmuxPane } : {}),
       ...(parsedBox.value ? { boxId: parsedBox.value } : {}),
       ...(parsedJob.value ? { boxJobId: parsedJob.value } : {}),
     },

@@ -3,6 +3,7 @@
 // would silently renumber the rest, and this order IS the priority the manager
 // reads.
 import { backendOrNull } from '../../../../lib/backend';
+import { timelineMeta } from '../../../../lib/actor';
 import { fail, failFromAction, ok } from '../../../../lib/envelope';
 import { parseTaskReorder, readJson } from '../../../../lib/validate';
 
@@ -22,7 +23,11 @@ export async function POST(
   const parsed = parseTaskReorder(parsedBody.value);
   if (!parsed.ok) return fail('invalid_request', parsed.message);
 
-  const res = await backend.reorderTasks(id, parsed.value.ids);
+  const res = await backend.reorderTasks(
+    id,
+    parsed.value.ids,
+    await timelineMeta(req, backend, { wsId: id, note: parsed.value.note }),
+  );
   if (!res.ok) return failFromAction(res.error);
   return ok({ tasks: res.tasks });
 }

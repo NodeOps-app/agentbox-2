@@ -3,6 +3,7 @@
 // POST /api/v1/boxes  — create a box (async; enqueues a build job, returns jobId).
 import { resolveBoxRefView } from '@/lib/boxes/resolve';
 import { backendOrNull, readState } from '../lib/backend';
+import { timelineMeta } from '../lib/actor';
 import { fail, failFromAction, ok } from '../lib/envelope';
 import { AGENTS, parseCreateBox, readJson } from '../lib/validate';
 
@@ -48,7 +49,7 @@ export async function POST(req: Request): Promise<Response> {
   const parsed = parseCreateBox(parsedBody.value, allowedAgents);
   if (!parsed.ok) return fail('invalid_request', parsed.message, parsed.details);
 
-  const res = await backend.create(parsed.value);
+  const res = await backend.create(parsed.value, await timelineMeta(req, backend));
   if (!res.ok) return failFromAction(res.error);
   return ok({ jobId: res.jobId }, 202);
 }
