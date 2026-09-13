@@ -1637,7 +1637,7 @@ export function buildOpenApi(): Record<string, unknown> {
           tags: ['Managers'],
           summary: "Resume a manager's session in the hub",
           description:
-            "Reopens the session in a tmux session the hub owns (`claude --resume <id>` / `codex resume <id>`, run in the manager's `cwd`), and the manager becomes `hub`-run. 409 while the session still runs anywhere (two processes writing one transcript corrupt it), for a manager with no session id, and for an agent whose sessions cannot be resumed; 503 when the hub host has no tmux.",
+            "Reopens the session in a tmux session the hub owns (`claude --resume <id>` / `codex resume <id>`, run in the manager's `cwd`), and the manager becomes `hub`-run. 409 while the session still runs anywhere (two processes writing one transcript corrupt it), for a manager with no session id, for an agent whose sessions cannot be resumed, and for an external session reported from another host (its transcript is not on this machine); 503 when the hub host has no tmux.",
           parameters: [managerIdParam],
           responses: {
             '200': {
@@ -3376,6 +3376,11 @@ export function buildOpenApi(): Record<string, unknown> {
                 '`external`: a session in your own terminal the hub only observes. `hub`: one the hub runs in tmux, which can be attached to and stopped.',
             },
             status: { type: 'string', enum: ['running', 'stopped'] },
+            resumable: {
+              type: 'boolean',
+              description:
+                'Whether POST /managers/{id}/resume would be accepted now: false while it runs, without a session id, for an agent whose sessions cannot be resumed, and for an external session that ran on another machine (its transcript is not on this hub). A GUI disables Resume on false.',
+            },
             cwd: {
               type: 'string',
               description: 'Folder the session runs in; a resume runs there.',
@@ -3417,6 +3422,7 @@ export function buildOpenApi(): Record<string, unknown> {
             'agent',
             'kind',
             'status',
+            'resumable',
             'cwd',
             'boxIds',
             'boxJobIds',

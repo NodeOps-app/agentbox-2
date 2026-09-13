@@ -9,6 +9,7 @@ import {
   attachBoxToManager,
   buildManagerArgv,
   buildManagerShellScript,
+  isManagerResumable,
   isPidAlive,
   isResumableManagerAgent,
   listResumableHostSessions,
@@ -440,6 +441,27 @@ describe('resumeManagerSession', () => {
     expect(resumed.pid).toBeUndefined();
   });
 
+  it('refuses a session that ran on another machine, whose transcript is not here', async () => {
+    const { id, root } = await makeWorkspace();
+    const { manager } = await upsertDetectedManager(id, {
+      agent: 'claude',
+      sessionId: 'sess-remote',
+      cwd: root,
+      pid: 9,
+      host: 'laptop',
+    });
+    const { calls, exec } = fakeExec();
+    const err = await resumeManagerSession(id, manager.id, {
+      exec,
+      hostname: () => 'vps',
+      isPidAlive: () => false,
+      now: () => Date.now() + MANAGER_SEEN_WINDOW_MS * 2,
+    }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ManagerConflictError);
+    expect((err as Error).message).toMatch(/ran on laptop; its transcript is not on this machine/);
+    expect(calls).toEqual([]);
+  });
+
   it('refuses a manager with no session id rather than starting a fresh agent', async () => {
     const { id, root } = await makeWorkspace();
     const hub = await startManagerSession({
@@ -514,6 +536,25 @@ describe('toManagerView', () => {
     const stopped = toManagerView(rec, { status: 'stopped', workspaceName: 'w', tasks: [] });
     expect(stopped.attachCommand).toBeUndefined();
     expect(stopped.lastExit).toBe(1);
+  });
+
+  it('is resumable only when a resume would be accepted', () => {
+    const ext = record({ sessionId: 's', host: 'laptop', pid: 1 });
+    expect(isManagerResumable(ext, 'stopped', 'laptop')).toBe(true);
+    expect(isManagerResumable(ext, 'running', 'laptop')).toBe(false);
+    expect(isManagerResumable(ext, 'stopped', 'vps')).toBe(false);
+    expect(isManagerResumable({ ...ext, agent: 'opencode' }, 'stopped', 'laptop')).toBe(false);
+    expect(isManagerResumable(record({ kind: 'hub' }), 'stopped', 'laptop')).toBe(false);
+    // A hub-run manager's transcript is on the hub by construction.
+    const hub = record({ kind: 'hub', sessionId: 's', host: 'elsewhere' });
+    expect(isManagerResumable(hub, 'stopped', 'laptop')).toBe(true);
+    const view = toManagerView(ext, {
+      status: 'stopped',
+      workspaceName: 'w',
+      tasks: [],
+      hostname: 'vps',
+    });
+    expect(view.resumable).toBe(false);
   });
 });
 

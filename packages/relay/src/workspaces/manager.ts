@@ -434,14 +434,44 @@ export async function readManagerExit(wsId: string, id: string): Promise<number 
   }
 }
 
+/**
+ * The session's transcript is only on the machine it ran on, so an external
+ * manager reported from another host cannot be resumed by this one.
+ */
+function ranElsewhere(rec: ManagerRecord, host: string): boolean {
+  return rec.kind === 'external' && Boolean(rec.host) && rec.host !== host;
+}
+
+/** Whether `resumeManagerSession` would accept this manager right now. */
+export function isManagerResumable(
+  rec: ManagerRecord,
+  status: ManagerStatus,
+  host: string = osHostname(),
+): boolean {
+  return (
+    status !== 'running' &&
+    Boolean(rec.sessionId) &&
+    isResumableManagerAgent(rec.agent) &&
+    !ranElsewhere(rec, host)
+  );
+}
+
 /** The API view: the record without its argv, plus what a list row shows. */
 export function toManagerView(
   rec: ManagerRecord,
-  ctx: { status: ManagerStatus; workspaceName: string; tasks: WorkTask[]; lastExit?: number },
+  ctx: {
+    status: ManagerStatus;
+    workspaceName: string;
+    tasks: WorkTask[];
+    lastExit?: number;
+    /** The hub's hostname, for `resumable`; defaults to this machine's. */
+    hostname?: string;
+  },
 ): ManagerView {
   const view: ManagerView & { argv?: string[] } = {
     ...rec,
     status: ctx.status,
+    resumable: isManagerResumable(rec, ctx.status, ctx.hostname),
     workspaceName: ctx.workspaceName,
     taskCounts: {
       open: ctx.tasks.filter((t) => t.managerId === rec.id && t.status !== 'done').length,
@@ -711,6 +741,12 @@ export async function resumeManagerSession(
 ): Promise<ManagerRecord> {
   const rec = (await readManagers(wsId)).find((m) => m.id === id);
   if (!rec) throw new Error(`unknown manager ${id}`);
+  const host = (probe.hostname ?? osHostname)();
+  if (ranElsewhere(rec, host)) {
+    throw new ManagerConflictError(
+      `manager ${id} ran on ${rec.host ?? ''}; its transcript is not on this machine (${host}), so it cannot be resumed here`,
+    );
+  }
   if ((await managerStatus(rec, probe)) === 'running') {
     throw new ManagerConflictError(
       rec.kind === 'external'

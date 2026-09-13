@@ -150,7 +150,9 @@ describe('liveness and lifecycle', () => {
   it('resumes a stopped external session in tmux as a hub manager, then stops it', async () => {
     const h = harness();
     const { managers, manager, root } = await external(h);
+    expect(manager.resumable).toBe(false);
     h.alive.delete(99);
+    expect((await managers.getManager(manager.id))?.resumable).toBe(true);
     const resumed = await managers.resumeManager(manager.id);
     if (!resumed.ok) throw new Error(resumed.error);
     const start = h.spawned.find((a) => a[0] === 'new-session')!;
@@ -171,6 +173,27 @@ describe('liveness and lifecycle', () => {
     expect(stopped.manager.status).toBe('stopped');
     expect(await managers.removeManager(manager.id)).toEqual({ ok: true });
     expect(await managers.getManager(manager.id)).toBeNull();
+  });
+
+  it('refuses to resume a session reported from another host, and says why', async () => {
+    const h = harness();
+    const { managers } = backends(h);
+    const root = await makeFolder();
+    const res = await managers.detectManager({
+      agent: 'claude',
+      sessionId: S2,
+      cwd: root,
+      pid: 7,
+      host: 'desktop',
+    });
+    if (!res.ok) throw new Error(res.error);
+    expect(res.manager.resumable).toBe(false);
+    const resumed = await managers.resumeManager(res.manager.id);
+    expect(resumed).toMatchObject({
+      ok: false,
+      error: expect.stringMatching(/ran on desktop; its transcript is not on this machine/),
+    });
+    expect(h.spawned.filter((a) => a[0] === 'new-session')).toEqual([]);
   });
 
   it('answers unknown-manager errors the envelope maps to 404', async () => {

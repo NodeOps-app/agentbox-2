@@ -490,6 +490,8 @@ export interface HubApiManager {
   /** `external`: a session in someone's terminal. `hub`: one the hub runs in tmux. */
   kind: 'external' | 'hub';
   status: 'running' | 'stopped';
+  /** Whether `POST /managers/{id}/resume` would be accepted now. */
+  resumable?: boolean;
   cwd: string;
   sessionId?: string;
   title?: string;

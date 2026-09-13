@@ -109,6 +109,7 @@ export function createManagerBackend(
             : undefined;
         return toManagerView(rec, {
           status,
+          hostname: hostname(),
           workspaceName: ws.name,
           tasks,
           ...(lastExit === undefined ? {} : { lastExit }),

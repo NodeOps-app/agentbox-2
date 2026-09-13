@@ -156,6 +156,12 @@ export type ManagerStatus = 'running' | 'stopped';
 
 export interface ManagerView extends Omit<ManagerRecord, 'argv'> {
   status: ManagerStatus;
+  /**
+   * Whether a resume would be accepted now: false while it runs, without a
+   * session id, for an agent we cannot resume, and for a session that ran on
+   * another machine (its transcript is not on the hub's disk).
+   */
+  resumable: boolean;
   /** Ready-to-run attach command; only for a RUNNING hub-run manager. */
   attachCommand?: string;
   workspaceName: string;
