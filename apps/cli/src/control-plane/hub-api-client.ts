@@ -465,6 +465,8 @@ export interface HubApiTaskCreate {
   boxId?: string;
   boxJobId?: string;
   managerId?: string;
+  /** Why: recorded on the workspace timeline next to the create. */
+  note?: string;
 }
 
 export interface HubApiTaskUpdate {
@@ -476,6 +478,7 @@ export interface HubApiTaskUpdate {
   dependsOn?: string[];
   /** `null` clears the manager. */
   managerId?: string | null;
+  note?: string;
 }
 
 /** A box that exists, or the create job that will become one. */
@@ -521,8 +524,23 @@ export interface HubApiManagerDetect {
   pid?: number;
   host?: string;
   managerId?: string;
+  tmuxPane?: string;
   boxId?: string;
   boxJobId?: string;
+}
+
+/** One event on a workspace timeline (`POST /managers/{id}/notes` answers with it). */
+export interface HubApiTimelineEvent {
+  id: string;
+  at: string;
+  type: string;
+  actor: 'human' | 'manager' | 'box' | 'hub' | 'github';
+  managerId?: string;
+  turn?: number;
+  prompt?: string;
+  taskIds?: string[];
+  text?: string;
+  noteKind?: 'note' | 'replan' | 'plan';
 }
 
 export interface HubApiManagerFilter {
@@ -564,6 +582,11 @@ export interface HubApiTarget {
   url: string;
   apiKey: string;
   fetchImpl?: typeof fetch;
+  /**
+   * The `X-AgentBox-Session` value to send. Undefined detects the host agent
+   * session this process runs inside; `null` sends none.
+   */
+  session?: string | null;
 }
 
 /** An error carrying the `/api/v1` envelope's code + HTTP status (+ optional details). */
@@ -593,18 +616,35 @@ export class HubApiClient {
   private readonly base: string;
   private readonly token: string;
   private readonly fetchImpl: typeof fetch;
+  private readonly sessionOverride: string | null | undefined;
+  private sessionValue: Promise<string | undefined> | undefined;
 
   constructor(target: HubApiTarget) {
     this.base = target.url.replace(/\/+$/, '');
     this.token = target.apiKey;
     this.fetchImpl = target.fetchImpl ?? fetch;
+    this.sessionOverride = target.session;
+  }
+
+  /** Which host agent session is calling, so the hub can stamp its timeline. */
+  private sessionHeader(): Promise<string | undefined> {
+    if (this.sessionOverride !== undefined) {
+      return Promise.resolve(this.sessionOverride ?? undefined);
+    }
+    // Loaded lazily: host-session imports this module for its error type.
+    this.sessionValue ??= import('../lib/host-session.js')
+      .then((m) => m.currentSessionHeader())
+      .catch(() => undefined);
+    return this.sessionValue;
   }
 
   private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
+    const session = await this.sessionHeader();
     const res = await this.fetchImpl(`${this.base}/api/v1${path}`, {
       method,
       headers: {
         Authorization: `Bearer ${this.token}`,
+        ...(session ? { 'X-AgentBox-Session': session } : {}),
         ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
       },
       ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
@@ -1210,9 +1250,11 @@ export class HubApiClient {
     wsId: string,
     ids: string[],
     target: HubApiAssignTarget,
+    opts: { note?: string } = {},
   ): Promise<HubApiTask[]> {
     const path = `/workspaces/${encodeURIComponent(wsId)}/tasks/assign`;
-    return (await this.request<{ tasks: HubApiTask[] }>('POST', path, { ids, ...target })).tasks;
+    const body = { ids, ...target, ...(opts.note ? { note: opts.note } : {}) };
+    return (await this.request<{ tasks: HubApiTask[] }>('POST', path, body)).tasks;
   }
 
   unassignTask(wsId: string, taskId: string): Promise<HubApiTask> {
@@ -1223,9 +1265,26 @@ export class HubApiClient {
   }
 
   /** `ids` must be an exact permutation of the workspace's tasks. */
-  async reorderTasks(wsId: string, ids: string[]): Promise<HubApiTask[]> {
+  async reorderTasks(
+    wsId: string,
+    ids: string[],
+    opts: { note?: string } = {},
+  ): Promise<HubApiTask[]> {
     const path = `/workspaces/${encodeURIComponent(wsId)}/tasks/reorder`;
-    return (await this.request<{ tasks: HubApiTask[] }>('POST', path, { ids })).tasks;
+    const body = { ids, ...(opts.note ? { note: opts.note } : {}) };
+    return (await this.request<{ tasks: HubApiTask[] }>('POST', path, body)).tasks;
+  }
+
+  /** Record a note on the workspace timeline, stamped with the manager's current turn. */
+  addManagerNote(
+    id: string,
+    body: { text: string; kind?: 'note' | 'replan' | 'plan' },
+  ): Promise<HubApiTimelineEvent> {
+    return this.request<HubApiTimelineEvent>(
+      'POST',
+      `/managers/${encodeURIComponent(id)}/notes`,
+      body,
+    );
   }
 
   /** Register (or refresh) the host agent session this CLI runs inside. */

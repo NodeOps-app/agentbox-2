@@ -35,10 +35,13 @@ function stub(replies: Record<string, { status: number; body?: unknown }>): {
   return { fetchImpl, calls };
 }
 
+// `session: null`: the default detects the host agent session, which on a
+// developer machine is whatever claude/codex session runs the suite.
 const target = (fetchImpl: typeof fetch) => ({
   url: 'https://hub.example/',
   apiKey: 'KEY',
   fetchImpl,
+  session: null,
 });
 
 describe('HubApiClient', () => {

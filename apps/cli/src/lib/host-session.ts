@@ -40,6 +40,7 @@ export const RECENT_SESSION_MS = 5 * 60 * 1000;
 /** The shape both agent stores use for a session id, and the only one the hub accepts. */
 const SESSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const MANAGER_ID_RE = /^[0-9a-f]{16}$/;
+const TMUX_PANE_RE = /^%\d+$/;
 
 /** A transcript's opening rows carry the session's cwd well inside this. */
 const TRANSCRIPT_HEAD_BYTES = 64 * 1024;
@@ -87,6 +88,8 @@ export interface HostSessionHint {
   host: string;
   /** Set inside a hub-run manager's own session. */
   managerId?: string;
+  /** `$TMUX_PANE` when the session's terminal runs inside tmux: where the hub can type to it. */
+  tmuxPane?: string;
 }
 
 export interface HostSessionDeps {
@@ -103,6 +106,8 @@ export interface HostSessionDeps {
   ps?: (pid: number, timeoutMs: number) => { ppid: number; comm: string } | undefined;
   ppid?: number;
   now?: () => number;
+  /** Skip the ancestor walk that finds codex's pid: a caller that only names the session. */
+  pidless?: boolean;
 }
 
 function defaultPs(pid: number, timeoutMs: number): { ppid: number; comm: string } | undefined {
@@ -195,12 +200,20 @@ export function detectHostSession(deps: HostSessionDeps = {}): HostSessionHint |
   const host = (deps.hostname ?? hostname)();
   const hint = env['AGENTBOX_MANAGER']?.trim();
   const managerId = hint && MANAGER_ID_RE.test(hint) ? hint : undefined;
-  const base = { host, ...(managerId ? { managerId } : {}) };
+  // TMUX_PANE alone can be inherited stale by a process outside tmux; TMUX says it is live.
+  const pane = (env['TMUX'] ?? '').length > 0 ? env['TMUX_PANE']?.trim() : undefined;
+  const base = {
+    host,
+    ...(managerId ? { managerId } : {}),
+    ...(pane && TMUX_PANE_RE.test(pane) ? { tmuxPane: pane } : {}),
+  };
 
   if (agent === 'codex') {
     const sessionId = (env['CODEX_THREAD_ID'] ?? '').trim();
     if (!SESSION_ID_RE.test(sessionId)) return undefined;
-    const pid = findAncestorPid('codex', deps.ppid ?? process.ppid, deps.ps ?? defaultPs, deps.now);
+    const pid = deps.pidless
+      ? undefined
+      : findAncestorPid('codex', deps.ppid ?? process.ppid, deps.ps ?? defaultPs, deps.now);
     return { agent: 'codex', sessionId, cwd, ...base, ...(pid !== undefined ? { pid } : {}) };
   }
 
@@ -305,4 +318,19 @@ export async function registerCurrentSession(
 ): Promise<RegisteredManager | undefined> {
   const hint = detectHostSession();
   return hint ? registerHostManager(client, hint, attach) : undefined;
+}
+
+let sessionHeaderMemo: { value: string | undefined } | undefined;
+
+/**
+ * `X-AgentBox-Session` for this process: `<agent>:<sessionId>`, or undefined
+ * outside a host agent session. Memoized, and detected without the pid walk: the
+ * hub only needs the session's name to stamp who made a change.
+ */
+export function currentSessionHeader(): string | undefined {
+  if (!sessionHeaderMemo) {
+    const hint = detectHostSession({ pidless: true });
+    sessionHeaderMemo = { value: hint ? `${hint.agent}:${hint.sessionId}` : undefined };
+  }
+  return sessionHeaderMemo.value;
 }

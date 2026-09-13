@@ -118,6 +118,7 @@ const addCommand = new Command('add')
   .option('--box <id>', 'assign it to a box right away')
   .option('--by-manager', 'record the manager agent as the author (default: human)')
   .option('--no-manager', 'do not attach the task to the current agent session')
+  .option('--note <text>', 'why: recorded on the workspace timeline next to the task')
   .option('-j, --json', 'print the task as JSON')
   .action(
     async (
@@ -129,6 +130,7 @@ const addCommand = new Command('add')
         box?: string;
         byManager?: boolean;
         manager?: boolean;
+        note?: string;
         json?: boolean;
       },
     ) => {
@@ -146,6 +148,7 @@ const addCommand = new Command('add')
           ...(opts.dependsOn ? { dependsOn: mustIds([opts.dependsOn]) } : {}),
           ...(opts.box ? { boxId: opts.box } : {}),
           ...(opts.byManager ? { createdBy: 'manager' as const } : {}),
+          ...(opts.note ? { note: opts.note } : {}),
         });
         if (opts.json) process.stdout.write(JSON.stringify(task, null, 2) + '\n');
         else log.success(`${task.id}  ${task.title}`);
@@ -254,6 +257,7 @@ const updateCommand = new Command('update')
   .option('-p, --project <id>', 'scope the task to this project')
   .option('--no-project', 'clear the project scope')
   .option('--depends-on <ids>', 'comma-separated task ids this one waits on ("" clears)')
+  .option('--note <text>', 'why: recorded on the workspace timeline next to the change')
   .option('-j, --json', 'print the task as JSON')
   .action(
     async (
@@ -264,6 +268,7 @@ const updateCommand = new Command('update')
         status?: string;
         project?: string | boolean;
         dependsOn?: string;
+        note?: string;
         json?: boolean;
       },
     ) => {
@@ -288,7 +293,10 @@ const updateCommand = new Command('update')
           );
           process.exit(4);
         }
-        const task = await client.updateTask(ws.id, mustIds([id])[0]!, body);
+        const task = await client.updateTask(ws.id, mustIds([id])[0]!, {
+          ...body,
+          ...(opts.note ? { note: opts.note } : {}),
+        });
         if (opts.json) process.stdout.write(JSON.stringify(task, null, 2) + '\n');
         else log.success(`${task.id}  ${task.status}  ${task.title}`);
       });
@@ -314,16 +322,23 @@ const assignCommand = new Command('assign')
   .argument('<ids...>', 'task ids (e.g. T-11 T-12)')
   .requiredOption('--box <id>', 'box id, or "none" to unassign')
   .option('-w, --workspace <ref>', 'workspace id or path (default: the one containing the cwd)')
-  .action(async (ids: string[], opts: WorkspaceOpt & { box: string }) => {
+  .option('--note <text>', 'why: recorded on the workspace timeline next to the assignment')
+  .action(async (ids: string[], opts: WorkspaceOpt & { box: string; note?: string }) => {
     await withHubClient({ preferLocal: true }, async (client) => {
       const ws = await mustResolve(client, opts.workspace);
       const taskIds = mustIds(ids);
       if (opts.box === 'none') {
+        if (opts.note) log.warn('--note is not recorded when unassigning');
         for (const id of taskIds) await client.unassignTask(ws.id, id);
         log.success(`${taskIds.join(', ')} back in the backlog`);
         return;
       }
-      await client.assignTasks(ws.id, taskIds, { boxId: opts.box });
+      await client.assignTasks(
+        ws.id,
+        taskIds,
+        { boxId: opts.box },
+        opts.note ? { note: opts.note } : {},
+      );
       log.success(`${taskIds.join(', ')} -> ${opts.box}`);
     });
   });
@@ -332,10 +347,15 @@ const reorderCommand = new Command('reorder')
   .description('Set the whole priority order (list every task id)')
   .argument('<ids...>', 'every task id, in the order you want')
   .option('-w, --workspace <ref>', 'workspace id or path (default: the one containing the cwd)')
-  .action(async (ids: string[], opts: WorkspaceOpt) => {
+  .option('--note <text>', 'why the order changed: recorded on the workspace timeline')
+  .action(async (ids: string[], opts: WorkspaceOpt & { note?: string }) => {
     await withHubClient({ preferLocal: true }, async (client) => {
       const ws = await mustResolve(client, opts.workspace);
-      const tasks = await client.reorderTasks(ws.id, mustIds(ids));
+      const tasks = await client.reorderTasks(
+        ws.id,
+        mustIds(ids),
+        opts.note ? { note: opts.note } : {},
+      );
       renderTable(['id', 'status', 'title', 'where', 'project'], taskRows(tasks));
     });
   });

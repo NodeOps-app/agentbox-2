@@ -15,7 +15,7 @@ import { confirm, isCancel, log, select } from '@agentbox/cli-kit';
 import { Command } from 'commander';
 import { withHubClient } from '../control-plane/with-hub.js';
 import { resolveWorkspace, WorkspaceRefError } from '../lib/workspace-ref.js';
-import { detectHostSession } from '../lib/host-session.js';
+import { detectHostSession, registerHostManager } from '../lib/host-session.js';
 import { renderTable } from '../lib/text-table.js';
 import { detectHostTerminal, spawnInNewTerminal } from '../terminal/host.js';
 import type {
@@ -426,6 +426,58 @@ const sessionsCommand = new Command('sessions')
     });
   });
 
+const noteCommand = new Command('note')
+  .description(
+    "Record why the manager did something on the workspace timeline, at this session's turn",
+  )
+  .argument('<text>', 'the note')
+  .argument('[id]', 'manager id or unique prefix (default: the session running this command)')
+  .option('--replan', 'mark it as a re-plan: reordering, holding or splitting work')
+  .option('--plan', 'mark it as the plan itself')
+  .option('-j, --json', 'print the recorded event as JSON')
+  .action(
+    async (
+      text: string,
+      id: string | undefined,
+      opts: { replan?: boolean; plan?: boolean; json?: boolean },
+    ) => {
+      if (opts.replan && opts.plan) {
+        log.error('pass --replan or --plan, not both');
+        process.exit(4);
+      }
+      await withHubClient({ preferLocal: true }, async (client) => {
+        let managerId: string;
+        if (id) managerId = (await mustManager(client, id)).id;
+        else {
+          const hint = detectHostSession();
+          if (!hint) {
+            log.error('run inside the manager session, or pass a manager id');
+            process.exit(2);
+          }
+          // Registering is idempotent, and a session that never ran agentbox yet has no record.
+          const registered = await registerHostManager(client, hint);
+          if (!registered) process.exit(1);
+          managerId = registered.managerId;
+        }
+        const event = await client.addManagerNote(managerId, {
+          text,
+          ...(opts.replan
+            ? { kind: 'replan' as const }
+            : opts.plan
+              ? { kind: 'plan' as const }
+              : {}),
+        });
+        if (opts.json) {
+          process.stdout.write(JSON.stringify(event, null, 2) + '\n');
+          return;
+        }
+        log.success(
+          `noted on ${managerId}${event.turn !== undefined ? ` at turn ${String(event.turn)}` : ''}`,
+        );
+      });
+    },
+  );
+
 const forgetCommand = new Command('forget')
   .alias('rm')
   .description('Forget a stopped manager (its boxes and tasks are untouched)')
@@ -462,4 +514,5 @@ export const managerCommand = new Command('manager')
   .addCommand(stopCommand)
   .addCommand(attachCommand)
   .addCommand(sessionsCommand)
+  .addCommand(noteCommand)
   .addCommand(forgetCommand);
