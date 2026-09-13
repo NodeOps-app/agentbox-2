@@ -61,6 +61,26 @@ describe('detectHostSession: claude', () => {
     expect(hint?.cwd).toBe('/work/repo');
   });
 
+  it('finds the session started in a sibling folder from the cwd its transcript records', () => {
+    const file = join(transcriptDir('/work/repo'), `${ID}.jsonl`);
+    const files = { [file]: NOW };
+    const head = [
+      '{"type":"permission-mode"}',
+      JSON.stringify({ type: 'user', cwd: '/work/repo', sessionId: ID }),
+    ].join('\n');
+    const hint = detectHostSession(
+      deps({
+        cwd: '/work/other',
+        env: { CLAUDE_CODE_SESSION_ID: ID },
+        files,
+        listDir: (dir) =>
+          dir === join(HOME, '.claude', 'projects') ? [encodeClaudeProjectsKey('/work/repo')] : [],
+        readHead: (p) => (p === file ? head : undefined),
+      }),
+    );
+    expect(hint).toMatchObject({ agent: 'claude', sessionId: ID, cwd: '/work/repo' });
+  });
+
   it("falls back to the one recent session when the env id is a subagent's", () => {
     const dir = transcriptDir('/work/repo');
     const files = {

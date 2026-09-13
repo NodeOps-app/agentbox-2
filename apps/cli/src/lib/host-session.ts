@@ -7,7 +7,7 @@
  * it — and group the boxes that session creates under it.
  */
 import { spawnSync } from 'node:child_process';
-import { existsSync, readdirSync, statSync } from 'node:fs';
+import { closeSync, existsSync, openSync, readSync, readdirSync, statSync } from 'node:fs';
 import { homedir, hostname } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { log } from '@agentbox/cli-kit';
@@ -40,6 +40,37 @@ export const RECENT_SESSION_MS = 5 * 60 * 1000;
 const SESSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const MANAGER_ID_RE = /^[0-9a-f]{16}$/;
 
+/** A transcript's opening rows carry the session's cwd well inside this. */
+const TRANSCRIPT_HEAD_BYTES = 64 * 1024;
+
+function defaultReadHead(path: string): string | undefined {
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, 'r');
+    const buf = Buffer.alloc(TRANSCRIPT_HEAD_BYTES);
+    const n = readSync(fd, buf, 0, buf.length, 0);
+    return buf.subarray(0, n).toString('utf8');
+  } catch {
+    return undefined;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+/** The `cwd` a claude transcript records on its rows; the folder name is a lossy encoding of it. */
+export function cwdFromTranscriptHead(head: string): string | undefined {
+  for (const line of head.split('\n')) {
+    if (!line.includes('"cwd"')) continue;
+    try {
+      const row = JSON.parse(line) as { cwd?: unknown };
+      if (typeof row.cwd === 'string' && row.cwd.startsWith('/')) return row.cwd;
+    } catch {
+      // A row cut by the head boundary; the next one may be whole.
+    }
+  }
+  return undefined;
+}
+
 /** Bound on the ancestor walk; a real process tree is a handful of hops. */
 const MAX_PARENT_HOPS = 20;
 /** Total budget for every `ps` call in one walk. */
@@ -65,6 +96,8 @@ export interface HostSessionDeps {
   exists?: (path: string) => boolean;
   listDir?: (dir: string) => string[];
   mtimeMs?: (path: string) => number | undefined;
+  /** The first bytes of a file as text, or undefined when it cannot be read. */
+  readHead?: (path: string) => string | undefined;
   /** `{ppid, comm}` of a process, or undefined when it cannot be read. */
   ps?: (pid: number, timeoutMs: number) => { ppid: number; comm: string } | undefined;
   ppid?: number;
@@ -154,16 +187,6 @@ export function detectHostSession(deps: HostSessionDeps = {}): HostSessionHint |
   const pid = parsePid(env['CLAUDE_PID']);
   const withPid = pid !== undefined ? { pid } : {};
 
-  const envId = (env['CLAUDE_CODE_SESSION_ID'] ?? '').trim();
-  if (SESSION_ID_RE.test(envId)) {
-    for (let dir = cwd; ; dir = dirname(dir)) {
-      if (exists(join(projectDir(dir), `${envId}.jsonl`))) {
-        return { agent: 'claude', sessionId: envId, cwd: dir, ...base, ...withPid };
-      }
-      if (dirname(dir) === dir) break;
-    }
-  }
-
   const listDir =
     deps.listDir ??
     ((dir: string): string[] => {
@@ -182,6 +205,27 @@ export function detectHostSession(deps: HostSessionDeps = {}): HostSessionHint |
         return undefined;
       }
     });
+  const envId = (env['CLAUDE_CODE_SESSION_ID'] ?? '').trim();
+  if (SESSION_ID_RE.test(envId)) {
+    for (let dir = cwd; ; dir = dirname(dir)) {
+      if (exists(join(projectDir(dir), `${envId}.jsonl`))) {
+        return { agent: 'claude', sessionId: envId, cwd: dir, ...base, ...withPid };
+      }
+      if (dirname(dir) === dir) break;
+    }
+    // The session may have been started anywhere: the command can `cd` to a sibling
+    // project before it runs agentbox. The transcript's own rows say where.
+    const projectsRoot = join(home, '.claude', 'projects');
+    for (const key of listDir(projectsRoot)) {
+      const file = join(projectsRoot, key, `${envId}.jsonl`);
+      if (!exists(file)) continue;
+      const head = (deps.readHead ?? defaultReadHead)(file);
+      const sessionCwd = head ? cwdFromTranscriptHead(head) : undefined;
+      if (sessionCwd)
+        return { agent: 'claude', sessionId: envId, cwd: sessionCwd, ...base, ...withPid };
+    }
+  }
+
   const now = (deps.now ?? Date.now)();
   const dir = projectDir(cwd);
   const recent = listDir(dir)
