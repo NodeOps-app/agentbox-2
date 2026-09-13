@@ -342,6 +342,9 @@ resume's prompt that starts with `-` gets a leading space so the agent cannot pa
 - **The log cannot un-append.** A PR logged `pr.ready` that later went red stays in the history; the
   live row follows the last sync, whose PR states live in the hub's memory and are empty after a
   restart until the next sync.
+- **A message typed into a session showing a dialog answers the dialog.** Verified: a hub-run claude
+  in an untrusted folder sits on its trust prompt with "No, exit" selected, and the message's Enter
+  exits the agent. The hub does not read the pane before typing; a manager runs in a folder it trusts.
 - **`box.started` records the request**, including one for a box that was already running.
 - **Relay-side writes fire no change event.** A push or PR from a box shows on the next poll or the
   next hub-side change.
