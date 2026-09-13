@@ -5,6 +5,7 @@
 // keys are shared with the shim (`prTimelineEvents`), so both paths land once.
 import { stat } from 'node:fs/promises';
 import { join } from 'node:path';
+import { hashProjectPath } from '@agentbox/config';
 import { execa } from 'execa';
 import {
   appendTimelineEvent,
@@ -42,6 +43,15 @@ export interface GithubPrSync {
    * states live in memory, so before that no logged `pr.ready` is confirmed.
    */
   synced(wsId: string): boolean;
+  /**
+   * The web URL of the GitHub repo behind a project folder, from the cache a
+   * sync fills. Never runs `gh`: undefined until a sync has looked the folder up.
+   */
+  webUrlForRoot(root: string): string | undefined;
+  /** The same, by project id (`hashProjectPath` of the folder). */
+  webUrlForProject(projectId: string): string | undefined;
+  /** The web URL of a repo (`owner/name`) a sync resolved, on the host it lives on. */
+  webUrlForRepo(nameWithOwner: string): string | undefined;
 }
 
 export const GITHUB_SYNC_INTERVAL_MS = 60_000;
@@ -73,6 +83,8 @@ interface RepoRef {
   nameWithOwner: string;
   /** What `--repo` takes: `HOST/owner/name` off github.com. */
   arg: string;
+  /** `https://<host>/owner/name`. */
+  webUrl: string;
 }
 
 export function createGithubPrSync(
@@ -85,6 +97,7 @@ export function createGithubPrSync(
   const states = new Map<string, WorkspaceSyncState>();
   /** Keyed by project folder; `null` = not a GitHub repo, cached so it is not asked again. */
   const repoByRoot = new Map<string, RepoRef | null>();
+  const rootByProjectId = new Map<string, string>();
   let ghUser: { login: string | null; at: number } | null = null;
   const prStates = new Map<string, PrLiveState>();
   let statesVersion = 0;
@@ -115,6 +128,7 @@ export function createGithubPrSync(
           ref = {
             nameWithOwner: parsed.nameWithOwner,
             arg: host === 'github.com' ? parsed.nameWithOwner : `${host}/${parsed.nameWithOwner}`,
+            webUrl: `https://${host}/${parsed.nameWithOwner}`,
           };
         }
       } catch {
@@ -123,7 +137,10 @@ export function createGithubPrSync(
     }
     // A failed lookup is cached only when gh answered: a timeout says nothing
     // about whether the folder is a GitHub repo.
-    if (r) repoByRoot.set(root, ref);
+    if (r) {
+      repoByRoot.set(root, ref);
+      rootByProjectId.set(hashProjectPath(root), root);
+    }
     return ref;
   }
 
@@ -262,6 +279,19 @@ export function createGithubPrSync(
     statesVersion: () => statesVersion,
     synced(wsId) {
       return states.get(wsId)?.confirmed ?? false;
+    },
+    webUrlForRoot(root) {
+      return repoByRoot.get(root)?.webUrl;
+    },
+    webUrlForProject(projectId) {
+      const root = rootByProjectId.get(projectId);
+      return root === undefined ? undefined : repoByRoot.get(root)?.webUrl;
+    },
+    webUrlForRepo(nameWithOwner) {
+      for (const ref of repoByRoot.values()) {
+        if (ref?.nameWithOwner === nameWithOwner) return ref.webUrl;
+      }
+      return undefined;
     },
   };
 }

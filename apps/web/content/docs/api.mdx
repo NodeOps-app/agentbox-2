@@ -245,6 +245,12 @@ more tasks in one turn within 10 minutes. A `pr.merged` preceded by a message ab
 After a hub restart, a ready PR stays out of `live` and `summary.awaiting` until a GitHub sync of the
 workspace confirms it.
 
+Items and `live` rows that name a branch carry `branchUrl`, the branch on the web
+(`https://github.com/acme/storefront-web/tree/feat/checkout-copy`, each segment URL-encoded). A PR
+row's branch is its `pr.head`. The repo comes from `pr.url`, else a repo the GitHub sync resolved, else
+the row's project or box as the last sync cached it; without one of those the field is absent. A read
+never runs `gh` for it, so a row can gain the link on the read after the first sync.
+
 **Who did it.** The CLI sends `X-AgentBox-Session: <agent>:<sessionId>` from inside a Claude Code or
 Codex session; the hub resolves it to a registered manager and stamps its `managerId`, `turn` and that
 turn's `prompt`. Without the header (the tray, the web UI, a script) the actor is `human`, and so is a

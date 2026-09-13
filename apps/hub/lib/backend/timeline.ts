@@ -16,6 +16,7 @@ import {
   workspaceForPath,
   type TimelineEvent,
   type TimelineEventInput,
+  type TimelinePr,
   type TimelineStamp,
   type WorkTask,
 } from '@agentbox/relay';
@@ -235,6 +236,53 @@ export function parseShortstat(out: string): DiffStat {
   };
 }
 
+/** Where a row's repo is on the web, from what the GitHub sync already cached. */
+export interface RepoWebLookup {
+  /** A repo (`owner/name`) a sync resolved. */
+  repo(nameWithOwner: string): string | undefined;
+  project(projectId: string): string | undefined;
+  box(boxId: string): string | undefined;
+}
+
+interface BranchRow {
+  branch?: string;
+  pr?: TimelinePr;
+  projectId?: string;
+  boxId?: string;
+}
+
+/** `https://<host>/<owner>/<name>` from a PR's `…/pull/<n>` URL. */
+export function repoUrlOfPrUrl(url: string): string | undefined {
+  return /^(https?:\/\/[^/?#]+\/[^/?#]+\/[^/?#]+)\/pull\/\d+\/?(?:[?#].*)?$/u.exec(url)?.[1];
+}
+
+/**
+ * The branch's page on the repo's host. A PR row's branch is its head, since
+ * that is the branch in the repo its URL names. Each segment is encoded on its
+ * own, so the `/` of `feat/x` stays a path separator.
+ */
+export function branchUrlOf(row: BranchRow, lookup: RepoWebLookup): string | undefined {
+  const branch = row.pr?.head || row.branch;
+  if (!branch) return undefined;
+  const repoUrl =
+    (row.pr?.url ? repoUrlOfPrUrl(row.pr.url) : undefined) ??
+    (row.pr?.repo ? lookup.repo(row.pr.repo) : undefined) ??
+    (row.projectId ? lookup.project(row.projectId) : undefined) ??
+    (row.boxId ? lookup.box(row.boxId) : undefined);
+  if (!repoUrl) return undefined;
+  try {
+    return `${repoUrl}/tree/${branch.split('/').map(encodeURIComponent).join('/')}`;
+  } catch {
+    // encodeURIComponent throws on a lone surrogate; such a branch gets no link.
+    return undefined;
+  }
+}
+
+function withBranchUrl<T extends BranchRow>(row: T, lookup: RepoWebLookup): T {
+  const branchUrl = branchUrlOf(row, lookup);
+  return branchUrl ? { ...row, branchUrl } : row;
+}
+
 export interface TimelineBackendOptions {
   sync?: GithubPrSync;
   now?: () => number;
@@ -334,10 +382,22 @@ export function createTimelineBackend(
       let items = aggregateTimeline(events);
       if (q.before) items = items.filter((i) => i.at < q.before!);
       items = items.slice(0, q.limit ?? TIMELINE_DEFAULT_LIMIT);
+      // Links come from the sync's cache only: a read never waits on `gh`.
+      const factById = new Map(facts.map((b) => [b.id, b]));
+      const lookup: RepoWebLookup = {
+        repo: (repo) => sync.webUrlForRepo(repo),
+        project: (id) => sync.webUrlForProject(id),
+        box: (id) => {
+          const fact = factById.get(id);
+          if (!fact) return undefined;
+          return sync.webUrlForRoot(fact.projectRoot) ?? sync.webUrlForProject(fact.projectId);
+        },
+      };
+      items = items.map((i) => withBranchUrl(i, lookup));
       const live = [
         ...(await liveBoxItems(boxes, tasks, events)),
         ...liveReadyItems(events, (repo, n) => sync.prState(repo, n), sync.synced(wsId)),
-      ];
+      ].map((l) => withBranchUrl(l, lookup));
       const boxIds = new Set(boxes.map((b) => b.id));
       const pending = (deps.pendingApprovalBoxIds?.() ?? []).filter((id) => boxIds.has(id)).length;
       return {

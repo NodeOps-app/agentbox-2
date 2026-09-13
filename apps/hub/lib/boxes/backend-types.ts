@@ -986,6 +986,8 @@ export interface TimelineItem extends Omit<TimelineEvent, 'type'> {
   count?: number;
   /** `pr.merged`: a message about this PR was sent to the manager before it merged. */
   approvedByYou?: boolean;
+  /** The branch on the web (`…/tree/<branch>`); added at read time, only when its GitHub repo is known. */
+  branchUrl?: string;
 }
 
 /** A row that is true now, built at read time and never stored. */
@@ -997,6 +999,8 @@ export interface TimelineLiveItem {
   boxName?: string;
   agent?: string;
   branch?: string;
+  /** As on {@link TimelineItem}. */
+  branchUrl?: string;
   managerId?: string;
   task?: { id: string; title: string };
   taskIds?: string[];

@@ -3610,6 +3610,11 @@ export function buildOpenApi(): Record<string, unknown> {
           properties: timelineEventProperties,
           required: ['id', 'at', 'type', 'actor'],
         },
+        TimelineBranchUrl: {
+          type: 'string',
+          description:
+            "The row's branch on the web, e.g. `https://github.com/acme/storefront-web/tree/feat/checkout-copy`, each branch segment URL-encoded. Added at read time, never stored. Present only when the row names a branch (`pr.head` on a PR row, else `branch`) and its repo is known: from `pr.url`, else a repo the GitHub sync resolved, else the row's project or box repo as the last sync cached it.",
+        },
         TimelineItem: {
           type: 'object',
           description:
@@ -3622,6 +3627,7 @@ export function buildOpenApi(): Record<string, unknown> {
               type: 'boolean',
               description: '`pr.merged`: a message about this PR was sent before it merged.',
             },
+            branchUrl: { $ref: '#/components/schemas/TimelineBranchUrl' },
           },
           required: ['id', 'at', 'type', 'actor'],
         },
@@ -3636,6 +3642,7 @@ export function buildOpenApi(): Record<string, unknown> {
             boxName: { type: 'string' },
             agent: { type: 'string' },
             branch: { type: 'string' },
+            branchUrl: { $ref: '#/components/schemas/TimelineBranchUrl' },
             managerId: { type: 'string' },
             task: {
               type: 'object',

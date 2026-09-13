@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, realpath, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -9,16 +9,27 @@ import { createWorkspaceBackend } from '../lib/backend/workspaces';
 import { createGithubPrSync } from '../lib/backend/github-prs';
 import {
   aggregateTimeline,
+  branchUrlOf,
   buildTimelineSummary,
   createTimelineBackend,
   liveReadyItems,
   parseShortstat,
+  repoUrlOfPrUrl,
   stampInWorkspace,
   withBoxTimeline,
+  type RepoWebLookup,
 } from '../lib/backend/timeline';
 import type { BackendDeps, TimelineBoxFact } from '../lib/backend/deps';
 import type { HubBackend } from '../lib/boxes/backend-types';
-import { readTimeline, readWorkspace, type TimelineEvent } from '@agentbox/relay';
+import { hashProjectPath } from '@agentbox/config';
+import {
+  readTimeline,
+  readWorkspace,
+  recordTimelineEvent,
+  resolveWorkspaceDir,
+  timelineFile,
+  type TimelineEvent,
+} from '@agentbox/relay';
 
 const S1 = '5edc0ee0-ce9a-4e30-962d-bc630388d8bc';
 const S2 = '6fdc0ee0-ce9a-4e30-962d-bc630388d8bc';
@@ -701,5 +712,154 @@ describe('a message about a PR in a workspace over several repos', () => {
     const live = liveReadyItems(await readTimeline(wsId));
     expect(live.find((l) => l.pr?.repo === 'o/web')?.approved).toBe(true);
     expect(live.find((l) => l.pr?.repo === 'o/r')?.approved).toBeUndefined();
+  });
+});
+
+describe('branch links', () => {
+  const none: RepoWebLookup = {
+    repo: () => undefined,
+    project: () => undefined,
+    box: () => undefined,
+  };
+  const lookup: RepoWebLookup = {
+    repo: (r) =>
+      r === 'acme/storefront-web' ? 'https://github.com/acme/storefront-web' : undefined,
+    project: (id) => (id === 'p1' ? 'https://ghe.acme.dev/acme/api' : undefined),
+    box: (id) => (id === 'box1' ? 'https://github.com/acme/box-repo' : undefined),
+  };
+
+  it("takes a PR row's repo from its URL, on whatever host it names", () => {
+    expect(repoUrlOfPrUrl('https://ghe.acme.dev/acme/api/pull/12')).toBe(
+      'https://ghe.acme.dev/acme/api',
+    );
+    expect(repoUrlOfPrUrl('https://github.com/acme/api/issues/12')).toBeUndefined();
+    const row = {
+      pr: pr(409, {
+        repo: 'acme/storefront-web',
+        url: 'https://github.com/acme/storefront-web/pull/409',
+        head: 'feat/checkout-copy',
+      }),
+      projectId: 'p1',
+      boxId: 'box1',
+    };
+    expect(branchUrlOf(row, none)).toBe(
+      'https://github.com/acme/storefront-web/tree/feat/checkout-copy',
+    );
+  });
+
+  it('falls back to a repo the sync resolved, then the project, then the box', () => {
+    const noUrl = pr(1, { repo: 'acme/storefront-web', url: '', head: 'feat/a' });
+    expect(branchUrlOf({ pr: noUrl, projectId: 'p1' }, lookup)).toBe(
+      'https://github.com/acme/storefront-web/tree/feat/a',
+    );
+    expect(branchUrlOf({ pr: { ...noUrl, repo: 'other/repo' }, projectId: 'p1' }, lookup)).toBe(
+      'https://ghe.acme.dev/acme/api/tree/feat/a',
+    );
+    expect(branchUrlOf({ branch: 'agentbox/x', projectId: 'p1', boxId: 'box1' }, lookup)).toBe(
+      'https://ghe.acme.dev/acme/api/tree/agentbox/x',
+    );
+    expect(branchUrlOf({ branch: 'agentbox/x', projectId: 'gone', boxId: 'box1' }, lookup)).toBe(
+      'https://github.com/acme/box-repo/tree/agentbox/x',
+    );
+  });
+
+  it('encodes each branch segment and keeps the slashes', () => {
+    expect(branchUrlOf({ branch: 'feat/100% done#2/ü', boxId: 'box1' }, lookup)).toBe(
+      'https://github.com/acme/box-repo/tree/feat/100%25%20done%232/%C3%BC',
+    );
+  });
+
+  it('is absent with no branch, or no known repo', () => {
+    expect(branchUrlOf({ projectId: 'p1', boxId: 'box1' }, lookup)).toBeUndefined();
+    expect(
+      branchUrlOf({ branch: 'feat/a', projectId: 'gone', boxId: 'gone' }, lookup),
+    ).toBeUndefined();
+    const message = { pr: { repo: '', number: 4, title: '', url: '', base: '', head: '' } };
+    expect(branchUrlOf(message, lookup)).toBeUndefined();
+    expect(
+      branchUrlOf({ branch: 'feat/a', pr: pr(2, { url: '', repo: 'x/y' }) }, none),
+    ).toBeUndefined();
+  });
+
+  it('adds branchUrl to items and live rows from the cache, and never stores it', async () => {
+    const h = harness();
+    const { workspaces } = backends(h);
+    const root = await folder();
+    const added = await workspaces.addWorkspace({ path: root });
+    if (!added.ok) throw new Error(added.error);
+    const wsId = added.workspace.id;
+    h.boxes.push({
+      id: 'box1',
+      name: 'checkout-copy',
+      branches: ['agentbox/checkout-copy'],
+      state: 'running',
+      projectRoot: root,
+      projectId: hashProjectPath(root),
+    });
+    await recordTimelineEvent(wsId, {
+      type: 'box.created',
+      actor: 'human',
+      boxName: 'fresh',
+      branch: 'agentbox/fresh',
+      projectId: hashProjectPath(root),
+    });
+    const task = await workspaces.addTask(wsId, { title: 'Copy' });
+    if (!task.ok) throw new Error(task.error);
+    const assigned = await workspaces.assignTasks(wsId, [task.task.id], { boxId: 'box1' });
+    if (!assigned.ok) throw new Error(assigned.error);
+    await backgroundSettled();
+
+    const cold = createTimelineBackend(h.deps, { sync: createGithubPrSync(h.deps) });
+    const before = await cold.getTimeline(wsId);
+    expect(before!.items.some((i) => i.branchUrl)).toBe(false);
+    expect(before!.live.some((l) => l.branchUrl)).toBe(false);
+
+    h.gh.mockImplementation(async (args: string[]) => {
+      if (args[0] === 'api') return { exitCode: 0, stdout: 'me\n', stderr: '' };
+      if (args[0] === 'repo') {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            nameWithOwner: 'acme/api',
+            url: 'https://ghe.acme.dev/acme/api',
+          }),
+          stderr: '',
+        };
+      }
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify([
+          {
+            number: 7,
+            title: 'Copy',
+            url: 'https://ghe.acme.dev/acme/api/pull/7',
+            headRefName: 'agentbox/checkout-copy',
+            baseRefName: 'main',
+            state: 'OPEN',
+            author: { login: 'someone' },
+          },
+        ]),
+        stderr: '',
+      };
+    });
+    const sync = createGithubPrSync(h.deps);
+    const ws = (await readWorkspace(wsId))!;
+    expect(await sync.syncNow(ws)).toBe('ok');
+    expect(sync.webUrlForRepo('acme/api')).toBe('https://ghe.acme.dev/acme/api');
+    h.gh.mockClear();
+
+    const res = await createTimelineBackend(h.deps, { sync }).getTimeline(wsId);
+    expect(res!.items.find((i) => i.type === 'pr.opened')?.branchUrl).toBe(
+      'https://ghe.acme.dev/acme/api/tree/agentbox/checkout-copy',
+    );
+    expect(res!.items.find((i) => i.type === 'box.created')?.branchUrl).toBe(
+      'https://ghe.acme.dev/acme/api/tree/agentbox/fresh',
+    );
+    expect(res!.live.find((l) => l.type === 'task.in_progress')?.branchUrl).toBe(
+      'https://ghe.acme.dev/acme/api/tree/agentbox/checkout-copy',
+    );
+    expect(h.gh.mock.calls.some(([args]) => args[0] === 'repo')).toBe(false);
+    const raw = await readFile(timelineFile((await resolveWorkspaceDir(wsId))!), 'utf8');
+    expect(raw).not.toContain('branchUrl');
   });
 });

@@ -321,7 +321,10 @@ read that waits over 3 s gets the row without the diff, and the still-running ex
 read) and one per `pr.ready` not merged or closed since (`awaiting`, and `approved` once a message about
 it exists), minus a PR the last sync saw go red. PR states live in the hub's memory, so after a restart,
 until a sync of that workspace completes, a ready PR no sync has confirmed is left out of `live` and of
-`summary.awaiting`. `summary` counts merges and their +/−, tasks done, and what awaits you (unapproved ready PRs
+`summary.awaiting`. An item or live row that names a branch (a PR row's `pr.head`, else `branch`) gets
+`branchUrl` at read time: the repo from `pr.url`, else a repo the sync resolved, else the row's project
+or box folder looked up in the sync's `gh repo view` cache — the read never runs `gh`, so a project not
+yet synced has no link. `summary` counts merges and their +/−, tasks done, and what awaits you (unapproved ready PRs
 plus pending approvals on the workspace's boxes) since `since`.
 
 **Approve does not merge.** The tray's Approve posts `POST /managers/{id}/message {text, prNumber?, repo?}`,
