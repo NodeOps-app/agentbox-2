@@ -7,6 +7,8 @@ import {
   addTask,
   addWorkspace,
   assignTasks,
+  attachBoxToManager,
+  filterTasks,
   patchTask,
   readReconciledTasks,
   readTasks,
@@ -17,6 +19,7 @@ import {
   setTaskDone,
   taskSummaryForBox,
   unassignTasks,
+  upsertDetectedManager,
   type WorkTask,
 } from '../src/workspaces/index.js';
 
@@ -143,6 +146,29 @@ describe('assignTasks', () => {
   it('refuses an unknown task id', async () => {
     const ws = await makeWorkspace();
     await expect(assignTasks(ws, ['T-9'], { boxId: 'b' })).rejects.toThrow(/unknown task T-9/);
+  });
+
+  it('inherits the manager that made the box, without overriding one already set', async () => {
+    const ws = await makeWorkspace();
+    const root = (await readWorkspace(ws))!.root;
+    const { manager } = await upsertDetectedManager(ws, {
+      agent: 'claude',
+      sessionId: 's1',
+      cwd: root,
+    });
+    await attachBoxToManager(ws, manager.id, { boxJobId: 'job1' });
+    await addTask(ws, { title: 'a' });
+    await addTask(ws, { title: 'b', managerId: 'aaaaaaaaaaaaaaaa' });
+    const [a, b] = await assignTasks(ws, ['T-1', 'T-2'], { boxJobId: 'job1' });
+    expect(a?.managerId).toBe(manager.id);
+    expect(b?.managerId).toBe('aaaaaaaaaaaaaaaa');
+    // A task created straight onto the box inherits too.
+    expect((await addTask(ws, { title: 'c', boxJobId: 'job1' })).managerId).toBe(manager.id);
+    expect(filterTasks(await readTasks(ws), { managerId: manager.id }).map((t) => t.id)).toEqual([
+      'T-1',
+      'T-3',
+    ]);
+    expect((await patchTask(ws, 'T-1', { managerId: null }))?.managerId).toBeUndefined();
   });
 });
 

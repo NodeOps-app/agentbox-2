@@ -33,12 +33,18 @@ export function tasksFile(dir: string): string {
   return join(dir, 'tasks.json');
 }
 
-export function managerFile(dir: string): string {
-  return join(dir, 'manager.json');
+export function managersFile(dir: string): string {
+  return join(dir, 'managers.json');
 }
 
-export function managerExitFile(dir: string): string {
-  return join(dir, 'manager.exit');
+/** Where a hub-run manager's shell records the agent's exit code. */
+export function managerExitFile(dir: string, managerId: string): string {
+  return join(dir, 'managers', `${managerId}.exit`);
+}
+
+/** The single-manager files an earlier layout wrote; read once, then removed. */
+export function legacyManagerFiles(dir: string): { rec: string; exit: string } {
+  return { rec: join(dir, 'manager.json'), exit: join(dir, 'manager.exit') };
 }
 
 /**

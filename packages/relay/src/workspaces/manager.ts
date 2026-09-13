@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 import {
   open,
   readdir,
@@ -9,17 +10,30 @@ import {
   writeFile,
   mkdir,
 } from 'node:fs/promises';
-import { homedir } from 'node:os';
-import { basename, join } from 'node:path';
+import { homedir, hostname as osHostname } from 'node:os';
+import { basename, dirname, join } from 'node:path';
 import { execa } from 'execa';
+import { withFileLock } from '@agentbox/config';
 import { encodeClaudeProjectsKey } from '@agentbox/sandbox-core';
 import {
+  legacyManagerFiles,
+  listWorkspaces,
   managerExitFile,
-  managerFile,
+  managersFile,
   resolveWorkspaceDir,
+  WORKSPACE_LOCK,
   workspaceDir,
 } from './workspace-store.js';
-import type { HostSession, ManagerAgent, ManagerRecord, ManagerView } from './types.js';
+import type { ReconcileContext } from './task-store.js';
+import type {
+  HostSession,
+  ManagerAgent,
+  ManagerFile,
+  ManagerRecord,
+  ManagerStatus,
+  ManagerView,
+  WorkTask,
+} from './types.js';
 
 /** Seam for every tmux call, so tests assert argv without a terminal. */
 export type ManagerExec = (
@@ -99,21 +113,28 @@ export function isResumableManagerAgent(agent: string): boolean {
 /** What a picker opens on when the caller named no agent. */
 const DEFAULT_RESUMABLE_AGENT: string = RESUMABLE_MANAGER_AGENTS[0] ?? 'claude';
 
-export function managerSessionName(wsId: string): string {
-  return `agentbox-manager-${wsId}`;
+/** A manager id: 16 lowercase hex, minted here. */
+export const MANAGER_ID_RE = /^[0-9a-f]{16}$/u;
+
+export function newManagerId(): string {
+  return randomBytes(8).toString('hex');
+}
+
+export function managerSessionName(managerId: string): string {
+  return `agentbox-manager-${managerId}`;
 }
 
 /**
  * `=name` is tmux's exact-match prefix. Without it `has-session -t foo` matches
- * any session whose name STARTS with foo, so two workspaces whose ids share a
- * prefix would report each other's manager as running.
+ * any session whose name STARTS with foo, so two managers whose ids share a
+ * prefix would report each other as running.
  */
 function exactTarget(session: string): string {
   return `=${session}`;
 }
 
-export function managerAttachCommand(wsId: string): string {
-  return `tmux attach -t ${exactTarget(managerSessionName(wsId))}`;
+export function managerAttachCommand(tmuxSession: string): string {
+  return `tmux attach -t ${exactTarget(tmuxSession)}`;
 }
 
 /**
@@ -187,32 +208,225 @@ export async function tmuxSessionExists(
   }
 }
 
-async function managerPaths(wsId: string, root?: string): Promise<{ rec: string; exit: string }> {
-  const dir = (await resolveWorkspaceDir(wsId)) ?? workspaceDir(wsId, root);
-  return { rec: managerFile(dir), exit: managerExitFile(dir) };
+// ── the managers file ──
+
+async function dirFor(wsId: string): Promise<string> {
+  return (await resolveWorkspaceDir(wsId)) ?? workspaceDir(wsId);
 }
 
-export async function readManager(wsId: string): Promise<ManagerRecord | null> {
+async function readManagerFile(dir: string): Promise<ManagerRecord[] | null> {
   try {
-    const { rec } = await managerPaths(wsId);
-    return JSON.parse(await readFile(rec, 'utf8')) as ManagerRecord;
-  } catch {
-    return null;
+    const parsed = JSON.parse(await readFile(managersFile(dir), 'utf8')) as ManagerFile;
+    return Array.isArray(parsed.managers) ? parsed.managers : [];
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    // Malformed: an empty list, like a missing tasks.json. The next write replaces it.
+    return [];
   }
 }
 
-export async function writeManager(wsId: string, record: ManagerRecord): Promise<void> {
-  const { rec } = await managerPaths(wsId, record.cwd);
-  await mkdir(rec.slice(0, rec.lastIndexOf('/')), { recursive: true });
-  const tmp = `${rec}.tmp.${String(process.pid)}.${Date.now().toString(36)}`;
-  await writeFile(tmp, JSON.stringify(record, null, 2) + '\n', 'utf8');
-  await rename(tmp, rec);
+interface LegacyManagerRecord {
+  agent: ManagerAgent;
+  argv?: string[];
+  cwd: string;
+  sessionId?: string;
+  tmuxSession?: string;
+  startedAt?: string;
+  stoppedAt?: string;
+  lastExit?: number;
 }
 
-async function readLastExit(wsId: string): Promise<number | undefined> {
+/**
+ * The one record the single-manager layout wrote, as a `hub` manager. Its tmux
+ * session name is KEPT: a session started under the old name may still be
+ * running, and renaming it here would report a live agent as stopped and leave
+ * `stop` unable to reach it.
+ */
+async function readLegacyManager(dir: string, wsId: string): Promise<ManagerRecord | null> {
+  const files = legacyManagerFiles(dir);
+  let legacy: LegacyManagerRecord;
   try {
-    const { exit } = await managerPaths(wsId);
-    const raw = (await readFile(exit, 'utf8')).trim();
+    legacy = JSON.parse(await readFile(files.rec, 'utf8')) as LegacyManagerRecord;
+  } catch {
+    return null;
+  }
+  if (typeof legacy.agent !== 'string' || typeof legacy.cwd !== 'string') return null;
+  let lastExit = legacy.lastExit;
+  if (lastExit === undefined) {
+    const raw = await readFile(files.exit, 'utf8').catch(() => '');
+    const n = Number.parseInt(raw.trim(), 10);
+    if (!Number.isNaN(n)) lastExit = n;
+  }
+  const at = legacy.startedAt ?? new Date().toISOString();
+  return {
+    id: newManagerId(),
+    workspaceId: wsId,
+    agent: legacy.agent,
+    kind: 'hub',
+    cwd: legacy.cwd,
+    tmuxSession: legacy.tmuxSession ?? `agentbox-manager-${wsId}`,
+    ...(legacy.argv ? { argv: legacy.argv } : {}),
+    ...(legacy.sessionId ? { sessionId: legacy.sessionId } : {}),
+    boxIds: [],
+    boxJobIds: [],
+    createdAt: at,
+    lastSeenAt: legacy.stoppedAt ?? at,
+    startedAt: at,
+    ...(legacy.stoppedAt ? { stoppedAt: legacy.stoppedAt } : {}),
+    ...(lastExit === undefined ? {} : { lastExit }),
+  };
+}
+
+async function writeManagerFile(dir: string, managers: ManagerRecord[]): Promise<void> {
+  const final = managersFile(dir);
+  await mkdir(dir, { recursive: true });
+  const tmp = `${final}.tmp.${String(process.pid)}.${Date.now().toString(36)}`;
+  const doc: ManagerFile = { version: 1, managers };
+  await writeFile(tmp, JSON.stringify(doc, null, 2) + '\n', 'utf8');
+  await rename(tmp, final);
+}
+
+/** Locked read-modify-write of a workspace's managers (migrating a legacy file on the way). */
+export async function updateManagers<T>(
+  wsId: string,
+  fn: (
+    managers: ManagerRecord[],
+  ) => { managers: ManagerRecord[]; result: T } | Promise<{ managers: ManagerRecord[]; result: T }>,
+): Promise<T> {
+  const dir = await dirFor(wsId);
+  return withFileLock(
+    managersFile(dir),
+    async () => {
+      const current = await readManagerFile(dir);
+      const legacy = current === null ? await readLegacyManager(dir, wsId) : null;
+      const { managers, result } = await fn(current ?? (legacy ? [legacy] : []));
+      await writeManagerFile(dir, managers);
+      if (legacy) {
+        // Removed only AFTER managers.json is on disk: a crash in between leaves
+        // both files, and managers.json wins on the next read.
+        const files = legacyManagerFiles(dir);
+        await rm(files.rec, { force: true }).catch(() => {});
+        await rm(files.exit, { force: true }).catch(() => {});
+      }
+      return result;
+    },
+    WORKSPACE_LOCK,
+  );
+}
+
+export async function readManagers(wsId: string): Promise<ManagerRecord[]> {
+  const dir = await resolveWorkspaceDir(wsId);
+  if (!dir) return [];
+  const current = await readManagerFile(dir);
+  if (current !== null) return current;
+  // One-time migration of the single-manager layout. Cheap to test for: the
+  // common case is that neither file exists and nothing is written.
+  if ((await stat(legacyManagerFiles(dir).rec).catch(() => null)) === null) return [];
+  return updateManagers(wsId, (managers) => ({ managers, result: managers }));
+}
+
+/** Every workspace's managers, for a lookup by id or session. */
+async function allManagers(): Promise<ManagerRecord[]> {
+  const out: ManagerRecord[] = [];
+  for (const ws of await listWorkspaces()) out.push(...(await readManagers(ws.id)));
+  return out;
+}
+
+export async function findManager(id: string): Promise<ManagerRecord | null> {
+  return (await allManagers()).find((m) => m.id === id) ?? null;
+}
+
+export async function findManagerBySession(
+  agent: string,
+  sessionId: string,
+): Promise<ManagerRecord | null> {
+  return (await allManagers()).find((m) => m.agent === agent && m.sessionId === sessionId) ?? null;
+}
+
+/** The manager that created this box (or the job that will become it), in any workspace. */
+export async function managerIdForTarget(
+  target: { boxId: string } | { boxJobId: string },
+): Promise<string | undefined> {
+  const hit = (await allManagers()).find((m) =>
+    'boxId' in target ? m.boxIds.includes(target.boxId) : m.boxJobIds.includes(target.boxJobId),
+  );
+  return hit?.id;
+}
+
+/** Locked update of one record; `null` when it is not there. */
+export async function patchManager(
+  wsId: string,
+  id: string,
+  fn: (rec: ManagerRecord) => ManagerRecord,
+): Promise<ManagerRecord | null> {
+  return updateManagers(wsId, (managers) => {
+    const idx = managers.findIndex((m) => m.id === id);
+    if (idx === -1) return { managers, result: null };
+    const next = fn(managers[idx]!);
+    const out = [...managers];
+    out[idx] = next;
+    return { managers: out, result: next };
+  });
+}
+
+export async function removeManagerRecord(wsId: string, id: string): Promise<boolean> {
+  const removed = await updateManagers(wsId, (managers) => {
+    const out = managers.filter((m) => m.id !== id);
+    return { managers: out, result: out.length !== managers.length };
+  });
+  if (removed) await rm(managerExitFile(await dirFor(wsId), id), { force: true }).catch(() => {});
+  return removed;
+}
+
+// ── liveness ──
+
+/**
+ * How long a manager with no process handle counts as running after it was last
+ * seen. A codex session in its default sandbox cannot run `ps`, and a remote hub
+ * cannot probe a pid on another machine; both fall back to this window.
+ */
+export const MANAGER_SEEN_WINDOW_MS = 30 * 60 * 1000;
+
+/** `kill(pid, 0)`: ESRCH = gone; EPERM = alive but not ours to signal. */
+export function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+export interface ManagerProbe {
+  exec?: ManagerExec;
+  hostname?: () => string;
+  isPidAlive?: (pid: number) => boolean;
+  now?: () => number;
+}
+
+/** Derived from the process, never from the record, and never writes. */
+export async function managerStatus(
+  rec: ManagerRecord,
+  probe: ManagerProbe = {},
+): Promise<ManagerStatus> {
+  if (rec.kind === 'hub') {
+    const session = rec.tmuxSession ?? managerSessionName(rec.id);
+    return (await tmuxSessionExists(session, probe.exec ?? defaultExec)) ? 'running' : 'stopped';
+  }
+  const host = (probe.hostname ?? osHostname)();
+  // A pid is only meaningful on the machine it came from: probing it on a remote
+  // hub would ask about whatever unrelated process holds that number there.
+  if (rec.pid !== undefined && rec.host !== undefined && rec.host === host) {
+    return (probe.isPidAlive ?? isPidAlive)(rec.pid) ? 'running' : 'stopped';
+  }
+  const now = (probe.now ?? Date.now)();
+  const seen = Date.parse(rec.lastSeenAt);
+  return !Number.isNaN(seen) && now - seen < MANAGER_SEEN_WINDOW_MS ? 'running' : 'stopped';
+}
+
+export async function readManagerExit(wsId: string, id: string): Promise<number | undefined> {
+  try {
+    const raw = (await readFile(managerExitFile(await dirFor(wsId), id), 'utf8')).trim();
     const n = Number.parseInt(raw, 10);
     return Number.isNaN(n) ? undefined : n;
   } catch {
@@ -220,49 +434,200 @@ async function readLastExit(wsId: string): Promise<number | undefined> {
   }
 }
 
-/** Live view: the record plus whether its tmux session is actually up. */
-export async function managerView(
-  wsId: string,
-  exec: ManagerExec = defaultExec,
-): Promise<ManagerView> {
-  const session = managerSessionName(wsId);
-  const base = {
-    workspaceId: wsId,
-    tmuxSession: session,
-    attachCommand: managerAttachCommand(wsId),
+/** The API view: the record without its argv, plus what a list row shows. */
+export function toManagerView(
+  rec: ManagerRecord,
+  ctx: { status: ManagerStatus; workspaceName: string; tasks: WorkTask[]; lastExit?: number },
+): ManagerView {
+  const view: ManagerView & { argv?: string[] } = {
+    ...rec,
+    status: ctx.status,
+    workspaceName: ctx.workspaceName,
+    taskCounts: {
+      open: ctx.tasks.filter((t) => t.managerId === rec.id && t.status !== 'done').length,
+      done: ctx.tasks.filter((t) => t.managerId === rec.id && t.status === 'done').length,
+    },
   };
-  const record = await readManager(wsId);
-  if (!record) return { ...base, status: 'never' };
-  const running = await tmuxSessionExists(session, exec);
-  if (running) {
-    // Drop any previous run's ending rather than reporting a LIVE session with a
-    // `stoppedAt` next to it, which a UI would render as contradictory state.
-    const live = { ...record };
-    delete live.stoppedAt;
-    delete live.lastExit;
-    return { ...base, ...live, status: 'running' };
+  delete view.argv;
+  if (ctx.status === 'running') {
+    // A live session next to a previous run's ending reads as contradictory state.
+    delete view.stoppedAt;
+    delete view.lastExit;
+    if (rec.kind === 'hub') {
+      view.attachCommand = managerAttachCommand(rec.tmuxSession ?? managerSessionName(rec.id));
+    }
+  } else if (view.lastExit === undefined && ctx.lastExit !== undefined) {
+    view.lastExit = ctx.lastExit;
   }
-  const lastExit = record.lastExit ?? (await readLastExit(wsId));
-  return {
-    ...base,
-    ...record,
-    status: 'stopped',
-    ...(lastExit === undefined ? {} : { lastExit }),
-  };
+  return view;
 }
+
+// ── detection ──
+
+export interface DetectManagerInput {
+  agent: ManagerAgent;
+  sessionId: string;
+  /** Realpath of the folder the session runs in. */
+  cwd: string;
+  pid?: number;
+  host?: string;
+  /** `$AGENTBOX_MANAGER` of the caller: set inside a hub-run manager's own session. */
+  managerId?: string;
+}
+
+/**
+ * Register (or refresh) the host session a CLI call came from.
+ *
+ * Matched by `(agent, sessionId)` first. Failing that, a `managerId` hint names
+ * the hub-run manager the call came from — the hub started it before its agent
+ * had a session id, so this is where the two are joined. Anything else is a new
+ * `external` manager: a session in the user's own terminal.
+ */
+export async function upsertDetectedManager(
+  wsId: string,
+  input: DetectManagerInput,
+  now: Date = new Date(),
+): Promise<{ manager: ManagerRecord; created: boolean }> {
+  return updateManagers<{ manager: ManagerRecord; created: boolean }>(wsId, (managers) => {
+    const at = now.toISOString();
+    let idx = managers.findIndex((m) => m.agent === input.agent && m.sessionId === input.sessionId);
+    if (idx === -1 && input.managerId) idx = managers.findIndex((m) => m.id === input.managerId);
+    if (idx === -1) {
+      const manager: ManagerRecord = {
+        id: newManagerId(),
+        workspaceId: wsId,
+        agent: input.agent,
+        kind: 'external',
+        cwd: input.cwd,
+        sessionId: input.sessionId,
+        ...(input.host ? { host: input.host } : {}),
+        ...(input.pid !== undefined ? { pid: input.pid } : {}),
+        boxIds: [],
+        boxJobIds: [],
+        createdAt: at,
+        lastSeenAt: at,
+      };
+      return { managers: [...managers, manager], result: { manager, created: true } };
+    }
+    const prev = managers[idx]!;
+    const next: ManagerRecord = { ...prev, sessionId: input.sessionId, lastSeenAt: at };
+    // `/clear` starts a new session in the same process: the cached title named
+    // the old one.
+    if (prev.sessionId !== input.sessionId) delete next.title;
+    const fromOwnSession = input.managerId !== undefined && input.managerId === prev.id;
+    if (prev.kind === 'hub' && !fromOwnSession && input.pid !== undefined) {
+      // The session is being run from somewhere other than the hub's tmux — the
+      // user resumed it in a terminal. Observe that process from now on.
+      next.kind = 'external';
+      delete next.tmuxSession;
+      delete next.argv;
+      delete next.startedAt;
+      delete next.stoppedAt;
+      delete next.lastExit;
+    }
+    if (next.kind === 'external') {
+      if (input.pid !== undefined) next.pid = input.pid;
+      else delete next.pid;
+      if (input.host) next.host = input.host;
+    }
+    const out = [...managers];
+    out[idx] = next;
+    return { managers: out, result: { manager: next, created: false } };
+  });
+}
+
+/** Record that a manager created this box (or the create job that will become it). */
+export async function attachBoxToManager(
+  wsId: string,
+  id: string,
+  target: { boxId: string } | { boxJobId: string },
+): Promise<ManagerRecord | null> {
+  return patchManager(wsId, id, (rec) => {
+    if ('boxId' in target) {
+      return rec.boxIds.includes(target.boxId)
+        ? rec
+        : { ...rec, boxIds: [...rec.boxIds, target.boxId] };
+    }
+    return rec.boxJobIds.includes(target.boxJobId)
+      ? rec
+      : { ...rec, boxJobIds: [...rec.boxJobIds, target.boxJobId] };
+  });
+}
+
+const FAILED_JOB_STATUSES = new Set(['failed', 'cancelled']);
+
+/**
+ * Heal box pointers against reality, with the same rules as `reconcileTasks`: a
+ * job that recorded its box is promoted to that box, an explicitly failed job is
+ * dropped (a swept manifest is not evidence of failure), and a box that is gone
+ * is dropped unless a create still in flight has recorded it.
+ */
+export function reconcileManagers(
+  managers: ManagerRecord[],
+  ctx: ReconcileContext,
+): { managers: ManagerRecord[]; changed: boolean } {
+  const jobById = new Map(ctx.jobs.map((j) => [j.id, j]));
+  let changed = false;
+  const out = managers.map((m) => {
+    const boxIds = [...m.boxIds];
+    const boxJobIds: string[] = [];
+    for (const jobId of m.boxJobIds) {
+      const job = jobById.get(jobId);
+      if (job?.boxId) {
+        if (!boxIds.includes(job.boxId)) boxIds.push(job.boxId);
+        continue;
+      }
+      if (job && FAILED_JOB_STATUSES.has(job.status)) continue;
+      boxJobIds.push(jobId);
+    }
+    const kept = boxIds.filter(
+      (boxId) =>
+        ctx.liveBoxIds.has(boxId) ||
+        ctx.jobs.some(
+          (j) => j.boxId === boxId && !FAILED_JOB_STATUSES.has(j.status) && j.status !== 'done',
+        ),
+    );
+    const same =
+      kept.length === m.boxIds.length &&
+      kept.every((b, i) => b === m.boxIds[i]) &&
+      boxJobIds.length === m.boxJobIds.length;
+    if (same) return m;
+    changed = true;
+    return { ...m, boxIds: kept, boxJobIds };
+  });
+  return { managers: out, changed };
+}
+
+/** A workspace's managers with their box pointers healed; written back only when something moved. */
+export async function readReconciledManagers(
+  wsId: string,
+  ctx: ReconcileContext,
+): Promise<ManagerRecord[]> {
+  const current = await readManagers(wsId);
+  if (current.length === 0 || !reconcileManagers(current, ctx).changed) return current;
+  return updateManagers(wsId, (managers) => {
+    const { managers: healed } = reconcileManagers(managers, ctx);
+    return { managers: healed, result: healed };
+  });
+}
+
+// ── hub-run sessions ──
+
+/** A refusal that is about the manager's current state, not the request's shape. */
+export class ManagerConflictError extends Error {}
 
 export interface StartManagerSessionInput {
   wsId: string;
-  root: string;
-  agent: ManagerAgent;
+  /** The record to run: a new one for a fresh start, an existing one for a resume. */
+  manager: ManagerRecord;
   argv: string[];
-  sessionId?: string;
   exec?: ManagerExec;
   env?: NodeJS.ProcessEnv;
 }
 
 /**
- * Start the manager in a detached tmux session on the hub's own machine.
+ * Start a manager in a detached tmux session on the hub's own machine, and
+ * persist its record as `hub`.
  *
  * The session is the process's home: a client attaches to it instead of the hub
  * proxying a PTY, which is what lets the CLI, the tray and a plain terminal all
@@ -270,13 +635,17 @@ export interface StartManagerSessionInput {
  */
 export async function startManagerSession(input: StartManagerSessionInput): Promise<ManagerRecord> {
   const exec = input.exec ?? defaultExec;
-  const session = managerSessionName(input.wsId);
-  const { exit } = await managerPaths(input.wsId, input.root);
+  const rec = input.manager;
+  const session = managerSessionName(rec.id);
+  const exit = managerExitFile(await dirFor(input.wsId), rec.id);
+  await mkdir(dirname(exit), { recursive: true });
   // A stale exit code from the previous run would be reported as this run's.
   await rm(exit, { force: true }).catch(() => {});
   const script = buildManagerShellScript({
     argv: input.argv,
-    env: { AGENTBOX_WORKSPACE: input.wsId, AGENTBOX_MANAGER: '1' },
+    // AGENTBOX_MANAGER carries the id so the agent's own `agentbox` calls are
+    // attributed to THIS record rather than registering a second manager.
+    env: { AGENTBOX_WORKSPACE: input.wsId, AGENTBOX_MANAGER: rec.id },
     exitFile: exit,
   });
   // TMUX/TMUX_PANE would make tmux refuse to nest when the hub itself was
@@ -286,7 +655,7 @@ export async function startManagerSession(input: StartManagerSessionInput): Prom
   delete env['TMUX_PANE'];
   await exec(
     'tmux',
-    ['new-session', '-d', '-s', session, '-c', input.root, '--', loginShell(env), '-lc', script],
+    ['new-session', '-d', '-s', session, '-c', rec.cwd, '--', loginShell(env), '-lc', script],
     { env },
   );
   // `latest` sizes the window to the most recently active client, so a tray pane
@@ -309,35 +678,127 @@ export async function startManagerSession(input: StartManagerSessionInput): Prom
       `[manager] could not pin the tmux window size: ${err instanceof Error ? err.message : String(err)}`,
     );
   });
-  const record: ManagerRecord = {
-    agent: input.agent,
-    argv: input.argv,
-    cwd: input.root,
+  const at = new Date().toISOString();
+  const next: ManagerRecord = {
+    ...rec,
+    kind: 'hub',
     tmuxSession: session,
-    startedAt: new Date().toISOString(),
-    ...(input.sessionId ? { sessionId: input.sessionId } : {}),
+    argv: input.argv,
+    startedAt: at,
+    lastSeenAt: at,
   };
-  await writeManager(input.wsId, record);
-  return record;
+  delete next.pid;
+  delete next.stoppedAt;
+  delete next.lastExit;
+  return updateManagers(input.wsId, (managers) => {
+    const idx = managers.findIndex((m) => m.id === rec.id);
+    const out = [...managers];
+    if (idx === -1) out.push(next);
+    else out[idx] = next;
+    return { managers: out, result: next };
+  });
 }
 
-/** Kill the manager session. Idempotent: a session that is already gone is fine. */
+/**
+ * Reopen a manager's session in the hub's tmux with the agent's own resume
+ * spelling. Refused while the session is still running anywhere: two processes
+ * writing one transcript corrupt it.
+ */
+export async function resumeManagerSession(
+  wsId: string,
+  id: string,
+  probe: ManagerProbe & { env?: NodeJS.ProcessEnv } = {},
+): Promise<ManagerRecord> {
+  const rec = (await readManagers(wsId)).find((m) => m.id === id);
+  if (!rec) throw new Error(`unknown manager ${id}`);
+  if ((await managerStatus(rec, probe)) === 'running') {
+    throw new ManagerConflictError(
+      rec.kind === 'external'
+        ? `manager ${id} is still running in a terminal${rec.pid !== undefined ? ` (pid ${String(rec.pid)})` : ''}; exit it there before resuming it here`
+        : `manager ${id} is already running; attach to it instead`,
+    );
+  }
+  if (!rec.sessionId) {
+    throw new ManagerConflictError(
+      `manager ${id} has no session id to resume; start a new manager instead`,
+    );
+  }
+  if (!isResumableManagerAgent(rec.agent)) {
+    throw new ManagerConflictError(
+      `session resume is only supported for ${RESUMABLE_MANAGER_AGENTS.join(', ')}, not ${rec.agent}`,
+    );
+  }
+  return startManagerSession({
+    wsId,
+    manager: rec,
+    argv: buildManagerArgv(rec.agent, rec.sessionId),
+    ...(probe.exec ? { exec: probe.exec } : {}),
+    ...(probe.env ? { env: probe.env } : {}),
+  });
+}
+
+/**
+ * Kill a hub-run manager's session. Idempotent: a session that is already gone
+ * is fine, and the record is kept so it can be resumed. An external manager is
+ * the user's own process, which the hub does not signal.
+ */
 export async function stopManagerSession(
   wsId: string,
-  exec: ManagerExec = defaultExec,
+  id: string,
+  probe: ManagerProbe = {},
 ): Promise<ManagerRecord | null> {
-  const session = managerSessionName(wsId);
+  const rec = (await readManagers(wsId)).find((m) => m.id === id);
+  if (!rec) return null;
+  if (rec.kind === 'external') {
+    if ((await managerStatus(rec, probe)) === 'running') {
+      throw new ManagerConflictError(
+        `manager ${id} runs in your terminal; the hub does not stop a process it did not start`,
+      );
+    }
+    return rec;
+  }
+  const exec = probe.exec ?? defaultExec;
+  const session = rec.tmuxSession ?? managerSessionName(rec.id);
   await exec('tmux', ['kill-session', '-t', exactTarget(session)]).catch(() => {});
-  const record = await readManager(wsId);
-  if (!record) return null;
-  const lastExit = await readLastExit(wsId);
-  const next: ManagerRecord = {
-    ...record,
+  const lastExit = await readManagerExit(wsId, id);
+  return patchManager(wsId, id, (current) => ({
+    ...current,
     stoppedAt: new Date().toISOString(),
     ...(lastExit === undefined ? {} : { lastExit }),
-  };
-  await writeManager(wsId, next);
-  return next;
+  }));
+}
+
+/**
+ * The session's title from the agent's own store, or `null` when it cannot be
+ * read here (a session on another machine, or an agent whose store we do not read).
+ */
+export async function sessionTitle(
+  agent: string,
+  cwd: string,
+  sessionId: string,
+  home: string = homedir(),
+): Promise<string | null> {
+  if (agent === 'claude') {
+    const file = join(
+      home,
+      '.claude',
+      'projects',
+      encodeClaudeProjectsKey(cwd),
+      `${sessionId}.jsonl`,
+    );
+    const head = await readHead(file, SESSION_HEAD_BYTES);
+    return head === null ? null : titleFromTranscript(head);
+  }
+  if (agent === 'codex') {
+    const indexed = (await readThreadNames(join(home, '.codex', 'session_index.jsonl'))).get(
+      sessionId,
+    );
+    const title = indexed === undefined ? null : asTitle(indexed, { skipSlash: true });
+    if (title) return title;
+    const listed = await listRolloutSessions(cwd, agent, home);
+    return listed.find((s) => s.id === sessionId)?.title ?? null;
+  }
+  return null;
 }
 
 /** Read at most `bytes` from the start of a file; `null` when it cannot be read. */

@@ -7,6 +7,7 @@ import {
   WORKSPACE_LOCK,
   workspaceDir,
 } from './workspace-store.js';
+import { managerIdForTarget } from './manager.js';
 import type {
   BoxTaskSummary,
   TaskFile,
@@ -19,6 +20,7 @@ export interface TaskFilter {
   projectId?: string;
   boxId?: string;
   status?: WorkTaskStatus;
+  managerId?: string;
 }
 
 export interface AddTaskInput {
@@ -30,6 +32,7 @@ export interface AddTaskInput {
   externalRef?: WorkTaskExternalRef;
   boxId?: string;
   boxJobId?: string;
+  managerId?: string;
 }
 
 export interface UpdateTaskInput {
@@ -40,6 +43,8 @@ export interface UpdateTaskInput {
   projectId?: string | null;
   dependsOn?: string[];
   externalRef?: WorkTaskExternalRef;
+  /** `null` clears the manager; `undefined` leaves it alone. */
+  managerId?: string | null;
 }
 
 /** Which box (or pending create job) a task is assigned to. */
@@ -104,6 +109,7 @@ export function filterTasks(tasks: WorkTask[], f: TaskFilter = {}): WorkTask[] {
     if (f.projectId !== undefined && t.projectId !== f.projectId) return false;
     if (f.boxId !== undefined && t.boxId !== f.boxId) return false;
     if (f.status !== undefined && t.status !== f.status) return false;
+    if (f.managerId !== undefined && t.managerId !== f.managerId) return false;
     return true;
   });
 }
@@ -128,6 +134,12 @@ export function validateDependsOn(
  * writers cannot deadlock against each other.
  */
 export async function addTask(wsId: string, input: AddTaskInput): Promise<WorkTask> {
+  const target = input.boxId
+    ? { boxId: input.boxId }
+    : input.boxJobId
+      ? { boxJobId: input.boxJobId }
+      : null;
+  const managerId = input.managerId ?? (target ? await managerIdForTarget(target) : undefined);
   return updateTasks(wsId, async (tasks) => {
     if (input.dependsOn?.length) {
       const err = validateDependsOn(tasks, '', input.dependsOn);
@@ -152,6 +164,7 @@ export async function addTask(wsId: string, input: AddTaskInput): Promise<WorkTa
       ...(input.projectId ? { projectId: input.projectId } : {}),
       ...(input.dependsOn?.length ? { dependsOn: input.dependsOn } : {}),
       ...(input.externalRef ? { externalRef: input.externalRef } : {}),
+      ...(managerId ? { managerId } : {}),
       ...(input.boxId ? { boxId: input.boxId, status: 'in_progress' as const } : {}),
       ...(input.boxJobId ? { boxJobId: input.boxJobId, status: 'in_progress' as const } : {}),
     };
@@ -187,6 +200,10 @@ export async function patchTask(
       else next.dependsOn = patch.dependsOn;
     }
     if (patch.externalRef !== undefined) next.externalRef = patch.externalRef;
+    if (patch.managerId !== undefined) {
+      if (patch.managerId === null) delete next.managerId;
+      else next.managerId = patch.managerId;
+    }
     if (patch.status !== undefined) applyStatus(next, patch.status);
     const out = [...tasks];
     out[idx] = next;
@@ -235,6 +252,9 @@ export async function assignTasks(
   ids: string[],
   target: AssignTarget | null,
 ): Promise<WorkTask[]> {
+  // A task with no manager joins the one that made its box: that session is the
+  // one working it. Resolved before the lock — it reads every workspace's managers.
+  const inherited = target ? await managerIdForTarget(target) : undefined;
   return updateTasks(wsId, (tasks) => {
     const wanted = new Set(ids);
     const missing = ids.filter((id) => !tasks.some((t) => t.id === id));
@@ -247,6 +267,7 @@ export async function assignTasks(
       delete next.boxJobId;
       if (target && 'boxId' in target) next.boxId = target.boxId;
       else if (target) next.boxJobId = target.boxJobId;
+      if (inherited && !next.managerId) next.managerId = inherited;
       if (target && next.status === 'todo') next.status = 'in_progress';
       if (!target && next.status === 'in_progress') next.status = 'todo';
       return next;

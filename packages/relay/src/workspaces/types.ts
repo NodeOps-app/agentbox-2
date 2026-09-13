@@ -9,7 +9,7 @@ export const WORKSPACES_DIR = join(STATE_DIR, 'workspaces');
  * A workspace is a host FOLDER that groups one or more projects and owns a task
  * list plus (optionally) a manager agent session. It is deliberately not a
  * project: a project is one repo/agentbox.yaml root a box is built from, while a
- * workspace is the unit a human (and the manager) plans across.
+ * workspace is the unit a human (and its managers) plan across.
  *
  * `id` is `hashProjectPath(root)` — the same key space as the project registry,
  * so a single-project folder registered as both shares one id and a client can
@@ -79,6 +79,8 @@ export interface WorkTask {
    * the box, so a task assigned at create time is never orphaned by the gap.
    */
   boxJobId?: string;
+  /** The manager session this task belongs to. Inherited from its box on assignment. */
+  managerId?: string;
   dependsOn?: string[];
   createdBy: WorkTaskCreatedBy;
   externalRef?: WorkTaskExternalRef;
@@ -100,37 +102,65 @@ export interface TaskFile {
  */
 export type ManagerAgent = AgentId;
 
-/** What was started, so a restart can reuse the same agent and session. */
+/**
+ * `external` is a session the user runs in their own terminal — the hub only
+ * observes it, through detection. `hub` is one the hub started (or resumed) in a
+ * tmux session it owns, so it can also be attached to and stopped.
+ */
+export type ManagerKind = 'external' | 'hub';
+
+/**
+ * A manager is a HOST agent session that orchestrates boxes: many per workspace.
+ * It is registered when the `agentbox` CLI runs inside it (detection), or when
+ * the hub starts one.
+ */
 export interface ManagerRecord {
+  /** 16 hex, random: a hub-run manager has no session id until it is detected. */
+  id: string;
+  workspaceId: string;
   agent: ManagerAgent;
-  argv: string[];
+  kind: ManagerKind;
+  /** Realpath of the folder the session runs in — where a resume must run. */
   cwd: string;
+  /** Claude session uuid / codex thread uuid. */
   sessionId?: string;
-  tmuxSession: string;
-  startedAt: string;
+  /** Cached first-turn title, scraped lazily from the agent's own store. */
+  title?: string;
+  /** `os.hostname()` of the process; a pid is only probed when this matches the hub's. */
+  host?: string;
+  /** External only. */
+  pid?: number;
+  /** Hub only. */
+  tmuxSession?: string;
+  /** Hub only: what was started, so a restart can reuse it. */
+  argv?: string[];
+  /** Boxes this session created. Reconciled on read: dropped when the box is gone. */
+  boxIds: string[];
+  /** Create jobs that have not produced a box yet; promoted to `boxIds` on read. */
+  boxJobIds: string[];
+  createdAt: string;
+  lastSeenAt: string;
+  startedAt?: string;
   stoppedAt?: string;
   lastExit?: number;
 }
 
-/**
- * `never` = no manager was ever started here (no record), which a UI renders as
- * the empty state; `stopped` = a record exists but its tmux session is gone.
- */
-export type ManagerStatus = 'running' | 'stopped' | 'never';
+/** On-disk shape of `managers.json`. */
+export interface ManagerFile {
+  version: 1;
+  managers: ManagerRecord[];
+}
 
-export interface ManagerView {
-  workspaceId: string;
+/** Derived from the process (tmux session or pid), never stored. */
+export type ManagerStatus = 'running' | 'stopped';
+
+export interface ManagerView extends Omit<ManagerRecord, 'argv'> {
   status: ManagerStatus;
-  tmuxSession: string;
-  /** Ready-to-run attach command, so a GUI can show it without knowing tmux. */
-  attachCommand: string;
-  agent?: ManagerAgent;
-  argv?: string[];
-  cwd?: string;
-  sessionId?: string;
-  startedAt?: string;
-  stoppedAt?: string;
-  lastExit?: number;
+  /** Ready-to-run attach command; only for a RUNNING hub-run manager. */
+  attachCommand?: string;
+  workspaceName: string;
+  /** Tasks whose `managerId` is this manager. */
+  taskCounts: { open: number; done: number };
 }
 
 /** One resumable agent session found in the host agent's own store. */
