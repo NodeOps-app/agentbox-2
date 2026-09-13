@@ -57,7 +57,7 @@ export function parseCreateBox(
 ): Parsed<CreateBoxInput> {
   if (!isObject(body)) return { ok: false, message: 'body must be a JSON object' };
   const { projectId, repoUrl, agent, provider, name, prompt, fromBranch, setupWizard } = body;
-  const { agentArgs, startAgent, foreground, opts } = body;
+  const { agentArgs, startAgent, foreground, opts, managerId } = body;
   // Exactly one of projectId / repoUrl: projectId → a registered project on the
   // hub's machine (local file queue); repoUrl → the origin the control-plane
   // worker clones (no local checkout).
@@ -123,9 +123,12 @@ export function parseCreateBox(
   if (!fg.ok) return fg;
   const po = parseCreateBoxOpts(opts);
   if (!po.ok) return po;
+  const mid = optionalManagerId(managerId, 'managerId');
+  if (!mid.ok) return mid;
   return {
     ok: true,
     value: {
+      ...(mid.value ? { managerId: mid.value } : {}),
       projectId: hasProject ? (projectId as string) : undefined,
       repoUrl: hasRepo ? (repoUrl as string) : undefined,
       agent: agent as CreateBoxInput['agent'],
@@ -1002,12 +1005,15 @@ export interface TaskCreateInput {
   externalRef?: { kind: string; id: string; url?: string };
   boxId?: string;
   boxJobId?: string;
+  managerId?: string;
 }
 
 export function parseTaskCreate(body: unknown): Parsed<TaskCreateInput> {
   if (!isObject(body)) return { ok: false, message: 'body must be a JSON object' };
   const { title, description, projectId, dependsOn, createdBy, externalRef, boxId, boxJobId } =
     body;
+  const parsedManager = optionalManagerId(body['managerId'], 'managerId');
+  if (!parsedManager.ok) return parsedManager;
   if (typeof title !== 'string' || title.trim().length === 0) {
     return { ok: false, message: 'title is required (non-empty string)' };
   }
@@ -1052,6 +1058,7 @@ export function parseTaskCreate(body: unknown): Parsed<TaskCreateInput> {
       ...(parsedRef.value ? { externalRef: parsedRef.value } : {}),
       ...(parsedBox.value ? { boxId: parsedBox.value } : {}),
       ...(parsedJob.value ? { boxJobId: parsedJob.value } : {}),
+      ...(parsedManager.value ? { managerId: parsedManager.value } : {}),
     },
   };
 }
@@ -1063,11 +1070,12 @@ export interface TaskUpdateInput {
   projectId?: string | null;
   dependsOn?: string[];
   externalRef?: { kind: string; id: string; url?: string };
+  managerId?: string | null;
 }
 
 export function parseTaskUpdate(body: unknown): Parsed<TaskUpdateInput> {
   if (!isObject(body)) return { ok: false, message: 'body must be a JSON object' };
-  const { title, description, status, projectId, dependsOn, externalRef } = body;
+  const { title, description, status, projectId, dependsOn, externalRef, managerId } = body;
   const out: TaskUpdateInput = {};
   if (title !== undefined) {
     if (typeof title !== 'string' || title.trim().length === 0) {
@@ -1103,6 +1111,15 @@ export function parseTaskUpdate(body: unknown): Parsed<TaskUpdateInput> {
   const parsedRef = parseExternalRef(externalRef);
   if (!parsedRef.ok) return parsedRef;
   if (parsedRef.value) out.externalRef = parsedRef.value;
+  // `null` clears the manager; omitted leaves it alone.
+  if (managerId !== undefined) {
+    if (managerId === null) out.managerId = null;
+    else {
+      const parsedManager = optionalManagerId(managerId, 'managerId');
+      if (!parsedManager.ok) return parsedManager;
+      out.managerId = parsedManager.value ?? null;
+    }
+  }
   if (Object.keys(out).length === 0) {
     return { ok: false, message: 'no updatable field in body' };
   }
@@ -1200,6 +1217,91 @@ export function parseManagerStart(
       agent,
       ...(parsedSession.value ? { sessionId: parsedSession.value } : {}),
       ...(parsedRestart.value !== undefined ? { restart: parsedRestart.value } : {}),
+    },
+  };
+}
+
+/** A manager id as the store mints it: 16 lowercase hex. */
+export const MANAGER_ID_RE = /^[0-9a-f]{16}$/;
+
+export function isManagerId(v: unknown): v is string {
+  return typeof v === 'string' && MANAGER_ID_RE.test(v);
+}
+
+function optionalManagerId(v: unknown, field: string): Parsed<string | undefined> {
+  if (v === undefined) return { ok: true, value: undefined };
+  if (!isManagerId(v)) return { ok: false, message: `${field} must be a manager id (16 hex)` };
+  return { ok: true, value: v };
+}
+
+export const MANAGER_STATUSES = ['running', 'stopped'] as const;
+
+export function isManagerStatus(v: unknown): v is (typeof MANAGER_STATUSES)[number] {
+  return typeof v === 'string' && (MANAGER_STATUSES as readonly string[]).includes(v);
+}
+
+export interface ManagerDetectInput {
+  agent: string;
+  sessionId: string;
+  cwd: string;
+  pid?: number;
+  host?: string;
+  managerId?: string;
+  boxId?: string;
+  boxJobId?: string;
+}
+
+/**
+ * The body the CLI sends from inside a host agent session.
+ *
+ * `allowedAgents` is the accept-list for `agent`; the route passes the live
+ * registry minus service agents. Nothing here is executed — a detect only
+ * records a session — but `sessionId` is held to the same id shape as a start,
+ * because a later resume puts it into the agent's argv on this machine.
+ */
+export function parseManagerDetect(
+  body: unknown,
+  allowedAgents: readonly string[] = MANAGER_AGENT_NAMES,
+): Parsed<ManagerDetectInput> {
+  if (!isObject(body)) return { ok: false, message: 'body must be a JSON object' };
+  const { agent, sessionId, cwd, pid, host, managerId, boxId, boxJobId } = body;
+  if (typeof agent !== 'string' || !allowedAgents.includes(agent)) {
+    return { ok: false, message: `agent must be one of ${allowedAgents.join(', ')}` };
+  }
+  if (typeof sessionId !== 'string' || !SESSION_ID_RE.test(sessionId)) {
+    return { ok: false, message: 'sessionId is required (alphanumeric with - or _)' };
+  }
+  if (typeof cwd !== 'string' || !cwd.startsWith('/') || cwd.length > 4096) {
+    return { ok: false, message: 'cwd must be an absolute path' };
+  }
+  if (pid !== undefined && (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0)) {
+    return { ok: false, message: 'pid must be a positive integer' };
+  }
+  const parsedHost = optionalString(host, 'host');
+  if (!parsedHost.ok) return parsedHost;
+  if (parsedHost.value !== undefined && parsedHost.value.length > 255) {
+    return { ok: false, message: 'host too long (max 255 chars)' };
+  }
+  const parsedManager = optionalManagerId(managerId, 'managerId');
+  if (!parsedManager.ok) return parsedManager;
+  const parsedBox = optionalString(boxId, 'boxId');
+  if (!parsedBox.ok) return parsedBox;
+  const parsedJob = optionalString(boxJobId, 'boxJobId');
+  if (!parsedJob.ok) return parsedJob;
+  if (parsedBox.value && parsedJob.value) {
+    return { ok: false, message: 'send either boxId or boxJobId, not both' };
+  }
+  return {
+    ok: true,
+    value: {
+      agent,
+      sessionId,
+      cwd,
+      ...(pid !== undefined ? { pid: pid as number } : {}),
+      ...(parsedHost.value ? { host: parsedHost.value } : {}),
+      ...(parsedManager.value ? { managerId: parsedManager.value } : {}),
+      ...(parsedBox.value ? { boxId: parsedBox.value } : {}),
+      ...(parsedJob.value ? { boxJobId: parsedJob.value } : {}),
     },
   };
 }

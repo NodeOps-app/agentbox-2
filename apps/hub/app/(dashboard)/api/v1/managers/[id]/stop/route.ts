@@ -1,8 +1,8 @@
-// POST /api/v1/workspaces/:id/manager/stop — kill the manager's tmux session.
-// Idempotent: stopping a manager that already exited is not an error, and the
-// record is kept so a restart can reuse its agent and session.
-import { backendOrNull } from '../../../../lib/backend';
-import { fail, failFromAction, ok } from '../../../../lib/envelope';
+// POST /api/v1/managers/:id/stop — kill a hub-run manager's tmux session.
+// Idempotent, and the record is kept so it can be resumed. An external manager
+// is the user's own terminal process, which the hub never signals (409 while it runs).
+import { backendOrNull } from '../../../lib/backend';
+import { fail, failFromAction, ok } from '../../../lib/envelope';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';

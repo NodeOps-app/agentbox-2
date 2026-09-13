@@ -9,6 +9,7 @@ import type { AgentId } from '@agentbox/core';
 import type {
   BoxTaskSummary,
   HostSession,
+  ManagerStatus,
   WorkTask,
   WorkTaskExternalRef,
   WorkTaskStatus,
@@ -306,6 +307,9 @@ export interface CreateBoxInput {
   setupWizard?: boolean;
   // Box-shaping knobs the CLI resolved (see CreateBoxOpts). Absent for a web-UI create.
   opts?: CreateBoxOpts;
+  // The manager session the create came from; the job is attached to it so the
+  // box groups under that manager. Absent for a web-UI / tray create.
+  managerId?: string;
 }
 
 // Branch listing for a project's create-box base-branch picker: the current
@@ -498,7 +502,7 @@ export type BoxLogAttachSpec =
 // actions.ts) reaches it ONLY through that global, so the heavy Node/docker
 // packages never enter Next's bundle. This is a pure-type module (no runtime
 // imports) so both the implementation and the ambient global can share it.
-export interface HubBackend extends WorkspaceBackend {
+export interface HubBackend extends WorkspaceBackend, ManagerBackend {
   // authMode is an env-derived concern layered on by source.ts, not the host
   // backend — so the backend produces everything else. `live` (opt-in, expensive
   // — mirrors providers' `?freshness=1`) refreshes each cloud box's `state` with
@@ -957,6 +961,9 @@ export type WorkspaceResult = { ok: true; workspace: WorkspaceView } | { ok: fal
 export type TaskResult = { ok: true; task: WorkTask } | { ok: false; error: string };
 export type TasksResult = { ok: true; tasks: WorkTask[] } | { ok: false; error: string };
 export type ManagerResult = { ok: true; manager: ManagerView } | { ok: false; error: string };
+export type DetectManagerResult =
+  | { ok: true; manager: ManagerView; workspace: WorkspaceView; created: boolean }
+  | { ok: false; error: string };
 
 /** What `listResumableHostSessions` answers: the picker's rows, plus whether this agent has any. */
 export interface ManagerSessionsResult {
@@ -970,6 +977,7 @@ export interface TaskFilter {
   projectId?: string;
   boxId?: string;
   status?: WorkTaskStatus;
+  managerId?: string;
 }
 
 export interface AddTaskInput {
@@ -981,6 +989,7 @@ export interface AddTaskInput {
   externalRef?: WorkTaskExternalRef;
   boxId?: string;
   boxJobId?: string;
+  managerId?: string;
 }
 
 export interface UpdateTaskInput {
@@ -991,6 +1000,8 @@ export interface UpdateTaskInput {
   projectId?: string | null;
   dependsOn?: string[];
   externalRef?: WorkTaskExternalRef;
+  /** `null` clears the manager; `undefined` leaves it as it was. */
+  managerId?: string | null;
 }
 
 /** A box that exists, or the create job that will become one. */
@@ -1000,9 +1011,53 @@ export interface StartManagerInput {
   /** An agent the hub's registry knows. There is no free-form command: the
    *  manager runs on the HUB'S machine, not inside a box. */
   agent: string;
+  /** Resume this session. One an existing manager already holds resumes THAT manager. */
   sessionId?: string;
-  /** Kill a running manager and start this one, instead of refusing. */
+  /** With a `sessionId` whose hub-run manager is running: restart it instead of refusing. */
   restart?: boolean;
+}
+
+/** What the CLI sends from inside a host agent session. */
+export interface DetectManagerInput {
+  agent: string;
+  sessionId: string;
+  /** Absolute folder the session runs in, on the caller's machine. */
+  cwd: string;
+  pid?: number;
+  host?: string;
+  /** `$AGENTBOX_MANAGER`: set inside a hub-run manager's own session. */
+  managerId?: string;
+  /** A box (or create job) this session just made, attached in the same call. */
+  boxId?: string;
+  boxJobId?: string;
+}
+
+export interface ManagerFilter {
+  workspaceId?: string;
+  status?: ManagerStatus;
+}
+
+/**
+ * The manager domain slice (`lib/backend/managers.ts`): host agent sessions
+ * that orchestrate boxes, many per workspace.
+ */
+export interface ManagerBackend {
+  /** Register (or refresh) the session a CLI call came from, creating its workspace if none contains it. */
+  detectManager(input: DetectManagerInput): Promise<DetectManagerResult>;
+  listManagers(filter?: ManagerFilter): Promise<ManagerView[]>;
+  getManager(id: string): Promise<ManagerView | null>;
+  /** `null` = unknown workspace. */
+  listWorkspaceManagers(wsId: string): Promise<ManagerView[] | null>;
+  startManager(wsId: string, input: StartManagerInput): Promise<ManagerResult>;
+  resumeManager(id: string): Promise<ManagerResult>;
+  stopManager(id: string): Promise<ManagerResult>;
+  /** Forget a manager record. Refused while it runs. */
+  removeManager(id: string): Promise<ActionResult>;
+  listManagerSessions(wsId: string, agent?: string): Promise<ManagerSessionsResult | null>;
+  /** Record that a manager's create produced this job. Best-effort from `create()`. */
+  attachJob(managerId: string, jobId: string): Promise<ActionResult>;
+  /** boxId | create-job id -> managerId, for `Box.managerId` in getData(). */
+  managerByBox(): Promise<Map<string, string>>;
 }
 
 /**
@@ -1032,11 +1087,6 @@ export interface WorkspaceBackend {
   unassignTasks(wsId: string, ids: string[]): Promise<TasksResult>;
   /** `ids` must be an exact permutation of the workspace's tasks. */
   reorderTasks(wsId: string, ids: string[]): Promise<TasksResult>;
-
-  getManager(wsId: string): Promise<ManagerView | null>;
-  startManager(wsId: string, input: StartManagerInput): Promise<ManagerResult>;
-  stopManager(wsId: string): Promise<ManagerResult>;
-  listManagerSessions(wsId: string, agent?: string): Promise<ManagerSessionsResult | null>;
 
   /** projectId -> workspaceId, for `Project.workspaceId` in getData(). */
   workspaceIdByProject(): Promise<Map<string, string>>;

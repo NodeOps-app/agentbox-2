@@ -1,5 +1,5 @@
 // GET  /api/v1/workspaces/:id/tasks — the workspace's tasks in priority order,
-//   filterable by `?status=`, `?projectId=`, `?boxId=`. Assignments are healed
+//   filterable by `?status=`, `?projectId=`, `?boxId=`, `?managerId=`. Assignments are healed
 //   against live boxes and create jobs on the way out.
 // POST /api/v1/workspaces/:id/tasks — add a task.
 import { backendOrNull } from '../../../lib/backend';
@@ -27,6 +27,7 @@ export async function GET(
     ...(status ? { status } : {}),
     ...(url.searchParams.get('projectId') ? { projectId: url.searchParams.get('projectId')! } : {}),
     ...(url.searchParams.get('boxId') ? { boxId: url.searchParams.get('boxId')! } : {}),
+    ...(url.searchParams.get('managerId') ? { managerId: url.searchParams.get('managerId')! } : {}),
   };
   const tasks = await backend.listTasks(id, filter);
   if (tasks === null) return fail('not_found', `unknown workspace ${id}`);

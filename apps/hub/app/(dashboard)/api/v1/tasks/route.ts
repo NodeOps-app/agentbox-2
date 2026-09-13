@@ -1,5 +1,5 @@
 // GET /api/v1/tasks — tasks across every workspace, filterable by
-// `?workspaceId=`, `?projectId=`, `?boxId=`, `?status=`. The cross-workspace
+// `?workspaceId=`, `?projectId=`, `?boxId=`, `?status=`, `?managerId=`. The cross-workspace
 // read a fleet view needs: the per-workspace route answers one list, this one
 // answers "what is assigned to this box" without knowing which workspace owns it.
 import { backendOrNull } from '../lib/backend';
@@ -24,6 +24,7 @@ export async function GET(req: Request): Promise<Response> {
     ...(params.get('workspaceId') ? { workspaceId: params.get('workspaceId')! } : {}),
     ...(params.get('projectId') ? { projectId: params.get('projectId')! } : {}),
     ...(params.get('boxId') ? { boxId: params.get('boxId')! } : {}),
+    ...(params.get('managerId') ? { managerId: params.get('managerId')! } : {}),
   });
   return ok({ tasks });
 }

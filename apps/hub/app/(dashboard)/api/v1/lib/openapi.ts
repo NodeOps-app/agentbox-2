@@ -12,6 +12,31 @@ const errorResponse = {
   },
 };
 
+const managerIdParam = {
+  name: 'id',
+  in: 'path',
+  required: true,
+  schema: { type: 'string', pattern: '^[0-9a-f]{16}$' },
+  description: 'Manager id.',
+};
+
+const workspaceIdParam = {
+  name: 'id',
+  in: 'path',
+  required: true,
+  schema: { type: 'string' },
+  description: 'Workspace id.',
+};
+
+const detectSchema = {
+  type: 'object',
+  properties: {
+    manager: { $ref: '#/components/schemas/Manager' },
+    workspace: { $ref: '#/components/schemas/Workspace' },
+  },
+  required: ['manager', 'workspace'],
+};
+
 export function buildOpenApi(): Record<string, unknown> {
   return {
     openapi: '3.1.0',
@@ -55,15 +80,16 @@ export function buildOpenApi(): Record<string, unknown> {
       {
         name: 'Workspaces',
         description:
-          'Folders grouping one or more projects, each owning a task list and a manager.',
+          'Folders grouping one or more projects, each owning a task list and its manager sessions.',
       },
       {
         name: 'Tasks',
         description: 'Units of work, prioritized by list order and assigned to boxes.',
       },
       {
-        name: 'Manager',
-        description: 'A coding agent running locally in a workspace folder, in a tmux session.',
+        name: 'Managers',
+        description:
+          'Host agent sessions that create and watch boxes: detected from your terminal, or run by the hub in tmux.',
       },
     ],
     paths: {
@@ -841,7 +867,7 @@ export function buildOpenApi(): Record<string, unknown> {
           tags: ['Workspaces'],
           summary: 'List registered workspaces',
           description:
-            'A workspace is a folder on the hub host grouping one or more projects; it owns a task list and (optionally) a manager agent. Empty on a hosted hub, which holds no host folders.',
+            'A workspace is a folder on the hub host grouping one or more projects; it owns a task list and its manager sessions. One is created automatically when a manager session is detected in a folder no workspace contains. Empty on a hosted hub, which holds no host folders.',
           responses: {
             '200': {
               description: 'Workspaces',
@@ -927,7 +953,7 @@ export function buildOpenApi(): Record<string, unknown> {
           tags: ['Workspaces'],
           summary: 'Unregister a workspace',
           description:
-            'Drops the workspace record and its tasks. The folder, its projects and their boxes are untouched. Refused (409) while its manager is running.',
+            'Drops the workspace record, its tasks and its managers. The folder, its projects and their boxes are untouched. Refused (409) while any of its managers is running.',
           parameters: [
             {
               name: 'id',
@@ -1041,6 +1067,7 @@ export function buildOpenApi(): Record<string, unknown> {
             },
             { name: 'projectId', in: 'query', schema: { type: 'string' } },
             { name: 'boxId', in: 'query', schema: { type: 'string' } },
+            { name: 'managerId', in: 'query', schema: { type: 'string' } },
           ],
           responses: {
             '200': {
@@ -1091,6 +1118,12 @@ export function buildOpenApi(): Record<string, unknown> {
                     boxJobId: {
                       type: 'string',
                       description: 'Assign to the box this create job will produce.',
+                    },
+                    managerId: {
+                      type: 'string',
+                      pattern: '^[0-9a-f]{16}$',
+                      description:
+                        "The manager session this task belongs to. Omitted with a box: the box's manager.",
                     },
                   },
                   required: ['title'],
@@ -1252,7 +1285,7 @@ export function buildOpenApi(): Record<string, unknown> {
           tags: ['Tasks'],
           summary: 'Update a task',
           description:
-            'Partial update (this API has no PATCH). `projectId: null` clears the project scope; an omitted field is left alone.',
+            'Partial update (this API has no PATCH). `projectId: null` clears the project scope and `managerId: null` the manager; an omitted field is left alone.',
           parameters: [
             {
               name: 'id',
@@ -1281,6 +1314,11 @@ export function buildOpenApi(): Record<string, unknown> {
                     projectId: { type: 'string', nullable: true },
                     dependsOn: { type: 'array', items: { type: 'string', pattern: '^T-\\d+$' } },
                     externalRef: { $ref: '#/components/schemas/WorkTaskExternalRef' },
+                    managerId: {
+                      type: 'string',
+                      nullable: true,
+                      description: '`null` clears the manager.',
+                    },
                   },
                 },
               },
@@ -1445,46 +1483,206 @@ export function buildOpenApi(): Record<string, unknown> {
           },
         },
       },
-      '/workspaces/{id}/manager': {
+      '/managers': {
         get: {
-          tags: ['Manager'],
-          summary: "Get the workspace's manager state",
+          tags: ['Managers'],
+          summary: 'List manager sessions across every workspace',
           description:
-            '`status` is derived from the tmux session, not the record: a manager that exited on its own reads `stopped` with its `lastExit`. `never` means none was ever started here.',
+            'A manager is a host agent session that creates and watches boxes: `external` (a claude/codex session in your own terminal, registered when the `agentbox` CLI runs inside it) or `hub` (one this hub started in tmux). Running first, then the most recently seen. `status` is derived from the process — the tmux session for a hub manager, the pid for an external one reported from this host, else a 30-minute last-seen window. Empty on a hosted hub.',
           parameters: [
+            { name: 'workspaceId', in: 'query', schema: { type: 'string' } },
             {
-              name: 'id',
-              in: 'path',
-              required: true,
-              schema: { type: 'string' },
-              description: 'Workspace id.',
+              name: 'status',
+              in: 'query',
+              schema: { type: 'string', enum: ['running', 'stopped'] },
             },
           ],
           responses: {
             '200': {
-              description: 'Manager state',
+              description: 'Managers',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    properties: {
+                      managers: { type: 'array', items: { $ref: '#/components/schemas/Manager' } },
+                    },
+                    required: ['managers'],
+                  },
+                },
+              },
+            },
+            '400': errorResponse,
+            '401': errorResponse,
+          },
+        },
+      },
+      '/managers/detect': {
+        post: {
+          tags: ['Managers'],
+          summary: 'Register the host session a CLI call came from',
+          description:
+            "Matched by `(agent, sessionId)`, so repeating it refreshes one record (`lastSeenAt`, `pid`). A `managerId` (the caller's `$AGENTBOX_MANAGER`) joins the session to the hub-run manager it runs in. When no workspace contains `cwd`, one is created there, named after the folder; a session already registered stays in its workspace. `boxId` / `boxJobId` attaches a box this session just made in the same call. 201 when a manager or workspace was created, 200 when an existing one was refreshed.",
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    agent: {
+                      type: 'string',
+                      description:
+                        'An agent this hub knows with a session surface (not a service agent).',
+                    },
+                    sessionId: {
+                      type: 'string',
+                      description: 'Claude session uuid / codex thread uuid.',
+                    },
+                    cwd: { type: 'string', description: 'Absolute folder the session runs in.' },
+                    pid: {
+                      type: 'integer',
+                      description:
+                        "The agent process, probed for liveness when `host` is this hub's.",
+                    },
+                    host: {
+                      type: 'string',
+                      description: 'Hostname of the machine the session runs on.',
+                    },
+                    managerId: { type: 'string', pattern: '^[0-9a-f]{16}$' },
+                    boxId: { type: 'string' },
+                    boxJobId: { type: 'string' },
+                  },
+                  required: ['agent', 'sessionId', 'cwd'],
+                },
+              },
+            },
+          },
+          responses: {
+            '200': {
+              description: 'Refreshed',
+              content: { 'application/json': { schema: detectSchema } },
+            },
+            '201': {
+              description: 'Created',
+              content: { 'application/json': { schema: detectSchema } },
+            },
+            '400': errorResponse,
+            '401': errorResponse,
+            '503': errorResponse,
+          },
+        },
+      },
+      '/managers/{id}': {
+        get: {
+          tags: ['Managers'],
+          summary: 'Get one manager',
+          parameters: [managerIdParam],
+          responses: {
+            '200': {
+              description: 'Manager',
               content: { 'application/json': { schema: { $ref: '#/components/schemas/Manager' } } },
             },
             '401': errorResponse,
             '404': errorResponse,
           },
         },
-      },
-      '/workspaces/{id}/manager/start': {
-        post: {
-          tags: ['Manager'],
-          summary: 'Start the manager agent',
+        delete: {
+          tags: ['Managers'],
+          summary: 'Forget a manager',
           description:
-            'Runs a coding agent LOCALLY in the workspace folder, in a detached tmux session the hub owns, with AGENTBOX_WORKSPACE set. Clients attach to that session rather than the hub proxying a terminal. Send `agent` — one this hub knows, has installed, and can attach to (a `service` agent is a daemon and is refused) — optionally with a `sessionId` to resume (claude and codex only). There is deliberately no free-form command, and `sessionId` must look like an id: this runs on the hub host, not in a box. 503 when the hub host has no tmux.',
-          parameters: [
-            {
-              name: 'id',
-              in: 'path',
-              required: true,
-              schema: { type: 'string' },
-              description: 'Workspace id.',
+            'Drops the record. Its boxes and tasks are untouched (tasks keep a `managerId` nothing resolves). Refused (409) while it runs.',
+          parameters: [managerIdParam],
+          responses: {
+            '200': {
+              description: 'Forgotten',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    properties: { ok: { type: 'boolean' } },
+                    required: ['ok'],
+                  },
+                },
+              },
             },
-          ],
+            '401': errorResponse,
+            '404': errorResponse,
+            '409': errorResponse,
+            '503': errorResponse,
+          },
+        },
+      },
+      '/managers/{id}/stop': {
+        post: {
+          tags: ['Managers'],
+          summary: 'Stop a hub-run manager',
+          description:
+            'Kills its tmux session. Idempotent; the record is kept so it can be resumed. An external manager is your own terminal process, which the hub never signals: 409 while it runs, a no-op once it has exited.',
+          parameters: [managerIdParam],
+          responses: {
+            '200': {
+              description: 'Manager',
+              content: { 'application/json': { schema: { $ref: '#/components/schemas/Manager' } } },
+            },
+            '401': errorResponse,
+            '404': errorResponse,
+            '409': errorResponse,
+            '503': errorResponse,
+          },
+        },
+      },
+      '/managers/{id}/resume': {
+        post: {
+          tags: ['Managers'],
+          summary: "Resume a manager's session in the hub",
+          description:
+            "Reopens the session in a tmux session the hub owns (`claude --resume <id>` / `codex resume <id>`, run in the manager's `cwd`), and the manager becomes `hub`-run. 409 while the session still runs anywhere (two processes writing one transcript corrupt it), for a manager with no session id, and for an agent whose sessions cannot be resumed; 503 when the hub host has no tmux.",
+          parameters: [managerIdParam],
+          responses: {
+            '200': {
+              description: 'Manager',
+              content: { 'application/json': { schema: { $ref: '#/components/schemas/Manager' } } },
+            },
+            '401': errorResponse,
+            '404': errorResponse,
+            '409': errorResponse,
+            '503': errorResponse,
+          },
+        },
+      },
+      '/workspaces/{id}/managers': {
+        get: {
+          tags: ['Managers'],
+          summary: "List a workspace's managers",
+          parameters: [workspaceIdParam],
+          responses: {
+            '200': {
+              description: 'Managers',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    properties: {
+                      managers: { type: 'array', items: { $ref: '#/components/schemas/Manager' } },
+                    },
+                    required: ['managers'],
+                  },
+                },
+              },
+            },
+            '401': errorResponse,
+            '404': errorResponse,
+          },
+        },
+      },
+      '/workspaces/{id}/managers/start': {
+        post: {
+          tags: ['Managers'],
+          summary: 'Start a manager agent in the workspace folder',
+          description:
+            'Runs a coding agent LOCALLY in the workspace folder, in a detached tmux session the hub owns, with AGENTBOX_WORKSPACE and AGENTBOX_MANAGER set. Clients attach to that session rather than the hub proxying a terminal. Send `agent` — one this hub knows, has installed, and can attach to (a `service` agent is a daemon and is refused) — optionally with a `sessionId` to resume (claude and codex only). A `sessionId` some manager already holds resumes that manager rather than creating a second one (409 while it runs, unless `restart` and it is hub-run). There is deliberately no free-form command, and `sessionId` must look like an id: this runs on the hub host, not in a box. 503 when the hub host has no tmux.',
+          parameters: [workspaceIdParam],
           requestBody: {
             required: true,
             content: {
@@ -1504,7 +1702,8 @@ export function buildOpenApi(): Record<string, unknown> {
                     },
                     restart: {
                       type: 'boolean',
-                      description: 'Replace a running manager instead of refusing.',
+                      description:
+                        'With a `sessionId` whose hub-run manager is running: restart it instead of refusing.',
                     },
                   },
                   required: ['agent'],
@@ -1514,7 +1713,7 @@ export function buildOpenApi(): Record<string, unknown> {
           },
           responses: {
             '200': {
-              description: 'Manager state',
+              description: 'Manager',
               content: { 'application/json': { schema: { $ref: '#/components/schemas/Manager' } } },
             },
             '400': errorResponse,
@@ -1525,46 +1724,14 @@ export function buildOpenApi(): Record<string, unknown> {
           },
         },
       },
-      '/workspaces/{id}/manager/stop': {
-        post: {
-          tags: ['Manager'],
-          summary: 'Stop the manager agent',
-          description:
-            'Kills its tmux session. Idempotent; the record is kept so a restart reuses the same agent and session.',
-          parameters: [
-            {
-              name: 'id',
-              in: 'path',
-              required: true,
-              schema: { type: 'string' },
-              description: 'Workspace id.',
-            },
-          ],
-          responses: {
-            '200': {
-              description: 'Manager state',
-              content: { 'application/json': { schema: { $ref: '#/components/schemas/Manager' } } },
-            },
-            '401': errorResponse,
-            '404': errorResponse,
-            '503': errorResponse,
-          },
-        },
-      },
-      '/workspaces/{id}/manager/sessions': {
+      '/workspaces/{id}/managers/sessions': {
         get: {
-          tags: ['Manager'],
+          tags: ['Managers'],
           summary: 'Resumable agent sessions for the workspace folder',
           description:
             'Read from the agent\'s own on-disk store, for the "resume a session" picker, newest first. Only claude and codex are readable today; for anything else `supported: false` means that agent\'s session format is not one we can resume — not an error.',
           parameters: [
-            {
-              name: 'id',
-              in: 'path',
-              required: true,
-              schema: { type: 'string' },
-              description: 'Workspace id.',
-            },
+            workspaceIdParam,
             { name: 'agent', in: 'query', schema: { type: 'string', default: 'claude' } },
           ],
           responses: {
@@ -1602,6 +1769,7 @@ export function buildOpenApi(): Record<string, unknown> {
             { name: 'workspaceId', in: 'query', schema: { type: 'string' } },
             { name: 'projectId', in: 'query', schema: { type: 'string' } },
             { name: 'boxId', in: 'query', schema: { type: 'string' } },
+            { name: 'managerId', in: 'query', schema: { type: 'string' } },
             {
               name: 'status',
               in: 'query',
@@ -2977,6 +3145,11 @@ export function buildOpenApi(): Record<string, unknown> {
           type: 'object',
           properties: {
             id: { type: 'string' },
+            managerId: {
+              type: 'string',
+              description:
+                'The manager session that created this box. Absent for a box made from the web UI or the tray, and on a hosted hub.',
+            },
             projectId: { type: 'string' },
             repo: { type: 'string' },
             branch: { type: 'string' },
@@ -3125,14 +3298,11 @@ export function buildOpenApi(): Record<string, unknown> {
               properties: { open: { type: 'number' }, done: { type: 'number' } },
               required: ['open', 'done'],
             },
-            manager: {
+            managers: {
               type: 'object',
-              nullable: true,
-              description: 'null when no manager was ever started here.',
-              properties: {
-                status: { type: 'string', enum: ['running', 'stopped'] },
-                agent: { type: 'string' },
-              },
+              description: 'How many manager sessions this workspace has, and how many run now.',
+              properties: { running: { type: 'number' }, total: { type: 'number' } },
+              required: ['running', 'total'],
             },
             createdAt: { type: 'string' },
             updatedAt: { type: 'string' },
@@ -3168,6 +3338,11 @@ export function buildOpenApi(): Record<string, unknown> {
               type: 'string',
               description: 'A create job that has not produced a box yet; healed to boxId on read.',
             },
+            managerId: {
+              type: 'string',
+              description:
+                'The manager session this task belongs to. Set by `agentbox tasks add` inside a session, and inherited from the box on assignment.',
+            },
             dependsOn: { type: 'array', items: { type: 'string' } },
             createdBy: { type: 'string', enum: ['human', 'manager', 'api'] },
             externalRef: { $ref: '#/components/schemas/WorkTaskExternalRef' },
@@ -3188,23 +3363,67 @@ export function buildOpenApi(): Record<string, unknown> {
         },
         Manager: {
           type: 'object',
+          description: 'A host agent session that creates and watches boxes. Many per workspace.',
           properties: {
+            id: { type: 'string', pattern: '^[0-9a-f]{16}$' },
             workspaceId: { type: 'string' },
-            status: { type: 'string', enum: ['running', 'stopped', 'never'] },
-            tmuxSession: { type: 'string' },
-            attachCommand: { type: 'string', description: 'Ready-to-run tmux attach command.' },
+            workspaceName: { type: 'string' },
             agent: { type: 'string' },
-            argv: { type: 'array', items: { type: 'string' } },
-            cwd: { type: 'string' },
+            kind: {
+              type: 'string',
+              enum: ['external', 'hub'],
+              description:
+                '`external`: a session in your own terminal the hub only observes. `hub`: one the hub runs in tmux, which can be attached to and stopped.',
+            },
+            status: { type: 'string', enum: ['running', 'stopped'] },
+            cwd: {
+              type: 'string',
+              description: 'Folder the session runs in; a resume runs there.',
+            },
             sessionId: { type: 'string' },
+            title: { type: 'string', description: "The session's first user turn, when readable." },
+            host: { type: 'string' },
+            pid: { type: 'number' },
+            tmuxSession: { type: 'string' },
+            attachCommand: {
+              type: 'string',
+              description: 'Ready-to-run tmux attach command; only for a running hub-run manager.',
+            },
+            boxIds: { type: 'array', items: { type: 'string' } },
+            boxJobIds: {
+              type: 'array',
+              items: { type: 'string' },
+              description:
+                'Create jobs that have not produced a box yet; healed to boxIds on read.',
+            },
+            taskCounts: {
+              type: 'object',
+              properties: { open: { type: 'number' }, done: { type: 'number' } },
+              required: ['open', 'done'],
+            },
+            createdAt: { type: 'string' },
+            lastSeenAt: { type: 'string' },
             startedAt: { type: 'string' },
             stoppedAt: { type: 'string' },
             lastExit: {
               type: 'number',
-              description: "The agent's own exit code, when it ended on its own.",
+              description: "A hub-run agent's own exit code, when it ended on its own.",
             },
           },
-          required: ['workspaceId', 'status', 'tmuxSession', 'attachCommand'],
+          required: [
+            'id',
+            'workspaceId',
+            'workspaceName',
+            'agent',
+            'kind',
+            'status',
+            'cwd',
+            'boxIds',
+            'boxJobIds',
+            'taskCounts',
+            'createdAt',
+            'lastSeenAt',
+          ],
         },
         HostSession: {
           type: 'object',
@@ -3653,6 +3872,12 @@ export function buildOpenApi(): Record<string, unknown> {
               type: 'boolean',
               description:
                 "An interactive create — the hub runs it in the ungated foreground lane so it doesn't queue behind background jobs.",
+            },
+            managerId: {
+              type: 'string',
+              pattern: '^[0-9a-f]{16}$',
+              description:
+                'The manager session this create came from (`POST /managers/detect` returns it). The job is attached to it, so the box reports that `managerId`.',
             },
             opts: {
               type: 'object',

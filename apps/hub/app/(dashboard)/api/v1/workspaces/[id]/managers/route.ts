@@ -1,6 +1,5 @@
-// GET /api/v1/workspaces/:id/manager — the manager's live state. `status` is
-// derived from the tmux session, not from the record, so a manager that exited
-// on its own reads `stopped` without anything having to notice.
+// GET /api/v1/workspaces/:id/managers — the workspace's manager sessions,
+// running first, then the most recently seen.
 import { backendOrNull } from '../../../lib/backend';
 import { fail, ok } from '../../../lib/envelope';
 
@@ -14,7 +13,7 @@ export async function GET(
   const { id } = await ctx.params;
   const backend = backendOrNull();
   if (!backend) return fail('not_found', `unknown workspace ${id}`);
-  const manager = await backend.getManager(id);
-  if (!manager) return fail('not_found', `unknown workspace ${id}`);
-  return ok(manager);
+  const managers = await backend.listWorkspaceManagers(id);
+  if (!managers) return fail('not_found', `unknown workspace ${id}`);
+  return ok({ managers });
 }

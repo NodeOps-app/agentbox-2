@@ -5,7 +5,7 @@ import type { ManagerExec } from '@agentbox/relay';
 // its methods there. A slice takes this narrow dependency object instead of the
 // relay handle, so it can be unit-tested without a relay and reviewed without
 // reading the box/provider code it does not touch.
-import type { QueueJob } from '@agentbox/relay';
+import type { QueueJob, ReconcileContext } from '@agentbox/relay';
 
 export interface BackendDeps {
   /**
@@ -31,4 +31,28 @@ export interface BackendDeps {
   liveBoxIds(): Promise<Set<string>>;
   /** The local create queue, for resolving a task's pending create job. */
   jobs(): Promise<QueueJob[]>;
+  /**
+   * The hub's own hostname and pid probe. A manager's pid is only probed when it
+   * was reported from this host; tests pin both so the status matrix does not
+   * depend on the machine running the suite.
+   */
+  hostname?: () => string;
+  isPidAlive?: (pid: number) => boolean;
+}
+
+/**
+ * The box/job facts reconciliation needs. Both are whole-fleet listings (a
+ * docker inspect per box, plus every queue manifest), so a call that reconciles
+ * several workspaces resolves them ONCE and hands the same snapshot down.
+ */
+export async function reconcileContext(deps: BackendDeps): Promise<ReconcileContext> {
+  const [liveBoxIds, jobs] = await Promise.all([deps.liveBoxIds(), deps.jobs()]);
+  return {
+    liveBoxIds,
+    jobs: jobs.map((j) => ({
+      id: j.id,
+      status: j.status,
+      ...(j.boxId ? { boxId: j.boxId } : {}),
+    })),
+  };
 }

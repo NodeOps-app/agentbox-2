@@ -27,8 +27,8 @@ export type {
 /** A workspace as the API serves it: the record plus its derived counts. */
 export interface WorkspaceView extends Workspace {
   taskCounts: { open: number; done: number };
-  /** null when no manager was ever started here (the UI's empty state). */
-  manager: { status: ManagerStatus; agent?: string } | null;
+  /** How many manager sessions this workspace has, and how many are running now. */
+  managers: { running: number; total: number };
 }
 
 export type BoxStatus = 'running' | 'paused' | 'stopped' | 'creating' | 'error';
@@ -94,6 +94,10 @@ export interface Box {
   // has no tasks AND on the hosted/Postgres path (which holds no workspaces) —
   // like `hasGit`, silence means "no data", never "zero tasks".
   tasks?: BoxTaskSummary;
+  // The manager session (a host claude/codex session, or one the hub runs) that
+  // created this box. Like `tasks`, silence means "no data": a box made from the
+  // web UI or the tray has no manager, and the hosted path holds none at all.
+  managerId?: string;
   // The box's agent declares a state backup (`AgentSyncSpec.stateBackup`), so
   // `POST /boxes/{id}/backup` captures its IDENTITY and not merely a workspace.
   // True for a service bot (openclaw); absent for a coding-agent box, whose

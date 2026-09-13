@@ -1,10 +1,12 @@
-// POST /api/v1/workspaces/:id/manager/start — run a coding agent LOCALLY in the
+// POST /api/v1/workspaces/:id/managers/start — run a coding agent LOCALLY in the
 // workspace folder, in a detached tmux session the hub owns. The session is the
 // process's home: the CLI, the tray and a plain terminal all attach to the same
-// one rather than the hub proxying a PTY.
+// one rather than the hub proxying a PTY. A `sessionId` some manager already
+// holds resumes THAT manager instead of creating a second one.
 import { backendOrNull } from '../../../../lib/backend';
 import { fail, failFromAction, ok } from '../../../../lib/envelope';
 import { MANAGER_AGENT_NAMES, parseManagerStart, readJson } from '../../../../lib/validate';
+import { TMUX_MISSING } from '@/lib/backend/managers';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -47,9 +49,7 @@ export async function POST(
   if (!res.ok) {
     // A host without tmux cannot host a manager at all — that is an environment
     // gap on the hub's machine, not a bad request.
-    if (res.error.startsWith('tmux is not installed')) {
-      return fail('backend_unavailable', res.error);
-    }
+    if (res.error === TMUX_MISSING) return fail('backend_unavailable', res.error);
     return failFromAction(res.error);
   }
   return ok(res.manager);

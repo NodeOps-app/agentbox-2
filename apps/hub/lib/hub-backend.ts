@@ -41,6 +41,7 @@ import {
   type Provider,
 } from '@agentbox/core';
 import type { BoxStatus as CtlBoxStatus, StatusReply } from '@agentbox/ctl';
+import { createManagerBackend } from './backend/managers';
 import { createWorkspaceBackend } from './backend/workspaces';
 import type { BackendDeps } from './backend/deps';
 import {
@@ -2094,6 +2095,9 @@ export function createHubBackend(handle: RelayServerHandle): HubBackend {
     jobs: () => loadQueue().catch(() => []),
   };
   const workspaces = createWorkspaceBackend(backendDeps);
+  const managers = createManagerBackend(backendDeps, {
+    workspaceView: (id) => workspaces.getWorkspace(id),
+  });
 
   /**
    * The repo a project's boxes are cloned from. A control box's projects ARE
@@ -2156,21 +2160,23 @@ export function createHubBackend(handle: RelayServerHandle): HubBackend {
     });
     return { ok: true, jobId: id };
   }
-  return {
+  const hub: HubBackend = {
     ...workspaces,
+    ...managers,
     // authMode is layered on by source.ts (an env-derived concern), so the host
     // backend produces everything else.
     async getData(opts): Promise<Omit<HubState, 'authMode'>> {
       const [listed, jobs] = await Promise.all([listBoxes(), loadQueue()]);
       // Workspace facts for the two payload fields they own. Read once here so
       // the mapping below stays synchronous.
-      const [workspaceViews, wsByProject, taskSummaries] = await Promise.all([
+      const [workspaceViews, wsByProject, taskSummaries, managerByBox] = await Promise.all([
         workspaces.listWorkspaces().catch(() => []),
         workspaces.workspaceIdByProject().catch(() => new Map<string, string>()),
         workspaces.taskSummaries().catch(() => ({
           byBox: new Map<string, BoxTaskSummary>(),
           byJob: new Map<string, BoxTaskSummary>(),
         })),
+        managers.managerByBox().catch(() => new Map<string, string>()),
       ]);
       // `?live=1` (opt-in, expensive — mirrors providers' `?freshness=1`): refresh
       // each cloud box's `state` with an authoritative SDK probe before mapping.
@@ -2190,7 +2196,12 @@ export function createHubBackend(handle: RelayServerHandle): HubBackend {
         if (j.kind === 'prepare') continue;
         if (j.boxId && liveIds.has(j.boxId)) continue;
         const jobTasks = taskSummaries.byJob.get(j.id);
-        const withTasks = (box: Box): Box => (jobTasks ? { ...box, tasks: jobTasks } : box);
+        const jobManager = managerByBox.get(j.id);
+        const withTasks = (box: Box): Box => ({
+          ...box,
+          ...(jobTasks ? { tasks: jobTasks } : {}),
+          ...(jobManager ? { managerId: jobManager } : {}),
+        });
         if (j.status === 'queued' || j.status === 'running')
           jobBoxes.push(withTasks(mapJobToBox(j, 'creating')));
         else if (j.status === 'failed') jobBoxes.push(withTasks(mapJobToBox(j, 'error')));
@@ -2263,7 +2274,12 @@ export function createHubBackend(handle: RelayServerHandle): HubBackend {
       const hasGitOf = boxHasGitResolver();
       const withTasks = (box: Box): Box => {
         const summary = taskSummaries.byBox.get(box.id);
-        return summary ? { ...box, tasks: summary } : box;
+        const managerId = managerByBox.get(box.id);
+        return {
+          ...box,
+          ...(summary ? { tasks: summary } : {}),
+          ...(managerId ? { managerId } : {}),
+        };
       };
       const listedBoxes = await Promise.all(
         listed.map(async (b) =>
@@ -3843,4 +3859,20 @@ export function createHubBackend(handle: RelayServerHandle): HubBackend {
       }
     },
   };
+  // A create that came from a manager session groups under it: the job id is
+  // recorded now and promoted to the box id once the worker writes it back.
+  // Wrapped here rather than threaded through create()'s many return paths, and
+  // best-effort — a bookkeeping miss must never fail a create that succeeded.
+  const createBox = hub.create;
+  hub.create = async (input) => {
+    const res = await createBox(input);
+    if (res.ok && input.managerId) {
+      const attached = await managers
+        .attachJob(input.managerId, res.jobId)
+        .catch((e: unknown) => ({ ok: false as const, error: String(e) }));
+      if (!attached.ok) console.warn(`[hub] create ${res.jobId}: ${attached.error}`);
+    }
+    return res;
+  };
+  return hub;
 }

@@ -1,4 +1,4 @@
-// GET /api/v1/workspaces/:id/manager/sessions — resumable agent sessions for the
+// GET /api/v1/workspaces/:id/managers/sessions — resumable agent sessions for the
 // workspace folder, read from the agent's own on-disk store. Feeds the "resume a
 // session" picker before a manager is started. `supported: false` means this
 // agent's session format is not one we can resume, which is not an error.

@@ -8,6 +8,7 @@ import {
   parseHostUpsert,
   parseProject,
   parsePrune,
+  parseManagerDetect,
   parseManagerStart,
   parseTaskAssign,
   parseTaskCreate,
@@ -510,7 +511,7 @@ describe('parseManagerStart', () => {
         'v1',
         'workspaces',
         '[id]',
-        'manager',
+        'managers',
         'start',
         'route.ts',
       ),
@@ -524,5 +525,52 @@ describe('parseManagerStart', () => {
     expect(route).toMatch(/sys[\s\S]{0,80}\.agents\(\)/);
     expect(route).toMatch(/surface\s*!==\s*'service'/);
     expect(route).toMatch(/\.map\(\(a\)\s*=>\s*a\.id\)/);
+  });
+});
+
+describe('parseManagerDetect', () => {
+  const base = { agent: 'claude', sessionId: '5edc0ee0-ce9a-4e30-962d-bc630388d8bc', cwd: '/w' };
+
+  it('accepts a session with its optional process facts', () => {
+    expect(
+      parseManagerDetect({ ...base, pid: 12, host: 'laptop', managerId: '0123456789abcdef' }),
+    ).toMatchObject({
+      ok: true,
+      value: { pid: 12, host: 'laptop', managerId: '0123456789abcdef' },
+    });
+  });
+
+  it('refuses what could not be a session', () => {
+    expect(parseManagerDetect({ ...base, agent: 'openclaw' }, ['claude'])).toMatchObject({
+      ok: false,
+    });
+    expect(
+      parseManagerDetect({ ...base, sessionId: '--dangerously-skip-permissions' }),
+    ).toMatchObject({
+      ok: false,
+    });
+    expect(parseManagerDetect({ ...base, cwd: 'relative' })).toMatchObject({ ok: false });
+    expect(parseManagerDetect({ ...base, pid: -1 })).toMatchObject({ ok: false });
+    expect(parseManagerDetect({ ...base, pid: 1.5 })).toMatchObject({ ok: false });
+    expect(parseManagerDetect({ ...base, managerId: 'nope' })).toMatchObject({ ok: false });
+    expect(parseManagerDetect({ ...base, boxId: 'b', boxJobId: 'j' })).toMatchObject({ ok: false });
+  });
+});
+
+describe('managerId on creates and tasks', () => {
+  it('rides a box create and a task create, and null clears it on update', () => {
+    expect(
+      parseCreateBox({ projectId: 'p', agent: 'none', managerId: '0123456789abcdef' }),
+    ).toMatchObject({ ok: true, value: { managerId: '0123456789abcdef' } });
+    expect(parseCreateBox({ projectId: 'p', agent: 'none', managerId: 'x' }).ok).toBe(false);
+    expect(parseTaskCreate({ title: 't', managerId: '0123456789abcdef' })).toMatchObject({
+      ok: true,
+      value: { managerId: '0123456789abcdef' },
+    });
+    expect(parseTaskUpdate({ managerId: null })).toMatchObject({
+      ok: true,
+      value: { managerId: null },
+    });
+    expect(parseTaskUpdate({ managerId: 'x' }).ok).toBe(false);
   });
 });

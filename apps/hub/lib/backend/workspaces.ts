@@ -1,6 +1,6 @@
-// The workspace domain: workspaces, their tasks, and the host-local manager
-// session. Everything here reaches state through @agentbox/relay's workspace
-// store; nothing here knows about providers, containers or git.
+// The workspace domain: workspaces and their tasks (managers are their own
+// slice, `managers.ts`). Everything here reaches state through @agentbox/relay's
+// workspace store; nothing here knows about providers, containers or git.
 import { existsSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
 import { statSync } from 'node:fs';
@@ -8,14 +8,11 @@ import {
   addTask,
   addWorkspace,
   assignTasks,
-  buildManagerArgv,
   filterTasks,
-  isResumableManagerAgent,
-  listResumableHostSessions,
   listWorkspaces,
-  managerSessionName,
-  managerView,
+  managerStatus,
   patchTask,
+  readManagers,
   readReconciledTasks,
   readWorkspace,
   removeTask,
@@ -24,27 +21,20 @@ import {
   reorderTasks,
   rescanWorkspace,
   setTaskDone,
-  startManagerSession,
-  stopManagerSession,
   taskSummaryForBox,
-  tmuxAvailable,
-  tmuxSessionExists,
   toWorkspaceView,
   unassignTasks,
-  RESUMABLE_MANAGER_AGENTS,
   type BoxTaskSummary,
+  type ManagerProbe,
   type ReconcileContext,
   type Workspace,
   type WorkTask,
 } from '@agentbox/relay';
-import type { BackendDeps } from './deps';
+import { reconcileContext as fleetContext, type BackendDeps } from './deps';
 import type {
   ActionResult,
   AddTaskInput,
   AssignTarget,
-  ManagerSessionsResult,
-  ManagerResult,
-  StartManagerInput,
   TaskFilter,
   TaskResult,
   TasksResult,
@@ -52,11 +42,7 @@ import type {
   WorkspaceBackend,
   WorkspaceResult,
 } from '../boxes/backend-types';
-import type { ManagerView, WorkspaceView } from '../boxes/types';
-
-/** Tasks a box can never have: a task cannot be assigned to a bake. */
-const TMUX_MISSING =
-  'tmux is not installed on the hub host; the manager runs in a tmux session (brew install tmux)';
+import type { WorkspaceView } from '../boxes/types';
 
 function err(message: string): { ok: false; error: string } {
   return { ok: false, error: message };
@@ -67,22 +53,18 @@ function unknownWorkspace(id: string): { ok: false; error: string } {
 }
 
 export function createWorkspaceBackend(deps: BackendDeps): WorkspaceBackend {
-  /**
-   * The box/job facts reconciliation needs. Both are whole-fleet listings (a
-   * docker inspect per box, plus every queue manifest), so a call that reconciles
-   * several workspaces resolves them ONCE and hands the same snapshot down —
-   * `getData()` does exactly that on every dashboard poll.
-   */
-  async function reconcileContext(): Promise<ReconcileContext> {
-    const [liveBoxIds, jobs] = await Promise.all([deps.liveBoxIds(), deps.jobs()]);
-    return {
-      liveBoxIds,
-      jobs: jobs.map((j) => ({
-        id: j.id,
-        status: j.status,
-        ...(j.boxId ? { boxId: j.boxId } : {}),
-      })),
-    };
+  const reconcileContext = (): Promise<ReconcileContext> => fleetContext(deps);
+  const probe: ManagerProbe = {
+    ...(deps.managerExec ? { exec: deps.managerExec } : {}),
+    ...(deps.hostname ? { hostname: deps.hostname } : {}),
+    ...(deps.isPidAlive ? { isPidAlive: deps.isPidAlive } : {}),
+  };
+
+  /** How many of a workspace's managers are running right now. */
+  async function managerCounts(wsId: string): Promise<{ running: number; total: number }> {
+    const managers = await readManagers(wsId);
+    const statuses = await Promise.all(managers.map((m) => managerStatus(m, probe)));
+    return { running: statuses.filter((s) => s === 'running').length, total: managers.length };
   }
 
   /**
@@ -100,7 +82,7 @@ export function createWorkspaceBackend(deps: BackendDeps): WorkspaceBackend {
     ctx?: ReconcileContext,
   ): Promise<WorkspaceView | null> {
     if (!rec) return null;
-    const [tasks, manager] = await Promise.all([tasksOf(rec.id, ctx), managerView(rec.id)]);
+    const [tasks, managers] = await Promise.all([tasksOf(rec.id, ctx), managerCounts(rec.id)]);
     const base: Workspace = toWorkspaceView(rec);
     return {
       ...base,
@@ -108,7 +90,7 @@ export function createWorkspaceBackend(deps: BackendDeps): WorkspaceBackend {
         open: tasks.filter((t) => t.status !== 'done').length,
         done: tasks.filter((t) => t.status === 'done').length,
       },
-      manager: manager.status === 'never' ? null : { status: manager.status, agent: manager.agent },
+      managers,
     };
   }
 
@@ -122,11 +104,6 @@ export function createWorkspaceBackend(deps: BackendDeps): WorkspaceBackend {
     if (!job) return `unknown job ${target.boxJobId}`;
     if (job.kind === 'prepare') return `job ${target.boxJobId} is an image bake, not a box create`;
     return null;
-  }
-
-  async function requireWorkspace(wsId: string): Promise<{ id: string; root: string } | null> {
-    const rec = await readWorkspace(wsId);
-    return rec ? { id: rec.id, root: rec.root } : null;
   }
 
   return {
@@ -178,9 +155,9 @@ export function createWorkspaceBackend(deps: BackendDeps): WorkspaceBackend {
       const rec = await readWorkspace(id);
       if (!rec) return unknownWorkspace(id);
       // A live manager is a running process in that folder: unregistering under
-      // it would orphan the tmux session with nothing left pointing at it.
-      if (await tmuxSessionExists(managerSessionName(id))) {
-        return err('the workspace manager is running; stop it before removing the workspace');
+      // it would drop the only record pointing at that session and its boxes.
+      if ((await managerCounts(id)).running > 0) {
+        return err('a manager of this workspace is running; stop it before removing the workspace');
       }
       await removeWorkspace(id);
       deps.notify();
@@ -284,60 +261,6 @@ export function createWorkspaceBackend(deps: BackendDeps): WorkspaceBackend {
       } catch (e) {
         return err(e instanceof Error ? e.message : String(e));
       }
-    },
-
-    async getManager(wsId: string): Promise<ManagerView | null> {
-      if (!(await readWorkspace(wsId))) return null;
-      return managerView(wsId);
-    },
-
-    async startManager(wsId: string, input: StartManagerInput): Promise<ManagerResult> {
-      const ws = await requireWorkspace(wsId);
-      if (!ws) return unknownWorkspace(wsId);
-      if (!(await tmuxAvailable())) return err(TMUX_MISSING);
-      const running = await tmuxSessionExists(managerSessionName(wsId));
-      if (running && !input.restart) {
-        return err(`a manager is already running for workspace ${wsId}; stop it first`);
-      }
-      if (running) await stopManagerSession(wsId);
-
-      // The route validator is the accept-list for `agent`; here we only need the
-      // one rule it cannot express — only some agents can be resumed, and
-      // starting a FRESH agent that looks resumed is worse than a 400.
-      if (input.sessionId && !isResumableManagerAgent(input.agent)) {
-        return err(
-          `session resume is only supported for ${RESUMABLE_MANAGER_AGENTS.join(', ')}, not ${input.agent}`,
-        );
-      }
-      const agent = input.agent;
-      const argv = buildManagerArgv(agent, input.sessionId);
-      try {
-        await startManagerSession({
-          wsId,
-          root: ws.root,
-          agent,
-          argv,
-          ...(input.sessionId ? { sessionId: input.sessionId } : {}),
-          ...(deps.managerExec ? { exec: deps.managerExec } : {}),
-        });
-      } catch (e) {
-        return err(`could not start the manager: ${e instanceof Error ? e.message : String(e)}`);
-      }
-      deps.notify();
-      return { ok: true, manager: await managerView(wsId) };
-    },
-
-    async stopManager(wsId: string): Promise<ManagerResult> {
-      if (!(await readWorkspace(wsId))) return unknownWorkspace(wsId);
-      await stopManagerSession(wsId);
-      deps.notify();
-      return { ok: true, manager: await managerView(wsId) };
-    },
-
-    async listManagerSessions(wsId: string, agent?: string): Promise<ManagerSessionsResult | null> {
-      const ws = await requireWorkspace(wsId);
-      if (!ws) return null;
-      return listResumableHostSessions(ws.root, agent ?? 'claude');
     },
 
     // ── hooks getData() calls, so the dashboard read stays in one place ──

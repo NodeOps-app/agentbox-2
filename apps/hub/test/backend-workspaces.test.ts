@@ -42,7 +42,7 @@ describe('addWorkspace', () => {
     if (!res.ok) return;
     expect(res.workspace.projectIds).toHaveLength(2);
     expect(res.workspace.taskCounts).toEqual({ open: 0, done: 0 });
-    expect(res.workspace.manager).toBeNull();
+    expect(res.workspace.managers).toEqual({ running: 0, total: 0 });
     expect(deps.notify).toHaveBeenCalledTimes(1);
     expect(await backend.listWorkspaces()).toHaveLength(1);
   });
@@ -204,44 +204,5 @@ describe('getData hooks', () => {
     expect(byBox.get('box1')).toEqual({ total: 2, done: 1, current: { id: 'T-2', title: 'b' } });
     expect(byJob.get('j1')?.total).toBe(1);
     expect(byBox.get('nothing')).toBeUndefined();
-  });
-});
-
-describe('manager', () => {
-  it('is "never" before a start and refuses an unknown workspace', async () => {
-    const backend = createWorkspaceBackend(makeDeps());
-    const root = await makeFolder();
-    const added = await backend.addWorkspace({ path: root });
-    if (!added.ok) throw new Error(added.error);
-    expect((await backend.getManager(added.workspace.id))?.status).toBe('never');
-    expect(await backend.getManager('deadbeef')).toBeNull();
-    expect(await backend.listManagerSessions('deadbeef')).toBeNull();
-    expect(await backend.stopManager('deadbeef')).toMatchObject({ ok: false });
-  });
-
-  it('rejects a session resume for an agent whose format we cannot resume', async () => {
-    // The exec seam is stubbed on purpose: if the resumable guard ever regresses,
-    // this test would otherwise fall through to a real `tmux new-session` and
-    // leave a coding agent running on whoever's machine ran the suite.
-    const spawned: string[][] = [];
-    const backend = createWorkspaceBackend({
-      ...makeDeps(),
-      managerExec: async (_file: string, args: string[]) => {
-        spawned.push(args);
-        return { exitCode: 0 };
-      },
-    });
-    const root = await makeFolder();
-    const added = await backend.addWorkspace({ path: root });
-    if (!added.ok) throw new Error(added.error);
-    const res = await backend.startManager(added.workspace.id, {
-      agent: 'opencode',
-      sessionId: 's1',
-    });
-    expect(res).toMatchObject({
-      ok: false,
-      error: expect.stringContaining('only supported for claude, codex'),
-    });
-    expect(spawned).toEqual([]);
   });
 });
