@@ -30,6 +30,7 @@ import type {
   ManagerAgent,
   ManagerFile,
   ManagerRecord,
+  ManagerResumeBlock,
   ManagerStatus,
   ManagerView,
   WorkTask,
@@ -449,18 +450,29 @@ function ranElsewhere(rec: ManagerRecord, host: string): boolean {
   return rec.kind === 'external' && Boolean(rec.host) && rec.host !== host;
 }
 
+/**
+ * Why `resumeManagerSession` would refuse this manager right now, checked in the
+ * order it checks, so a client's wording matches the error a resume would get.
+ */
+export function managerResumeBlock(
+  rec: ManagerRecord,
+  status: ManagerStatus,
+  host: string = osHostname(),
+): ManagerResumeBlock | undefined {
+  if (ranElsewhere(rec, host)) return 'other-host';
+  if (status === 'running') return 'running';
+  if (!rec.sessionId) return 'no-session';
+  if (!isResumableManagerAgent(rec.agent)) return 'unsupported-agent';
+  return undefined;
+}
+
 /** Whether `resumeManagerSession` would accept this manager right now. */
 export function isManagerResumable(
   rec: ManagerRecord,
   status: ManagerStatus,
   host: string = osHostname(),
 ): boolean {
-  return (
-    status !== 'running' &&
-    Boolean(rec.sessionId) &&
-    isResumableManagerAgent(rec.agent) &&
-    !ranElsewhere(rec, host)
-  );
+  return managerResumeBlock(rec, status, host) === undefined;
 }
 
 /** The API view: the record without its argv, plus what a list row shows. */
@@ -475,10 +487,12 @@ export function toManagerView(
     hostname?: string;
   },
 ): ManagerView {
+  const block = managerResumeBlock(rec, ctx.status, ctx.hostname);
   const view: ManagerView & { argv?: string[] } = {
     ...rec,
     status: ctx.status,
-    resumable: isManagerResumable(rec, ctx.status, ctx.hostname),
+    resumable: block === undefined,
+    ...(block ? { resumeBlockedBy: block } : {}),
     workspaceName: ctx.workspaceName,
     taskCounts: {
       open: ctx.tasks.filter((t) => t.managerId === rec.id && t.status !== 'done').length,

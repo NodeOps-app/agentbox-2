@@ -194,10 +194,11 @@ this hub runs in a tmux session **it owns** on its own machine, so the CLI, the 
 pid when the detect reported this hub's hostname, else "seen in the last 30 minutes". An external
 session that has ended can be **resumed by the hub**, after which it is `hub`-run.
 
-A manager: `{ id, workspaceId, workspaceName, agent, kind, status, resumable, cwd, sessionId?, title?, host?,
+A manager: `{ id, workspaceId, workspaceName, agent, kind, status, resumable, resumeBlockedBy?, cwd, sessionId?, title?, host?,
 pid?, tmuxSession?, attachCommand?, boxIds, boxJobIds, taskCounts, createdAt, lastSeenAt, startedAt?,
 stoppedAt?, lastExit? }`. `attachCommand` is present only for a running hub-run manager; `resumable` says whether a resume
-would be accepted now (a client disables Resume on `false`); `title` is the
+would be accepted now (a client disables Resume on `false`), and `resumeBlockedBy` says why not —
+`other-host`, `running`, `no-session` or `unsupported-agent`, absent when `resumable` is true; `title` is the
 session's first user turn when the hub can read the agent's store.
 
 | Method + path                            | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |

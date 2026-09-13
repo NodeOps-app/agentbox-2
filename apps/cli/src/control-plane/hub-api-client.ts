@@ -492,6 +492,8 @@ export interface HubApiManager {
   status: 'running' | 'stopped';
   /** Whether `POST /managers/{id}/resume` would be accepted now. */
   resumable?: boolean;
+  /** Why `resumable` is false; absent when it is true. */
+  resumeBlockedBy?: 'running' | 'other-host' | 'unsupported-agent' | 'no-session';
   cwd: string;
   sessionId?: string;
   title?: string;

@@ -253,7 +253,7 @@ describe('liveness and lifecycle', () => {
       host: 'desktop',
     });
     if (!res.ok) throw new Error(res.error);
-    expect(res.manager.resumable).toBe(false);
+    expect(res.manager).toMatchObject({ resumable: false, resumeBlockedBy: 'other-host' });
     const resumed = await managers.resumeManager(res.manager.id);
     expect(resumed).toMatchObject({
       ok: false,

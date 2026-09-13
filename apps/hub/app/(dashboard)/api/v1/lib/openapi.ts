@@ -3382,6 +3382,12 @@ export function buildOpenApi(): Record<string, unknown> {
               description:
                 'Whether POST /managers/{id}/resume would be accepted now: false while it runs, without a session id, for an agent whose sessions cannot be resumed, and for an external session that ran on another machine (its transcript is not on this hub). A GUI disables Resume on false.',
             },
+            resumeBlockedBy: {
+              type: 'string',
+              enum: ['running', 'other-host', 'unsupported-agent', 'no-session'],
+              description:
+                'Why `resumable` is false, in the order a resume checks: `other-host` (an external session reported from another machine), `running`, `no-session` (no session id yet), `unsupported-agent`. Absent when `resumable` is true.',
+            },
             cwd: {
               type: 'string',
               description: 'Folder the session runs in; a resume runs there.',

@@ -10,6 +10,7 @@ import {
   buildManagerArgv,
   buildManagerShellScript,
   isManagerResumable,
+  managerResumeBlock,
   isPidAlive,
   isResumableManagerAgent,
   listResumableHostSessions,
@@ -569,6 +570,26 @@ describe('toManagerView', () => {
       hostname: 'vps',
     });
     expect(view.resumable).toBe(false);
+    expect(view.resumeBlockedBy).toBe('other-host');
+    const ok = toManagerView(ext, {
+      status: 'stopped',
+      workspaceName: 'w',
+      tasks: [],
+      hostname: 'laptop',
+    });
+    expect(ok.resumable).toBe(true);
+    expect(ok).not.toHaveProperty('resumeBlockedBy');
+  });
+
+  it('names why a manager cannot be resumed, in the order a resume checks', () => {
+    const ext = record({ sessionId: 's', host: 'laptop', pid: 1 });
+    expect(managerResumeBlock(ext, 'running', 'vps')).toBe('other-host');
+    expect(managerResumeBlock(ext, 'running', 'laptop')).toBe('running');
+    expect(managerResumeBlock(record({ kind: 'hub' }), 'stopped', 'laptop')).toBe('no-session');
+    expect(managerResumeBlock({ ...ext, agent: 'pi' }, 'stopped', 'laptop')).toBe(
+      'unsupported-agent',
+    );
+    expect(managerResumeBlock(ext, 'stopped', 'laptop')).toBeUndefined();
   });
 });
 

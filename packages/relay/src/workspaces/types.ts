@@ -154,6 +154,9 @@ export interface ManagerFile {
 /** Derived from the process (tmux session or pid), never stored. */
 export type ManagerStatus = 'running' | 'stopped';
 
+/** Why a manager cannot be resumed right now. */
+export type ManagerResumeBlock = 'running' | 'other-host' | 'unsupported-agent' | 'no-session';
+
 export interface ManagerView extends Omit<ManagerRecord, 'argv'> {
   status: ManagerStatus;
   /**
@@ -162,6 +165,8 @@ export interface ManagerView extends Omit<ManagerRecord, 'argv'> {
    * another machine (its transcript is not on the hub's disk).
    */
   resumable: boolean;
+  /** Why `resumable` is false; absent when it is true. */
+  resumeBlockedBy?: ManagerResumeBlock;
   /** Ready-to-run attach command; only for a RUNNING hub-run manager. */
   attachCommand?: string;
   workspaceName: string;
