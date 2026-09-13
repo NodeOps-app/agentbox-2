@@ -87,7 +87,9 @@ session); building it needs a Swift 6 toolchain:
   (which carries the raw host-side fields — `state`, `projectRoot`, endpoint URLs, session titles —
   and the synthetic `creating`/`error` boxes for in-flight/failed creates) plus the lifecycle
   (`start`/`pause`/`resume`/`stop`/`destroy`), git, rename, and services routes. Approvals use
-  `/api/v1/approvals` (+ `…/{id}/answer`), live events the SSE `/api/events` stream. **Auth to
+  `/api/v1/approvals` (+ `…/{id}/answer`), live events the SSE `/api/events` stream. Boxes group under
+  their manager session in the menu: `Box.managerId` joins a box to a row of `GET /api/v1/managers`
+  (host claude/codex sessions, detected or hub-run; `…/{id}/resume` reopens one in the hub's tmux). **Auth to
   remember when changing the hub:** both `/api/v1/*` and `/api/events` go through the same gate
   (`apps/hub/proxy.ts`) and accept `Authorization: Bearer <token>` — a headless client (the tray
   against a remote control box) subscribes to events with the same Bearer key it uses for `/api/v1`.

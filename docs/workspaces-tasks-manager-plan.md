@@ -51,6 +51,8 @@ the manager's own instructions come after.
 | 5 | Tray: the Manager window (task list + terminal pane) | **done** |
 | 6 | Hub web UI: workspace + task views | planned |
 | 7 | Linear import: one ticket → several local tasks | planned |
+| 8a | Managers are detected, not declared: many per workspace, `/api/v1/managers`, `Box.managerId` | **done** |
+| 8b | Tray: boxes grouped by manager, the Manager window's session picker | planned |
 
 ### Known gaps
 
@@ -71,6 +73,18 @@ the manager's own instructions come after.
   inside each file rather than in its path. The remaining agents' on-disk formats are unverified, so
   `GET …/manager/sessions` answers `supported: false` for them and a `sessionId` is refused rather
   than silently starting a fresh agent that looks resumed.
+- **opencode and pi are never detected as managers.** Neither exports a session id into the commands
+  it runs, so a create from inside one registers nothing and its boxes land in "Other boxes".
+- **Codex's sandbox hides most of this.** In the default `workspace-write` sandbox loopback is blocked
+  (`curl http://127.0.0.1:8787` answers nothing), so the CLI cannot reach the hub at all and detection
+  fails with a warning; it needs `[sandbox_workspace_write] network_access = true` in
+  `~/.codex/config.toml`, or a full-access sandbox. Even with network access, `ps` is "operation not
+  permitted" there, so the ancestor walk that finds the codex pid fails soft and a sandboxed codex
+  manager never has a pid: its liveness is the 30-minute `lastSeenAt` window. `CODEX_THREAD_ID` itself
+  is exported (a uuid-v7, verified on codex 0.142).
+- **A remote hub probes no pid and scrapes no title.** A pid is only probed when the detect reported
+  the hub's own hostname, and a title is read from the agent's store on the hub's disk; a PC session
+  registered with a control box falls back to the `lastSeenAt` window and shows its short session id.
 - **A remote hub's manager runs on the remote machine.** That is correct but currently unhelpful:
   the workspace CLI commands all pass `preferLocal`, so they target this laptop's hub.
 - **The remaining hub-backend domains are still in the monolith.** Boxes, projects, fleet ops and the
@@ -142,6 +156,69 @@ is provisioned, then assigns after: a job id where the create returns one (hub-r
 queued creates), a box id where it returns that instead (the inline docker path, and the cloud path
 via a new `onCreated` hook). Assignment failure after the box exists is a warning, never a failed
 create.
+
+## Phase 8 — managers are detected, not declared
+
+Before this phase a manager existed only when someone registered a workspace and started an agent in
+it through the hub. In practice the manager was already there: the claude or codex session in the
+user's terminal that runs `agentbox create` / `agentbox claude …`. Nobody wanted to declare a
+workspace first.
+
+**A manager is a host agent session**, many per workspace, of two kinds:
+
+- `external` — the user's own terminal process. The hub only observes it.
+- `hub` — started by the hub in a tmux session it owns (`agentbox-manager-<managerId>`), as before.
+
+When the CLI runs inside a session it sends that session's identity (`POST /api/v1/managers/detect`);
+the hub registers it and, if no workspace contains the session's folder, creates one there named after
+the folder. A session already registered stays in its workspace. An external manager whose process
+has ended is **resumable by the hub** (`POST /managers/:id/resume` → `claude --resume <id>` /
+`codex resume <id>` in the recorded `cwd`), after which it is `hub`-run — that is what turns "the
+session that made these boxes" into a manager any client can reopen.
+
+| agent | identity in the spawned shell | liveness handle |
+| --- | --- | --- |
+| claude | `CLAUDE_CODE_SESSION_ID` (+ `CLAUDECODE=1`) | `CLAUDE_PID` |
+| codex | `CODEX_THREAD_ID` | nearest ancestor process named `codex` (none inside its sandbox) |
+
+**Detection** (`apps/cli/src/lib/host-session.ts`) cross-checks claude's id against a transcript,
+walking up from the cwd so a command run in a subfolder records the folder the session was started in
+(where `--resume` finds it). Inside an Agent-tool subagent the id is the subagent's own and has no
+transcript; the fallback is the single session in that folder touched in the last five minutes, else
+nothing is sent. `AGENTBOX_MANAGER=<managerId>` is exported into a hub-run manager's shell, so its
+agent's own `agentbox` calls join that record instead of registering a second one. Inside a box
+(`AGENTBOX_RELAY_URL` set) nothing is detected. Registration is best-effort everywhere: a failure is a
+warning, never a failed create.
+
+**Store.** `managers.json` `{version:1, managers: ManagerRecord[]}` replaces `manager.json`, with the
+same locked temp+rename writes as `tasks.json`; exit codes move to `managers/<managerId>.exit`. A
+legacy `manager.json` is read once into a `hub` record — keeping its old tmux session name, so a
+session still running under it reads running — and then deleted. `status` is derived, never stored:
+tmux for `hub`; for `external` a `kill(pid, 0)` (ESRCH = stopped, EPERM = running) when the detect
+reported this host's name, else running while `lastSeenAt` is under 30 minutes old.
+
+**Boxes and tasks.** A manager keeps `boxIds` and `boxJobIds`, reconciled on read with the same rules
+as a task's assignment (job → box, a failed job dropped, a gone box dropped unless a create in flight
+recorded it). `POST /boxes` takes `managerId` and attaches the job; the agent commands, whose docker and
+cloud paths create inline, attach through the detect call itself (`boxId` / `boxJobId` on the body).
+`GET /boxes` stamps `Box.managerId`. `WorkTask.managerId` is set by `agentbox tasks add` inside a
+session and inherited from the box on assignment; `?managerId=` filters both task listings.
+`WorkspaceView.manager` became `managers: { running, total }`, and a workspace cannot be removed while
+any of its managers runs.
+
+**API.** The three `workspaces/:id/manager*` routes are gone. `GET /managers`
+(`?workspaceId=&status=`), `POST /managers/detect`, `GET|DELETE /managers/:id`,
+`POST /managers/:id/{stop,resume}`, and per workspace `GET /workspaces/:id/managers`,
+`POST …/managers/start` (a `sessionId` some manager holds resumes THAT manager) and
+`GET …/managers/sessions`. Resume answers 409 while the session still runs anywhere and 503 without
+tmux; stop answers 409 for a running external manager, whose process the hub never signals.
+
+**Backend.** `apps/hub/lib/backend/managers.ts` (`createManagerBackend(deps, { workspaceView })`),
+with `hostname` / `isPidAlive` seams on `BackendDeps` so the status matrix is testable anywhere.
+
+**CLI.** `agentbox manager list | status [id] | start | resume <id> | stop <id> | attach [id] |
+sessions | forget <id>`; `agentbox tasks list --manager <id> | --mine`. A `tasks` / `workspace` /
+`manager` command in a folder no workspace contains registers the session instead of failing.
 
 ## Files to touch (representative)
 
