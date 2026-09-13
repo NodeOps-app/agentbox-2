@@ -422,6 +422,46 @@ describe('the single-manager layout', () => {
   });
 });
 
+describe('session titles', () => {
+  it('never caches an untitled lookup, and retries a miss only after the TTL', async () => {
+    const h = harness();
+    let clock = 1_000_000;
+    let answer: string | null = '(untitled)';
+    const lookups: string[] = [];
+    const workspaces = createWorkspaceBackend(h.deps);
+    const managers = createManagerBackend(h.deps, {
+      workspaceView: (id) => workspaces.getWorkspace(id),
+      sessionTitle: async (_agent, _cwd, id) => {
+        lookups.push(id);
+        return answer;
+      },
+      now: () => clock,
+    });
+    const res = await managers.detectManager({
+      agent: 'codex',
+      sessionId: S2,
+      cwd: await makeFolder(),
+      host: 'laptop',
+    });
+    if (!res.ok) throw new Error(res.error);
+    expect(res.manager.title).toBeUndefined();
+    await managers.listManagers();
+    await managers.listManagers();
+    expect(lookups).toHaveLength(1);
+
+    answer = null;
+    clock += 10 * 60 * 1000 + 1;
+    expect((await managers.getManager(res.manager.id))?.title).toBeUndefined();
+    expect(lookups).toHaveLength(2);
+
+    answer = 'Fix the login redirect';
+    clock += 10 * 60 * 1000 + 1;
+    expect((await managers.listManagers())[0]?.title).toBe('Fix the login redirect');
+    await managers.listManagers();
+    expect(lookups).toHaveLength(3);
+  });
+});
+
 describe('box pointers', () => {
   it('attaches a create job and heals it to the box the worker recorded', async () => {
     const h = harness({

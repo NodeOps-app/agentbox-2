@@ -58,7 +58,8 @@ const SESSION_HEAD_BYTES = 256 * 1024;
 const SESSION_FIRST_LINE_MAX = 4 * 1024 * 1024;
 const SESSION_TITLE_MAX = 120;
 const SESSION_LIST_MAX = 50;
-const UNTITLED_SESSION = '(untitled)';
+/** What a listing shows for a session with no usable first turn yet. Never a title to keep. */
+export const UNTITLED_SESSION = '(untitled)';
 
 /**
  * Read at most this much of a session-title index. It is append-only, so the

@@ -31,6 +31,7 @@ import {
   stopManagerSession,
   tmuxAvailable,
   toManagerView,
+  UNTITLED_SESSION,
   upsertDetectedManager,
   usesLegacySession,
   RESUMABLE_MANAGER_AGENTS,
@@ -69,7 +70,16 @@ function messageOf(e: unknown): string {
 export interface ManagerBackendOptions {
   /** The workspace slice's view, so a detect answers with the same shape `GET /workspaces` does. */
   workspaceView(id: string): Promise<WorkspaceView | null>;
+  /** Seams for the title lookup and its retry clock; production reads the agent's store. */
+  sessionTitle?: typeof sessionTitle;
+  now?: () => number;
 }
+
+/**
+ * How long a session whose title could not be read is left alone. `GET /managers`
+ * is polled, and a codex lookup can scan hundreds of rollout files.
+ */
+const TITLE_RETRY_MS = 10 * 60 * 1000;
 
 export function createManagerBackend(
   deps: BackendDeps,
@@ -91,16 +101,39 @@ export function createManagerBackend(
     return rec.kind === 'hub' || rec.host === hostname();
   }
 
-  /** Cache the session's title on the record the first time it can be read. */
-  async function withTitle(rec: ManagerRecord): Promise<ManagerRecord> {
+  const lookupTitle = opts.sessionTitle ?? sessionTitle;
+  const now = opts.now ?? Date.now;
+  /** Failed lookups by manager id, in memory only: a miss is not a fact to persist. */
+  const titleMisses = new Map<string, { sessionId: string; at: number }>();
+
+  /**
+   * Cache the session's title on the record the first time a real one can be
+   * read. An untitled answer is not cached — the session may simply not have a
+   * first turn yet — and a miss is retried only after `TITLE_RETRY_MS`.
+   */
+  async function withTitle(raw: ManagerRecord): Promise<ManagerRecord> {
+    let rec = raw;
+    if (rec.title === UNTITLED_SESSION) {
+      // Written by an earlier build that cached it.
+      rec = { ...raw };
+      delete rec.title;
+    }
     if (rec.title || !rec.sessionId || !storeIsLocal(rec)) return rec;
-    const title = await sessionTitle(rec.agent, rec.cwd, rec.sessionId).catch(() => null);
-    if (!title) return rec;
     const sessionId = rec.sessionId;
+    const miss = titleMisses.get(rec.id);
+    if (miss && miss.sessionId === sessionId && now() - miss.at < TITLE_RETRY_MS) return rec;
+    const title = await lookupTitle(rec.agent, rec.cwd, sessionId).catch(() => null);
+    if (!title || title === UNTITLED_SESSION) {
+      titleMisses.set(rec.id, { sessionId, at: now() });
+      return rec;
+    }
+    titleMisses.delete(rec.id);
     // Guarded on the session id: a detect that moved the record to a new session
     // meanwhile must not get the old session's title written over it.
     await patchManager(rec.workspaceId, rec.id, (cur) =>
-      cur.sessionId === sessionId && !cur.title ? { ...cur, title } : cur,
+      cur.sessionId === sessionId && (!cur.title || cur.title === UNTITLED_SESSION)
+        ? { ...cur, title }
+        : cur,
     ).catch(() => null);
     return { ...rec, title };
   }
