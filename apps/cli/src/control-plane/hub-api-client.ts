@@ -162,6 +162,8 @@ export interface HubApiCreateBoxInput {
   setupWizard?: boolean;
   /** Box-shaping knobs (image, snapshot, limits, size/location, carry, ...). */
   opts?: Record<string, unknown>;
+  /** The manager session this create came from (`detectManager`). */
+  managerId?: string;
 }
 
 /**
@@ -427,7 +429,7 @@ export interface HubApiWorkspace {
   root: string;
   projectIds: string[];
   taskCounts?: { open: number; done: number };
-  manager?: { status: string; agent?: string } | null;
+  managers?: { running: number; total: number };
   createdAt: string;
   updatedAt: string;
 }
@@ -445,6 +447,7 @@ export interface HubApiTask {
   order: number;
   boxId?: string;
   boxJobId?: string;
+  managerId?: string;
   dependsOn?: string[];
   createdBy: 'human' | 'manager' | 'api';
   externalRef?: { kind: string; id: string; url?: string };
@@ -461,6 +464,7 @@ export interface HubApiTaskCreate {
   createdBy?: 'human' | 'manager' | 'api';
   boxId?: string;
   boxJobId?: string;
+  managerId?: string;
 }
 
 export interface HubApiTaskUpdate {
@@ -470,24 +474,55 @@ export interface HubApiTaskUpdate {
   /** `null` clears the project scope. */
   projectId?: string | null;
   dependsOn?: string[];
+  /** `null` clears the manager. */
+  managerId?: string | null;
 }
 
 /** A box that exists, or the create job that will become one. */
 export type HubApiAssignTarget = { boxId: string } | { boxJobId: string };
 
+/** A host agent session that creates and watches boxes (`GET /managers`). */
 export interface HubApiManager {
+  id: string;
   workspaceId: string;
-  status: 'running' | 'stopped' | 'never';
-  tmuxSession: string;
-  /** Ready-to-run tmux attach command for this manager's session. */
-  attachCommand: string;
-  agent?: string;
-  argv?: string[];
-  cwd?: string;
+  workspaceName: string;
+  agent: string;
+  /** `external`: a session in someone's terminal. `hub`: one the hub runs in tmux. */
+  kind: 'external' | 'hub';
+  status: 'running' | 'stopped';
+  cwd: string;
   sessionId?: string;
+  title?: string;
+  host?: string;
+  pid?: number;
+  tmuxSession?: string;
+  /** Ready-to-run tmux attach command; only for a running hub-run manager. */
+  attachCommand?: string;
+  boxIds: string[];
+  boxJobIds: string[];
+  taskCounts: { open: number; done: number };
+  createdAt: string;
+  lastSeenAt: string;
   startedAt?: string;
   stoppedAt?: string;
   lastExit?: number;
+}
+
+/** Body for `POST /managers/detect`. */
+export interface HubApiManagerDetect {
+  agent: string;
+  sessionId: string;
+  cwd: string;
+  pid?: number;
+  host?: string;
+  managerId?: string;
+  boxId?: string;
+  boxJobId?: string;
+}
+
+export interface HubApiManagerFilter {
+  workspaceId?: string;
+  status?: 'running' | 'stopped';
 }
 
 export interface HubApiManagerStart {
@@ -515,6 +550,7 @@ export interface HubApiTaskFilter {
   projectId?: string;
   boxId?: string;
   status?: HubApiTaskStatus;
+  managerId?: string;
 }
 
 export const SUPPORTED_HUB_API_VERSIONS = ['v1'] as const;
@@ -1186,31 +1222,58 @@ export class HubApiClient {
     return (await this.request<{ tasks: HubApiTask[] }>('POST', path, { ids })).tasks;
   }
 
-  getManager(wsId: string): Promise<HubApiManager> {
-    return this.request<HubApiManager>('GET', `/workspaces/${encodeURIComponent(wsId)}/manager`);
+  /** Register (or refresh) the host agent session this CLI runs inside. */
+  detectManager(
+    body: HubApiManagerDetect,
+  ): Promise<{ manager: HubApiManager; workspace: HubApiWorkspace }> {
+    return this.request('POST', '/managers/detect', body);
   }
 
-  /** Start the manager agent in a tmux session ON THE HUB'S machine. */
+  async listManagers(filter: HubApiManagerFilter = {}): Promise<HubApiManager[]> {
+    const q = new URLSearchParams();
+    if (filter.workspaceId) q.set('workspaceId', filter.workspaceId);
+    if (filter.status) q.set('status', filter.status);
+    const suffix = q.toString() ? `?${q.toString()}` : '';
+    return (await this.request<{ managers: HubApiManager[] }>('GET', `/managers${suffix}`))
+      .managers;
+  }
+
+  getManager(id: string): Promise<HubApiManager> {
+    return this.request<HubApiManager>('GET', `/managers/${encodeURIComponent(id)}`);
+  }
+
+  async listWorkspaceManagers(wsId: string): Promise<HubApiManager[]> {
+    const path = `/workspaces/${encodeURIComponent(wsId)}/managers`;
+    return (await this.request<{ managers: HubApiManager[] }>('GET', path)).managers;
+  }
+
+  /** Start a manager agent in a tmux session ON THE HUB'S machine. */
   startManager(wsId: string, body: HubApiManagerStart): Promise<HubApiManager> {
     return this.request<HubApiManager>(
       'POST',
-      `/workspaces/${encodeURIComponent(wsId)}/manager/start`,
+      `/workspaces/${encodeURIComponent(wsId)}/managers/start`,
       body,
     );
   }
 
-  stopManager(wsId: string): Promise<HubApiManager> {
-    return this.request<HubApiManager>(
-      'POST',
-      `/workspaces/${encodeURIComponent(wsId)}/manager/stop`,
-    );
+  /** Reopen a stopped manager's session in the hub's tmux. */
+  resumeManager(id: string): Promise<HubApiManager> {
+    return this.request<HubApiManager>('POST', `/managers/${encodeURIComponent(id)}/resume`);
+  }
+
+  stopManager(id: string): Promise<HubApiManager> {
+    return this.request<HubApiManager>('POST', `/managers/${encodeURIComponent(id)}/stop`);
+  }
+
+  async removeManager(id: string): Promise<void> {
+    await this.request<{ ok: true }>('DELETE', `/managers/${encodeURIComponent(id)}`);
   }
 
   listManagerSessions(wsId: string, agent?: string): Promise<HubApiManagerSessions> {
     const q = agent ? `?agent=${encodeURIComponent(agent)}` : '';
     return this.request<HubApiManagerSessions>(
       'GET',
-      `/workspaces/${encodeURIComponent(wsId)}/manager/sessions${q}`,
+      `/workspaces/${encodeURIComponent(wsId)}/managers/sessions${q}`,
     );
   }
 }
@@ -1222,6 +1285,7 @@ function taskQuery(filter: HubApiTaskFilter): string {
   if (filter.projectId) q.set('projectId', filter.projectId);
   if (filter.boxId) q.set('boxId', filter.boxId);
   if (filter.status) q.set('status', filter.status);
+  if (filter.managerId) q.set('managerId', filter.managerId);
   return q.toString();
 }
 

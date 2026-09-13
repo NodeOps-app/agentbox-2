@@ -9,7 +9,12 @@
 import { confirm, isCancel, log } from '@agentbox/cli-kit';
 import { Command } from 'commander';
 import { withHubClient } from '../control-plane/with-hub.js';
-import { resolveWorkspace, WorkspaceRefError } from '../lib/workspace-ref.js';
+import {
+  resolveWorkspace,
+  resolveWorkspaceAndManager,
+  WorkspaceRefError,
+} from '../lib/workspace-ref.js';
+import { detectHostSession } from '../lib/host-session.js';
 import { renderTable } from '../lib/text-table.js';
 import { parseTaskIds, TaskIdError } from '../lib/tasks-assign.js';
 import type {
@@ -26,8 +31,14 @@ interface WorkspaceOpt {
 }
 
 async function mustResolve(client: HubApiClient, ref?: string): Promise<HubApiWorkspace> {
+  return (
+    await mustResolveWith(() => resolveWorkspace(client, ref).then((workspace) => ({ workspace })))
+  ).workspace;
+}
+
+async function mustResolveWith<T>(fn: () => Promise<T>): Promise<T> {
   try {
-    return await resolveWorkspace(client, ref);
+    return await fn();
   } catch (err) {
     if (err instanceof WorkspaceRefError) {
       log.error(err.message);
@@ -106,6 +117,7 @@ const addCommand = new Command('add')
   .option('--depends-on <ids>', 'comma-separated task ids this one waits on')
   .option('--box <id>', 'assign it to a box right away')
   .option('--by-manager', 'record the manager agent as the author (default: human)')
+  .option('--no-manager', 'do not attach the task to the current agent session')
   .option('-j, --json', 'print the task as JSON')
   .action(
     async (
@@ -116,12 +128,18 @@ const addCommand = new Command('add')
         dependsOn?: string;
         box?: string;
         byManager?: boolean;
+        manager?: boolean;
         json?: boolean;
       },
     ) => {
       await withHubClient({ preferLocal: true }, async (client) => {
-        const ws = await mustResolve(client, opts.workspace);
+        // Inside a claude/codex session the task belongs to that session, and a
+        // folder with no workspace gets one — registering the session creates it.
+        const { workspace: ws, managerId } = await mustResolveWith(() =>
+          resolveWorkspaceAndManager(client, opts.workspace, { register: opts.manager !== false }),
+        );
         const task = await client.addTask(ws.id, {
+          ...(managerId && opts.manager !== false ? { managerId } : {}),
           title: title.join(' '),
           ...(opts.description ? { description: opts.description } : {}),
           ...(opts.project ? { projectId: opts.project } : {}),
@@ -142,6 +160,8 @@ const listCommand = new Command('list')
   .option('-p, --project <id>', 'only tasks scoped to this project')
   .option('--box <id>', 'only tasks assigned to this box')
   .option('--status <status>', `only this status (${STATUSES.join(' | ')})`)
+  .option('--manager <id>', 'only tasks belonging to this manager')
+  .option('--mine', 'only tasks belonging to the agent session running this command')
   .option('-a, --all', 'include done tasks (hidden by default)')
   .option('--by-box', 'group by box, the way the manager plans them')
   .option('-j, --json', 'print the listing as JSON')
@@ -151,6 +171,8 @@ const listCommand = new Command('list')
         project?: string;
         box?: string;
         status?: string;
+        manager?: string;
+        mine?: boolean;
         all?: boolean;
         byBox?: boolean;
         json?: boolean;
@@ -159,7 +181,24 @@ const listCommand = new Command('list')
       await withHubClient({ preferLocal: true }, async (client) => {
         const ws = await mustResolve(client, opts.workspace);
         const status = mustStatus(opts.status);
+        let managerId = opts.manager;
+        if (opts.mine) {
+          const hint = detectHostSession();
+          if (!hint) {
+            log.error('--mine needs to run inside a claude or codex session');
+            process.exit(2);
+          }
+          const mine = (await client.listManagers()).find(
+            (m) => m.agent === hint.agent && m.sessionId === hint.sessionId,
+          );
+          if (!mine) {
+            log.info('this session is not registered as a manager yet, so it has no tasks.');
+            return;
+          }
+          managerId = mine.id;
+        }
         const all = await client.listTasks(ws.id, {
+          ...(managerId ? { managerId } : {}),
           ...(opts.project ? { projectId: opts.project } : {}),
           ...(opts.box ? { boxId: opts.box } : {}),
           ...(status ? { status } : {}),
@@ -198,6 +237,7 @@ const showCommand = new Command('show')
       process.stdout.write(`  status   ${task.status}\n`);
       process.stdout.write(`  where    ${whereOf(task)}\n`);
       process.stdout.write(`  project  ${task.projectId ?? '-'}\n`);
+      if (task.managerId) process.stdout.write(`  manager  ${task.managerId}\n`);
       if (task.dependsOn?.length) process.stdout.write(`  after    ${task.dependsOn.join(', ')}\n`);
       if (task.description) process.stdout.write(`\n${task.description}\n`);
     });

@@ -1,17 +1,21 @@
 /**
- * `agentbox manager` — the coding agent that runs LOCALLY in a workspace folder,
- * reads the task list, groups tasks into boxes and watches them.
+ * `agentbox manager` — the host agent sessions that create and watch boxes.
  *
- * The hub owns the process: it starts the agent in a detached tmux session on its
- * own machine, so the CLI, the tray and a plain terminal all attach to the SAME
- * session instead of the hub proxying a terminal to each of them. That is why
- * `start`/`stop` go through the API while `attach` is a local `tmux attach`.
+ * A manager is usually not started here at all: it is the claude or codex
+ * session in your terminal, registered the first time it runs `agentbox`
+ * (`external`). The hub can also run one (`hub`) in a detached tmux session on
+ * its own machine, which the CLI, the tray and a plain terminal all attach to —
+ * and it can resume an external session that has ended, which is how "the
+ * session that made these boxes" becomes a manager any client can reopen.
+ * That is why `start`/`resume`/`stop` go through the API while `attach` is a
+ * local `tmux attach`.
  */
 import { spawnSync } from 'node:child_process';
-import { isCancel, log, select } from '@agentbox/cli-kit';
+import { confirm, isCancel, log, select } from '@agentbox/cli-kit';
 import { Command } from 'commander';
 import { withHubClient } from '../control-plane/with-hub.js';
 import { resolveWorkspace, WorkspaceRefError } from '../lib/workspace-ref.js';
+import { detectHostSession } from '../lib/host-session.js';
 import { renderTable } from '../lib/text-table.js';
 import { detectHostTerminal, spawnInNewTerminal } from '../terminal/host.js';
 import type {
@@ -38,6 +42,8 @@ interface WorkspaceOpt {
   workspace?: string;
 }
 
+class ManagerRefError extends Error {}
+
 async function mustResolve(client: HubApiClient, ref?: string): Promise<HubApiWorkspace> {
   try {
     return await resolveWorkspace(client, ref);
@@ -50,15 +56,82 @@ async function mustResolve(client: HubApiClient, ref?: string): Promise<HubApiWo
   }
 }
 
-function printManager(m: HubApiManager): void {
-  log.info(`manager: ${m.status}${m.agent ? ` (${m.agent})` : ''}`);
-  if (m.cwd) process.stdout.write(`  folder   ${m.cwd}\n`);
-  if (m.sessionId) process.stdout.write(`  session  ${m.sessionId}\n`);
-  if (m.startedAt) process.stdout.write(`  started  ${m.startedAt}\n`);
-  if (m.status === 'stopped' && m.lastExit !== undefined) {
-    process.stdout.write(`  exited   ${String(m.lastExit)}\n`);
+/** Pure: a manager by exact id, or by an unambiguous id prefix of at least 4 chars. */
+export function pickManager(managers: HubApiManager[], ref: string): HubApiManager {
+  const exact = managers.find((m) => m.id === ref);
+  if (exact) return exact;
+  const byPrefix = ref.length >= 4 ? managers.filter((m) => m.id.startsWith(ref)) : [];
+  if (byPrefix.length === 1) return byPrefix[0]!;
+  if (byPrefix.length > 1) {
+    throw new ManagerRefError(
+      `"${ref}" matches ${String(byPrefix.length)} managers; use more of the id`,
+    );
   }
-  if (m.status === 'running') process.stdout.write(`  attach   ${m.attachCommand}\n`);
+  throw new ManagerRefError(
+    `no manager matches "${ref}". List them with \`agentbox manager list\`.`,
+  );
+}
+
+async function mustManager(client: HubApiClient, ref: string): Promise<HubApiManager> {
+  try {
+    return pickManager(await client.listManagers(), ref);
+  } catch (err) {
+    if (err instanceof ManagerRefError) {
+      log.error(err.message);
+      process.exit(2);
+    }
+    throw err;
+  }
+}
+
+/** The manager this command is running inside, if it is registered. */
+async function currentManager(client: HubApiClient): Promise<HubApiManager | undefined> {
+  const hint = detectHostSession();
+  if (!hint) return undefined;
+  return (await client.listManagers()).find(
+    (m) => m.agent === hint.agent && m.sessionId === hint.sessionId,
+  );
+}
+
+function label(m: HubApiManager): string {
+  return m.title ?? (m.sessionId ? m.sessionId.slice(0, 8) : '(new session)');
+}
+
+function printManager(m: HubApiManager): void {
+  log.info(
+    `manager ${m.id}: ${m.status} (${m.agent}, ${m.kind === 'hub' ? 'hub-run' : 'external'})`,
+  );
+  process.stdout.write(`  workspace ${m.workspaceName}\n`);
+  process.stdout.write(`  folder    ${m.cwd}\n`);
+  if (m.title) process.stdout.write(`  title     ${m.title}\n`);
+  if (m.sessionId) process.stdout.write(`  session   ${m.sessionId}\n`);
+  if (m.pid !== undefined)
+    process.stdout.write(`  pid       ${String(m.pid)}${m.host ? ` on ${m.host}` : ''}\n`);
+  process.stdout.write(`  boxes     ${String(m.boxIds.length + m.boxJobIds.length)}\n`);
+  process.stdout.write(
+    `  tasks     ${String(m.taskCounts.open)} open, ${String(m.taskCounts.done)} done\n`,
+  );
+  process.stdout.write(`  seen      ${ago(m.lastSeenAt)}\n`);
+  if (m.status === 'stopped' && m.lastExit !== undefined) {
+    process.stdout.write(`  exited    ${String(m.lastExit)}\n`);
+  }
+  if (m.attachCommand) process.stdout.write(`  attach    ${m.attachCommand}\n`);
+}
+
+function renderManagers(managers: HubApiManager[]): void {
+  renderTable(
+    ['id', 'status', 'kind', 'agent', 'workspace', 'boxes', 'tasks', 'session'],
+    managers.map((m) => [
+      m.id,
+      m.status,
+      m.kind,
+      m.agent,
+      m.workspaceName,
+      String(m.boxIds.length + m.boxJobIds.length),
+      `${String(m.taskCounts.open)}/${String(m.taskCounts.open + m.taskCounts.done)}`,
+      label(m),
+    ]),
+  );
 }
 
 function ago(iso: string): string {
@@ -71,10 +144,10 @@ function ago(iso: string): string {
 /**
  * True when the hub this command is talking to runs on THIS machine.
  *
- * The manager's tmux session lives on the hub's host, so attaching to it is only
- * a local `tmux attach` when the hub is local. Against a control box the session
- * is on the VPS, and running tmux here would fail with a bare non-zero exit that
- * reads as a broken manager.
+ * A hub-run manager's tmux session lives on the hub's host, so attaching to it is
+ * only a local `tmux attach` when the hub is local. Against a control box the
+ * session is on the VPS, and running tmux here would fail with a bare non-zero
+ * exit that reads as a broken manager.
  */
 async function hubIsLocal(): Promise<boolean> {
   const { resolveHubTarget } = await import('./hub.js');
@@ -82,8 +155,14 @@ async function hubIsLocal(): Promise<boolean> {
   return target?.onThisMachine ?? true;
 }
 
-/** Attach to the manager's tmux session in this terminal (or a new pane). */
+/** Attach to a hub-run manager's tmux session in this terminal (or a new pane). */
 async function attachToSession(m: HubApiManager, openIn?: AttachOpenIn): Promise<boolean> {
+  if (m.kind !== 'hub' || !m.tmuxSession || !m.attachCommand) {
+    log.error(
+      `manager ${m.id} runs in a terminal of its own, not in a session the hub can attach to.`,
+    );
+    return false;
+  }
   if (!(await hubIsLocal())) {
     log.error(
       `the manager runs on the hub's machine, not this one. Reach its session there with:\n  ${m.attachCommand}`,
@@ -103,7 +182,7 @@ async function attachToSession(m: HubApiManager, openIn?: AttachOpenIn): Promise
       host,
       mode: openIn,
       argv: ['tmux', 'attach-session', '-t', target],
-      cwd: m.cwd ?? process.cwd(),
+      cwd: m.cwd,
       title: 'manager',
     });
     if (!spawned.launched) {
@@ -124,21 +203,74 @@ async function attachToSession(m: HubApiManager, openIn?: AttachOpenIn): Promise
   return true;
 }
 
+function mustAttachIn(value: string | undefined): AttachOpenIn | undefined {
+  if (value && !['split', 'window', 'tab'].includes(value)) {
+    log.error(`--attach-in must be one of split, window, tab`);
+    process.exit(4);
+  }
+  return value as AttachOpenIn | undefined;
+}
+
+const listCommand = new Command('list')
+  .alias('ls')
+  .description('List manager sessions: running first, then the most recently seen')
+  .option('-w, --workspace <ref>', 'only this workspace (id or path)')
+  .option('--running', 'only running managers')
+  .option('-j, --json', 'print the listing as JSON')
+  .action(async (opts: WorkspaceOpt & { running?: boolean; json?: boolean }) => {
+    await withHubClient({ preferLocal: true }, async (client) => {
+      const ws = opts.workspace ? await mustResolve(client, opts.workspace) : undefined;
+      const managers = await client.listManagers({
+        ...(ws ? { workspaceId: ws.id } : {}),
+        ...(opts.running ? { status: 'running' as const } : {}),
+      });
+      if (opts.json) {
+        process.stdout.write(JSON.stringify(managers, null, 2) + '\n');
+        return;
+      }
+      if (managers.length === 0) {
+        log.info(
+          'no managers yet. Run `agentbox create` or `agentbox tasks add` from a claude or codex session, or `agentbox manager start`.',
+        );
+        return;
+      }
+      renderManagers(managers);
+    });
+  });
+
 const statusCommand = new Command('status')
-  .description("Show the workspace manager's state")
+  .description("Show a manager's state (default: this session's, else the workspace's)")
+  .argument('[id]', 'manager id (or a unique prefix)')
   .option('-w, --workspace <ref>', 'workspace id or path (default: the one containing the cwd)')
   .option('-j, --json', 'print the state as JSON')
-  .action(async (opts: WorkspaceOpt & { json?: boolean }) => {
+  .action(async (id: string | undefined, opts: WorkspaceOpt & { json?: boolean }) => {
     await withHubClient({ preferLocal: true }, async (client) => {
+      const one = id
+        ? await mustManager(client, id)
+        : opts.workspace
+          ? undefined
+          : await currentManager(client);
+      if (one) {
+        if (opts.json) process.stdout.write(JSON.stringify(one, null, 2) + '\n');
+        else printManager(one);
+        return;
+      }
       const ws = await mustResolve(client, opts.workspace);
-      const manager = await client.getManager(ws.id);
-      if (opts.json) process.stdout.write(JSON.stringify(manager, null, 2) + '\n');
-      else printManager(manager);
+      const managers = await client.listWorkspaceManagers(ws.id);
+      if (opts.json) {
+        process.stdout.write(JSON.stringify(managers, null, 2) + '\n');
+        return;
+      }
+      if (managers.length === 0) {
+        log.info(`no managers in ${ws.name} yet.`);
+        return;
+      }
+      renderManagers(managers);
     });
   });
 
 const startCommand = new Command('start')
-  .description('Start the manager agent in the workspace folder')
+  .description('Start a manager agent in the workspace folder, in a tmux session the hub runs')
   .option('-w, --workspace <ref>', 'workspace id or path (default: the one containing the cwd)')
   .option('--agent <agent>', `which agent to run (${managerAgents().join(' | ')})`, 'claude')
   .option(
@@ -146,7 +278,7 @@ const startCommand = new Command('start')
     `resume this agent session (${RESUMABLE_MANAGER_AGENTS.join(' | ')} only)`,
   )
   .option('--new', 'start a fresh session without asking which to resume')
-  .option('--restart', 'replace a manager that is already running')
+  .option('--restart', 'with --session: restart the hub-run manager holding it if it is running')
   .option('--attach', 'attach to the session once it is up')
   .action(
     async (
@@ -200,36 +332,67 @@ const startCommand = new Command('start')
     },
   );
 
-const stopCommand = new Command('stop')
-  .description('Stop the manager agent')
-  .option('-w, --workspace <ref>', 'workspace id or path (default: the one containing the cwd)')
-  .action(async (opts: WorkspaceOpt) => {
+const resumeCommand = new Command('resume')
+  .description("Reopen a stopped manager's session in a tmux session the hub runs")
+  .argument('<id>', 'manager id (or a unique prefix)')
+  .option('--attach', 'attach to the session once it is up')
+  .option('--attach-in <mode>', 'with --attach: open in a new split | window | tab')
+  .action(async (id: string, opts: { attach?: boolean; attachIn?: string }) => {
+    const mode = mustAttachIn(opts.attachIn);
     await withHubClient({ preferLocal: true }, async (client) => {
-      const ws = await mustResolve(client, opts.workspace);
-      printManager(await client.stopManager(ws.id));
+      const target = await mustManager(client, id);
+      const manager = await client.resumeManager(target.id);
+      printManager(manager);
+      if (opts.attach && !(await attachToSession(manager, mode))) process.exit(1);
+    });
+  });
+
+const stopCommand = new Command('stop')
+  .description('Stop a hub-run manager (a session in your own terminal is yours to exit)')
+  .argument('<id>', 'manager id (or a unique prefix)')
+  .action(async (id: string) => {
+    await withHubClient({ preferLocal: true }, async (client) => {
+      const target = await mustManager(client, id);
+      printManager(await client.stopManager(target.id));
     });
   });
 
 const attachCommand = new Command('attach')
-  .description("Attach to the manager's terminal session")
+  .description("Attach to a hub-run manager's terminal session")
+  .argument('[id]', 'manager id (default: the one running hub-run manager in the workspace)')
   .option('-w, --workspace <ref>', 'workspace id or path (default: the one containing the cwd)')
   .option('--attach-in <mode>', 'open in a new split | window | tab instead of this terminal')
-  .action(async (opts: WorkspaceOpt & { attachIn?: string }) => {
+  .action(async (id: string | undefined, opts: WorkspaceOpt & { attachIn?: string }) => {
+    const mode = mustAttachIn(opts.attachIn);
     await withHubClient({ preferLocal: true }, async (client) => {
-      const ws = await mustResolve(client, opts.workspace);
-      const manager = await client.getManager(ws.id);
-      if (manager.status !== 'running') {
-        log.error(
-          manager.status === 'never'
-            ? `no manager for ${ws.name} yet. Start one with \`agentbox manager start\`.`
-            : `the manager for ${ws.name} is not running. Start it with \`agentbox manager start\`.`,
+      let manager: HubApiManager;
+      if (id) manager = await mustManager(client, id);
+      else {
+        const ws = await mustResolve(client, opts.workspace);
+        const running = (await client.listWorkspaceManagers(ws.id)).filter(
+          (m) => m.kind === 'hub' && m.status === 'running',
+        );
+        if (running.length !== 1) {
+          log.error(
+            running.length === 0
+              ? `no hub-run manager is running in ${ws.name}. Start one with \`agentbox manager start\`, or resume one with \`agentbox manager resume <id>\`.`
+              : `${String(running.length)} hub-run managers are running in ${ws.name}; pass an id (\`agentbox manager list\`).`,
+          );
+          process.exit(2);
+        }
+        manager = running[0]!;
+      }
+      if (manager.kind === 'external' && manager.status === 'running') {
+        log.info(
+          `manager ${manager.id} is running in your terminal${manager.pid !== undefined ? ` (pid ${String(manager.pid)})` : ''}; switch to that window.`,
         );
         process.exit(2);
       }
-      const mode = opts.attachIn as AttachOpenIn | undefined;
-      if (mode && !['split', 'window', 'tab'].includes(mode)) {
-        log.error(`--attach-in must be one of split, window, tab`);
-        process.exit(4);
+      if (manager.status !== 'running') {
+        log.error(
+          `manager ${manager.id} is not running. Resume it with \`agentbox manager resume ${manager.id} --attach\`.`,
+        );
+        process.exit(2);
       }
       if (!(await attachToSession(manager, mode))) process.exit(1);
     });
@@ -263,10 +426,39 @@ const sessionsCommand = new Command('sessions')
     });
   });
 
+const forgetCommand = new Command('forget')
+  .alias('rm')
+  .description('Forget a stopped manager (its boxes and tasks are untouched)')
+  .argument('<id>', 'manager id (or a unique prefix)')
+  .option('-y, --yes', 'skip the confirmation')
+  .action(async (id: string, opts: { yes?: boolean }) => {
+    await withHubClient({ preferLocal: true }, async (client) => {
+      const target = await mustManager(client, id);
+      if (!opts.yes) {
+        const answer = await confirm({
+          message: `Forget manager ${target.id} (${target.agent} · ${label(target)})?`,
+          initialValue: false,
+        });
+        if (isCancel(answer) || !answer) {
+          log.info('cancelled.');
+          return;
+        }
+      }
+      await client.removeManager(target.id);
+      log.success(`forgot ${target.id}`);
+    });
+  });
+
 export const managerCommand = new Command('manager')
-  .description('The agent that runs locally in a workspace and orchestrates its boxes')
-  .addCommand(statusCommand, { isDefault: true })
+  .alias('managers')
+  .description(
+    'Agent sessions that create and watch boxes: detected from your terminal, or run by the hub',
+  )
+  .addCommand(listCommand, { isDefault: true })
+  .addCommand(statusCommand)
   .addCommand(startCommand)
+  .addCommand(resumeCommand)
   .addCommand(stopCommand)
   .addCommand(attachCommand)
-  .addCommand(sessionsCommand);
+  .addCommand(sessionsCommand)
+  .addCommand(forgetCommand);

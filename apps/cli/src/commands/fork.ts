@@ -14,6 +14,7 @@ import { getRuntimeProviderNames } from '../provider/loaders.js';
 import { agentIds, resolveAgentSpec } from '@agentbox/sandbox-core';
 import type { AgentId } from '@agentbox/core';
 import { agentCommandEntry } from '../agents/commands.js';
+import { detectAgentFromEnv, RECENT_SESSION_MS } from '../lib/host-session.js';
 
 /** Agents `--agent` accepts — the registry, so a new agent is forkable at once. */
 const FORK_AGENTS: readonly AgentId[] = agentIds();
@@ -48,20 +49,6 @@ export function resolveForkProvider(
   return provider || undefined;
 }
 
-/** Identity env vars each agent exports into the shell of the commands it runs,
- *  so a bare `agentbox fork` (no --agent) can tell which agent launched it:
- *  - claude: CLAUDECODE=1 and CLAUDE_CODE_SESSION_ID=<session uuid>.
- *  - codex: CODEX_THREAD_ID=<session uuid> (the id `codex resume` expects).
- *  Returns undefined when neither is present (caller falls back to claude).
- *  Exported for unit testing — keep it pure (env in, agent out, no fs). */
-export function detectAgentFromEnv(env: NodeJS.ProcessEnv = process.env): AgentId | undefined {
-  if (env.CLAUDECODE === '1' || (env.CLAUDE_CODE_SESSION_ID ?? '').trim().length > 0) {
-    return 'claude';
-  }
-  if ((env.CODEX_THREAD_ID ?? '').trim().length > 0) return 'codex';
-  return undefined;
-}
-
 /**
  * The create-style command each agent forks through. fork forwards a curated
  * argv and lets the delegate run its own create+teleport+attach pipeline
@@ -94,10 +81,6 @@ interface ForkOptions {
 /** fork's attach modes: claude's split|window|tab|same plus `background`
  *  (never attach — always leave Claude running in the box). */
 const FORK_ATTACH_VALUES = ['window', 'tab', 'split', 'background', 'same'] as const;
-
-/** Two host JSONLs both touched inside this window means we can't safely guess
- *  which Claude window the user meant — they must pass --session. */
-const RECENT_SESSION_MS = 5 * 60 * 1000;
 
 /** Session args fork forwards to the delegate command, per agent:
  *  - claude: `--resume <id>` when given; else `--continue`, but refuse first if

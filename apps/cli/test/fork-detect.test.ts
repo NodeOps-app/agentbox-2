@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { detectAgentFromEnv, resolveForkProvider } from '../src/commands/fork.js';
+import { resolveForkProvider } from '../src/commands/fork.js';
+import { detectAgentFromEnv } from '../src/lib/host-session.js';
 
 // Pure env-in/agent-out. No HOME/fs access (apps/cli tests have no HOME
 // isolation, so this suite must never touch the filesystem).
@@ -27,7 +28,9 @@ describe('detectAgentFromEnv', () => {
   });
 
   it('ignores blank/whitespace env values', () => {
-    expect(detectAgentFromEnv({ CLAUDE_CODE_SESSION_ID: '  ', CODEX_THREAD_ID: '' })).toBeUndefined();
+    expect(
+      detectAgentFromEnv({ CLAUDE_CODE_SESSION_ID: '  ', CODEX_THREAD_ID: '' }),
+    ).toBeUndefined();
   });
 });
 

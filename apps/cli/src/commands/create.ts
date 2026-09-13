@@ -54,6 +54,7 @@ import {
   stageRestoreWorkspace,
   type RestoreRequest,
 } from './_restore.js';
+import { registerCurrentSession } from '../lib/host-session.js';
 
 interface CreateOptions {
   workspace: string;
@@ -254,7 +255,9 @@ async function runCreateViaHubApi(
     ...(opts.credentialSync === false ? { credentialSync: false } : {}),
   };
   const outcome = await withHubClient({ url: opts.url }, async (client) => {
+    const manager = await registerCurrentSession(client);
     const { jobId } = await client.createBox({
+      ...(manager ? { managerId: manager.managerId } : {}),
       repoUrl: target.repoUrl,
       provider: providerSpecFor(providerName, remoteHost),
       agent: 'none',
@@ -791,7 +794,10 @@ export const createCommand = new Command('create')
       // nothing, not leave a box nobody wanted.
       const taskWorkspace =
         taskIds.length > 0 ? await preflightOrExit(client, projectRoot, taskIds) : null;
+      // Inside a claude/codex session the box groups under that session.
+      const manager = await registerCurrentSession(client);
       const { jobId } = await client.createBox({
+        ...(manager ? { managerId: manager.managerId } : {}),
         projectId: hashProjectPath(projectRoot),
         provider: opts.provider ?? providerName,
         agent: 'none',

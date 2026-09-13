@@ -1,6 +1,6 @@
 /**
  * `agentbox workspace` — register and inspect workspaces: a host folder grouping
- * one or more projects, owning a task list and a manager agent.
+ * one or more projects, owning a task list and its manager sessions.
  *
  * A thin client over the hub's `/api/v1/workspaces`. `preferLocal` throughout:
  * the folder is on a machine, and the one the user means is theirs.
@@ -39,9 +39,11 @@ function printWorkspace(ws: HubApiWorkspace): void {
       `  tasks     ${String(ws.taskCounts.open)} open, ${String(ws.taskCounts.done)} done\n`,
     );
   }
-  process.stdout.write(
-    `  manager   ${ws.manager ? `${ws.manager.status}${ws.manager.agent ? ` (${ws.manager.agent})` : ''}` : 'not started'}\n`,
-  );
+  if (ws.managers) {
+    process.stdout.write(
+      `  managers  ${String(ws.managers.running)} running, ${String(ws.managers.total)} total\n`,
+    );
+  }
 }
 
 const addCommand = new Command('add')
@@ -83,7 +85,7 @@ const listCommand = new Command('list')
         return;
       }
       renderTable(
-        ['id', 'name', 'projects', 'tasks', 'manager', 'root'],
+        ['id', 'name', 'projects', 'tasks', 'managers', 'root'],
         workspaces.map((w) => [
           w.id,
           w.name,
@@ -91,7 +93,7 @@ const listCommand = new Command('list')
           w.taskCounts
             ? `${String(w.taskCounts.open)}/${String(w.taskCounts.open + w.taskCounts.done)}`
             : '-',
-          w.manager?.status ?? '-',
+          w.managers ? `${String(w.managers.running)}/${String(w.managers.total)}` : '-',
           w.root,
         ]),
       );

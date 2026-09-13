@@ -383,20 +383,34 @@ describe('HubApiClient workspaces', () => {
 
   it('drives the manager routes', async () => {
     const { fetchImpl, calls } = stub({
-      'POST /api/v1/workspaces/w1/manager/start': { status: 200, body: { status: 'running' } },
-      'POST /api/v1/workspaces/w1/manager/stop': { status: 200, body: { status: 'stopped' } },
-      'GET /api/v1/workspaces/w1/manager/sessions': {
+      'POST /api/v1/managers/detect': {
+        status: 201,
+        body: { manager: { id: 'm1' }, workspace: {} },
+      },
+      'GET /api/v1/managers': { status: 200, body: { managers: [] } },
+      'POST /api/v1/workspaces/w1/managers/start': { status: 200, body: { status: 'running' } },
+      'POST /api/v1/managers/m1/resume': { status: 200, body: { status: 'running' } },
+      'POST /api/v1/managers/m1/stop': { status: 200, body: { status: 'stopped' } },
+      'DELETE /api/v1/managers/m1': { status: 200, body: { ok: true } },
+      'GET /api/v1/workspaces/w1/managers/sessions': {
         status: 200,
         body: { agent: 'claude', supported: true, sessions: [] },
       },
     });
     const client = new HubApiClient(target(fetchImpl));
+    const detected = await client.detectManager({ agent: 'claude', sessionId: 's1', cwd: '/w' });
+    expect(detected.manager.id).toBe('m1');
+    expect(calls[0]?.body).toEqual({ agent: 'claude', sessionId: 's1', cwd: '/w' });
+    await client.listManagers({ workspaceId: 'w1', status: 'running' });
+    expect(calls[1]?.url).toBe('https://hub.example/api/v1/managers?workspaceId=w1&status=running');
     await client.startManager('w1', { agent: 'claude', sessionId: 's1' });
-    expect(calls[0]?.body).toEqual({ agent: 'claude', sessionId: 's1' });
-    await client.stopManager('w1');
+    expect(calls[2]?.body).toEqual({ agent: 'claude', sessionId: 's1' });
+    await client.resumeManager('m1');
+    await client.stopManager('m1');
+    await client.removeManager('m1');
     await client.listManagerSessions('w1', 'codex');
-    expect(calls[2]?.url).toBe(
-      'https://hub.example/api/v1/workspaces/w1/manager/sessions?agent=codex',
+    expect(calls[6]?.url).toBe(
+      'https://hub.example/api/v1/workspaces/w1/managers/sessions?agent=codex',
     );
   });
 

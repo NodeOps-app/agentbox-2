@@ -79,6 +79,7 @@ import { isolateOptionKey, type AgentCreateOptions } from './options.js';
 import { RESUME_SEED } from '@agentbox/cli-kit';
 import type { AgentCliSpec, AgentCreateContext, AgentPreflight } from '@agentbox/cli-kit';
 import { makeHostServices } from './host-services.js';
+import { detectHostSession, registerHostManager } from '../../lib/host-session.js';
 
 /** Config overrides the create flags produce; the per-agent keys are delegated. */
 function buildCliOverrides(a: AgentCliSpec, opts: AgentCreateOptions): Partial<UserConfig> {
@@ -227,8 +228,20 @@ export async function runAgentCreate(
       )) ?? null;
     if (!taskWorkspaceId) process.exit(process.exitCode || 1);
   }
-  /** Assign `--tasks` to whatever the create produced. Never fails the create. */
-  const assignTasks = async (target: { boxId: string } | { boxJobId: string }): Promise<void> => {
+  // Inside a claude/codex session, whatever this create produces groups under
+  // that session. Detected once, up front: the env it reads does not change.
+  const sessionHint = detectHostSession();
+  /**
+   * Record what the create produced: under the current session's manager, then
+   * against `--tasks` (in that order, so the tasks inherit the manager). Never
+   * fails the create.
+   */
+  const recordCreate = async (target: { boxId: string } | { boxJobId: string }): Promise<void> => {
+    if (sessionHint) {
+      await withHubClient({ preferLocal: true }, (client) =>
+        registerHostManager(client, sessionHint, target),
+      );
+    }
     if (!taskWorkspaceId) return;
     await withHubClient({ preferLocal: true }, (client) =>
       assignTasksBestEffort(client, taskWorkspaceId!, taskIds, target),
@@ -422,7 +435,7 @@ export async function runAgentCreate(
             1,
           );
         }
-        if (res.boxId) await assignTasks({ boxId: res.boxId });
+        if (res.boxId) await recordCreate({ boxId: res.boxId });
         outro(`${a.id} is running on the control plane: box ${res.boxId ?? '(id pending)'}`);
         cmdLog.close();
         return;
@@ -468,7 +481,7 @@ export async function runAgentCreate(
       maxWorkingOverride,
       openTerminal: captureOpenTerminalContext(cfg.queue.openIn),
     });
-    await assignTasks({ boxJobId: result.job.id });
+    await recordCreate({ boxJobId: result.job.id });
     outro(
       `job ${result.job.id} queued (${String(result.runningCount)}/${String(result.maxConcurrent)} running); log: ${result.job.logPath}`,
     );
@@ -662,7 +675,7 @@ export async function runAgentCreate(
         { verbose: opts.verbose === true },
       );
       if (adopted) {
-        await assignTasks({ boxId: adopted.id });
+        await recordCreate({ boxId: adopted.id });
         await cloudAgentAttach({
           box: adopted,
           binary: a.spec.binary,
@@ -721,7 +734,7 @@ export async function runAgentCreate(
       binary: a.spec.binary,
       sessionName,
       mode: a.id,
-      onCreated: (box) => assignTasks({ boxId: box.id }),
+      onCreated: (box) => recordCreate({ boxId: box.id }),
       hasSeedPrompt: seedOwnsFirstTurn,
       extraArgs: effectiveArgs,
       verbose: opts.verbose === true,
@@ -801,7 +814,7 @@ export async function runAgentCreate(
       },
     });
     containerName = result.record.container;
-    await assignTasks({ boxId: result.record.id });
+    await recordCreate({ boxId: result.record.id });
 
     // The agent is baked into the current base image, but a box built from a
     // checkpoint captured before that agent's support won't have it — install it
