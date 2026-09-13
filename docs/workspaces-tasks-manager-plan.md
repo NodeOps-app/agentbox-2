@@ -71,7 +71,7 @@ the manager's own instructions come after.
   against `~/.claude/projects/<encoded-root>/<id>.jsonl`, and the SUBCOMMAND `codex resume <id>`
   against the flat `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` store, which records the folder
   inside each file rather than in its path. The remaining agents' on-disk formats are unverified, so
-  `GET …/manager/sessions` answers `supported: false` for them and a `sessionId` is refused rather
+  `GET …/managers/sessions` answers `supported: false` for them and a `sessionId` is refused rather
   than silently starting a fresh agent that looks resumed.
 - **opencode and pi are never detected as managers.** Neither exports a session id into the commands
   it runs, so a create from inside one registers nothing and its boxes land in "Other boxes".
@@ -132,7 +132,7 @@ absence means "no data", never "zero":
 - `Box.tasks` — `{ total, done, current }`, matched by box id and by pending create-job id (so a
   synthetic `job:<id>` row shows its tasks while the box is still being built).
 
-`POST …/manager/start` takes its accept-list from the live agent registry, minus the agents whose
+`POST …/managers/start` (then `…/manager/start`) takes its accept-list from the live agent registry, minus the agents whose
 `surface` is `service` and those the host reports as not installed. Anything a picker offers can
 therefore be a manager, including one added by `agentbox agent add`, while a daemon-shaped agent is
 refused (it has no session to attach to, so it would leave a tmux session nobody can use) and so is

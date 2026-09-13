@@ -76,7 +76,7 @@ export const HELP_GROUPS: HelpGroup[] = [
 export const SHORT_DESCRIPTIONS: Record<string, string> = {
   workspace: 'Register a folder grouping several projects, with its own task list',
   tasks: 'Units of work in a workspace, assigned to boxes (not agentbox.yaml tasks)',
-  manager: 'Run an agent locally over a workspace to plan and drive its boxes',
+  manager: 'Agent sessions that create and watch boxes: detected, or run by the hub',
   create: 'Create and start a new agent box (no agent launched)',
   claude: 'Create a box and launch Claude Code (detachable tmux session)',
   codex: 'Create a box and launch OpenAI Codex (detachable tmux session)',
