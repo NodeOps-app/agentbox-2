@@ -60,21 +60,32 @@ export function assignLanes(
     if (lane && !baseOf.has(lane)) baseOf.set(lane, item.base!);
   }
 
-  /** Branch → the lane that last carried it. */
-  const carrier = new Map<string, string>();
-  // A branch first met as a fork or merge base that no lane carried is the
-  // trunk's (`main`): a box that later checks it out must not take it over, or
-  // every later fork and merge would hang off that box.
+  // The trunk's branches (`main`): every fork or merge base that is not some
+  // box's own branch. Known before the walk, so a box that checks one out never
+  // carries it, or every later fork and merge would hang off that box.
+  const boxBranches = new Set<string>();
+  for (const item of items) {
+    if ((item.type === 'box.created' || item.type === 'box.ready') && item.branch) {
+      boxBranches.add(item.branch);
+    }
+  }
   const trunkBranches = new Set<string>();
+  for (const item of items) {
+    for (const base of [item.type === 'box.branch' ? undefined : item.base, item.pr?.base]) {
+      if (base && !boxBranches.has(base)) trunkBranches.add(base);
+    }
+  }
+
+  /** Branch → the lane that last carried it; never a trunk branch. */
+  const carrier = new Map<string, string>();
   /** Lane → its current branch label; a lane is known once it has a row. */
   const labels = new Map<string, string | undefined>();
 
+  const carrierOf = (branch: string | undefined): string | undefined =>
+    branch && !trunkBranches.has(branch) ? carrier.get(branch) : undefined;
   const laneOn = (branch: string | undefined, self: string): string => {
-    if (!branch) return TRUNK;
-    const lane = carrier.get(branch);
-    if (lane && lane !== self && lane.startsWith('box:')) return lane;
-    if (!lane) trunkBranches.add(branch);
-    return TRUNK;
+    const lane = carrierOf(branch);
+    return lane && lane !== self && lane.startsWith('box:') ? lane : TRUNK;
   };
   const laneIdOf = (row: Row): string => {
     const box = boxLaneOf(row);
@@ -96,7 +107,10 @@ export function assignLanes(
     const branch = branchOf(row);
     if (branch && branch !== labels.get(id)) lane.branch = branch;
     labels.set(id, branch ?? labels.get(id));
-    if (row.type === 'pr.merged') lane.into = laneOn(row.pr?.base, id);
+    // A PR merged back into the lane's own earlier branch never leaves the lane.
+    if (row.type === 'pr.merged' && carrierOf(row.pr?.base) !== id) {
+      lane.into = laneOn(row.pr?.base, id);
+    }
     if (branch && !trunkBranches.has(branch)) carrier.set(branch, id);
     return lane;
   };

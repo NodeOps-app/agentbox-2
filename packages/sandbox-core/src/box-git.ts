@@ -52,6 +52,20 @@ export function boxGitCheckout(
 }
 
 /**
+ * The branch the box's worktree is on; undefined when HEAD is detached (a
+ * checkout of a SHA, a tag or a remote ref) or the exec fails.
+ */
+export async function boxGitCurrentBranch(
+  provider: Provider,
+  box: BoxRecord,
+): Promise<string | undefined> {
+  const r = await run(provider, box, ['git', 'symbolic-ref', '--quiet', '--short', 'HEAD']).catch(
+    () => undefined,
+  );
+  return r?.exitCode === 0 ? r.stdout.trim() || undefined : undefined;
+}
+
+/**
  * `git checkout -b agentbox/<name> [from]` — create AND switch onto a fresh
  * scratch branch (from HEAD by default, or the given base ref). Local to the
  * worktree; for docker the branch lands in the bind-mounted host `.git/`

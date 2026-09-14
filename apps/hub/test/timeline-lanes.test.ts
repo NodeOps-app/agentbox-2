@@ -137,6 +137,32 @@ describe('assignLanes', () => {
     expect(merged.lane?.into).toBe('trunk');
   });
 
+  it('keeps main on the trunk when a box checks it out before any base names it', () => {
+    const a = boxCreate('a', 'j1');
+    const onMain = ev({ type: 'box.branch', boxId: 'a', branch: 'main', base: 'agentbox/a' });
+    const pushMain = ev({ type: 'git.push', boxId: 'a', branch: 'main' });
+    const b = boxCreate('b', 'j2', 'main');
+    const merged = ev({ type: 'pr.merged', boxId: 'b', pr: pr(5, 'agentbox/b') });
+    const hostPr = ev({ type: 'pr.opened', actor: 'github', pr: pr(6, 'main', 'release') });
+    lanes([...a, onMain, pushMain, ...b, merged, hostPr]);
+    expect(b[0].lane?.from).toBe('trunk');
+    expect(merged.lane?.into).toBe('trunk');
+    expect(hostPr.lane?.id).toBe('branch:main');
+  });
+
+  it('draws no merge for a PR merged back into the lane its own earlier branch', () => {
+    const a = boxCreate('a', 'j1', 'main');
+    const sub = ev({
+      type: 'box.branch',
+      boxId: 'a',
+      branch: 'agentbox/a-sub',
+      base: 'agentbox/a',
+    });
+    const merged = ev({ type: 'pr.merged', boxId: 'a', pr: pr(9, 'agentbox/a-sub', 'agentbox/a') });
+    lanes([...a, sub, merged]);
+    expect(merged.lane).toEqual({ id: 'box:a', kind: 'box' });
+  });
+
   it('gives a box-less host PR a branch lane', () => {
     const opened = ev({ type: 'pr.opened', actor: 'github', pr: pr(7, 'chore/stripe-node-17') });
     const merged = ev({ type: 'pr.merged', actor: 'github', pr: pr(7, 'chore/stripe-node-17') });

@@ -435,7 +435,7 @@ draws them.
 | --- | --- |
 | `base` on `box.created` | the hub's create: `fromBranch`, else the branch the project's host checkout is on (`git symbolic-ref --short HEAD`, 1 s, through `BackendDeps.projectBranch`). Absent on a detached HEAD or any failure; never fails the create |
 | `base` on `box.ready` | the queue worker, from the job's `createOpts.fromBranch` when it has one |
-| `box.branch` `{boxId, boxName, branch, base?}` | `withBoxTimeline` around `gitCheckout` and `gitNewBranch`, after success. `branch` is the new branch, `base` the one the box left. No dedupe key |
+| `box.branch` `{boxId, boxName, branch, base?}` | `withBoxTimeline` around `gitCheckout` and `gitNewBranch`, when the box ends up on another branch. The route sanctions the branch `git symbolic-ref` names after the op, and the row takes it from the re-read record: a checkout with `args` (paths) records and sanctions nothing, and one that detaches HEAD (a SHA, a tag, `origin/foo`) sanctions nothing, so it writes no row. `base` is the branch the box left. No dedupe key |
 
 The relay has no in-box checkout RPC. A switch made inside the box shows only when a later push or PR
 names the new head.
@@ -462,8 +462,10 @@ every item and live row:
   live row exists, or the box still exists and either is running or its last work was not a merge or
   a close (start and stop rows don't count as work).
 
-A branch first met as a base that no lane carried (`main`) stays the trunk's. A box that later checks
-it out does not take it over, so later forks and merges don't hang off that box.
+Trunk branches are known before the walk: every `base` and `pr.base` that is not some box's own
+`box.created`/`box.ready` branch (`main`). No box ever carries one, so a box that checks out `main`
+does not become the parent of later forks and merges. A PR merged back into its lane's own earlier
+branch has no `into`.
 
 **Known gaps.**
 - A multi-repo workspace shares one trunk.

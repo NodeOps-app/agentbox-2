@@ -2,6 +2,7 @@ import type { BoxRecord, ExecResult, GitRpcParams, Provider } from '@agentbox/co
 import { describe, expect, it } from 'vitest';
 import {
   boxGitCheckout,
+  boxGitCurrentBranch,
   boxGitNewBranch,
   boxGitPull,
   boxGitPush,
@@ -31,6 +32,33 @@ describe('scratchBranchName', () => {
     expect(scratchBranchName('feature')).toBe('agentbox/feature');
     expect(scratchBranchName('agentbox/feature')).toBe('agentbox/feature');
     expect(scratchBranchName('  spaced  ')).toBe('agentbox/spaced');
+  });
+});
+
+describe('boxGitCurrentBranch', () => {
+  function answering(r: ExecResult | Error): Provider {
+    return {
+      exec: () => (r instanceof Error ? Promise.reject(r) : Promise.resolve(r)),
+    } as unknown as Provider;
+  }
+
+  it('names the branch HEAD is on, and nothing when detached or the exec fails', async () => {
+    expect(
+      await boxGitCurrentBranch(answering({ exitCode: 0, stdout: 'feat/x\n', stderr: '' }), box),
+    ).toBe('feat/x');
+    expect(
+      await boxGitCurrentBranch(
+        answering({ exitCode: 1, stdout: '', stderr: 'fatal: ref HEAD is not a symbolic ref' }),
+        box,
+      ),
+    ).toBeUndefined();
+    expect(await boxGitCurrentBranch(answering(new Error('box gone')), box)).toBeUndefined();
+  });
+
+  it('asks git for the symbolic ref in the workspace', async () => {
+    const { provider, calls } = recorder();
+    await boxGitCurrentBranch(provider, box);
+    expect(calls[0]).toEqual(['git', 'symbolic-ref', '--quiet', '--short', 'HEAD']);
   });
 });
 

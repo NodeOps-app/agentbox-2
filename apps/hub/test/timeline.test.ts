@@ -1062,7 +1062,7 @@ describe('branch graph', () => {
     expect(asked).toEqual([projectId]);
   });
 
-  it('writes box.branch after a checkout or a new branch, and nothing when it fails', async () => {
+  it('writes box.branch for a switch the hub sanctioned, and nothing for paths, a detached HEAD or a failure', async () => {
     const h = harness();
     const { workspaces, managers } = backends(h);
     const root = await folder();
@@ -1078,15 +1078,36 @@ describe('branch graph', () => {
     };
     h.boxes.push(box);
     const seams = { deps: h.deps, stampFor: managers.timelineStamp };
+    // What the real routes persist: the branch HEAD names after the op, none when detached.
+    const sanction = (branch: string) => {
+      box.branches = [branch, 'agentbox/box-one'];
+    };
+    const calls: string[][] = [];
+    const hub = withBoxTimeline(
+      {
+        ...branchHub(),
+        gitCheckout: async (_id: string, branch: string, args?: string[]) => {
+          calls.push([branch, ...(args ?? [])]);
+          if (!args?.length && !/^[0-9a-f]{7,40}$/u.test(branch)) sanction(branch);
+          return { ok: true as const };
+        },
+        gitNewBranch: async (_id: string, input: { name: string }) => {
+          sanction(scratchBranchName(input.name));
+          return { ok: true as const };
+        },
+      } as unknown as HubBackend,
+      seams,
+    );
     await withBoxTimeline(branchHub(false), seams).gitCheckout('box1', 'feat/nope');
+    await hub.gitCheckout('box1', 'main', ['--', 'src/x.ts']);
+    await hub.gitCheckout('box1', 'abc1234');
     await backgroundSettled();
-    const hub = withBoxTimeline(branchHub(), seams);
     await hub.gitCheckout('box1', 'feat/x');
     await backgroundSettled();
-    box.branches = ['feat/x', 'agentbox/box-one'];
     await hub.gitNewBranch('box1', { name: 'retry' });
     await backgroundSettled();
 
+    expect(calls).toEqual([['main', '--', 'src/x.ts'], ['abc1234'], ['feat/x']]);
     const rows = (await readTimeline(added.workspace.id)).filter((e) => e.type === 'box.branch');
     expect(rows).toHaveLength(2);
     expect(rows.find((e) => e.branch === 'feat/x')).toMatchObject({

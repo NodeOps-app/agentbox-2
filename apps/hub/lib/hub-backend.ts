@@ -81,6 +81,7 @@ import {
   BOX_WORKSPACE,
   autoWriteSshConfig,
   boxGitCheckout,
+  boxGitCurrentBranch,
   boxGitNewBranch,
   boxGitPull,
   boxGitPush,
@@ -3006,7 +3007,12 @@ export function createHubBackend(handle: RelayServerHandle): HubBackend {
         id,
         async (box, provider) => {
           const r = await boxGitCheckout(provider, box, branch, args);
-          if (r.exitCode === 0) await sanctionBranch(box, branch);
+          // Only a real switch: a checkout with args restores paths, and a SHA,
+          // tag or remote ref leaves HEAD detached on no branch to push.
+          if (r.exitCode === 0 && !args?.length) {
+            const head = await boxGitCurrentBranch(provider, box);
+            if (head) await sanctionBranch(box, head);
+          }
           return r;
         },
         hydrate,

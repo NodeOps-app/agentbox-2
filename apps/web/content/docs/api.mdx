@@ -249,8 +249,10 @@ base?, projectId?, taskIds?, task?, pr?, text?, noteKind?, boxRunning?, addition
 removed`, `manager.joined | started | resumed | stopped | note | message`, `box.created | ready |
 failed | started | stopped | destroyed | branch`, `git.push`, and `pr.opened | ready | merged | closed`.
 `base` on `box.created` is the branch the box forked from: the create's `fromBranch`, else the branch the
-project's checkout was on (absent on a detached HEAD). `box.branch` is written after a successful
-`git/checkout` or `git/branch` on the box, with `branch` the new branch and `base` the one it left. A
+project's checkout was on (absent on a detached HEAD). `box.branch` is written when a
+`git/checkout` or `git/branch` moves the box onto another branch, with `branch` the branch it is now on
+and `base` the one it left; a checkout with `args` (paths) or one that leaves HEAD detached writes
+none. `box.ready` carries `base` only when the create named a `fromBranch`. A
 `git.push` carries `additions`/`deletions` when the hub could read them from the host repo: from the
 old tip to the new one, or from the merge base with the default branch for a first push.
 `taskIds` is captured when the event is written, and `pr` is `{ repo, number, title, url, base, head,

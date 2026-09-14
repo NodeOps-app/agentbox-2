@@ -87,6 +87,7 @@ export {
 export {
   BOX_WORKSPACE,
   boxGitCheckout,
+  boxGitCurrentBranch,
   boxGitNewBranch,
   boxGitPull,
   boxGitPush,

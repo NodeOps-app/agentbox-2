@@ -25,7 +25,6 @@ import {
   type TimelineStamp,
   type WorkTask,
 } from '@agentbox/relay';
-import { scratchBranchName } from '@agentbox/sandbox-core';
 import { inBackground } from './background';
 import { reconcileContext, type BackendDeps, type DiffStat, type TimelineBoxFact } from './deps';
 import { createGithubPrSync, type GithubPrSync } from './github-prs';
@@ -506,20 +505,26 @@ export function withBoxTimeline(hub: HubBackend, seams: BoxTimelineSeams): HubBa
     type: TimelineEvent['type'],
     meta: TimelineMeta | undefined,
     op: () => Promise<R>,
-    { push, branch }: { push?: PushTarget; branch?: string } = {},
+    { push, branchSwitch = false }: { push?: PushTarget; branchSwitch?: boolean } = {},
   ): Promise<R> {
     // A destroyed box has no record left to name it by, a push moves the ref
     // its diff is measured from, and a branch switch replaces the branch it
     // switches away from, so all three are read first. A push still reads the
     // fact again afterwards: the op may have hydrated the box from its Store
     // registration, and then the row is logged without a diff.
-    const early = type === 'box.destroyed' || push !== undefined || branch !== undefined;
+    const early = type === 'box.destroyed' || push !== undefined || branchSwitch;
     const before = early ? await factOf(id).catch(() => undefined) : undefined;
+    // Kept apart from `before`: a record can be updated in place by the op.
+    const previous = before?.branches[0];
     const stat = push ? await pushStatBefore(before, push).catch(() => undefined) : undefined;
     const res = await op();
     if (!res.ok) return res;
     inBackground(async () => {
-      const fact = before ?? (type === 'box.destroyed' ? undefined : await factOf(id));
+      // A switch is the branch the hub sanctioned after the op: a checkout that
+      // left HEAD detached sanctions nothing, and is not one.
+      const after = branchSwitch ? await factOf(id) : undefined;
+      if (branchSwitch && (!after?.branches[0] || after.branches[0] === previous)) return;
+      const fact = after ?? before ?? (type === 'box.destroyed' ? undefined : await factOf(id));
       if (!fact) return;
       const ws = await workspaceForPath(fact.projectRoot);
       if (!ws) return;
@@ -528,15 +533,12 @@ export function withBoxTimeline(hub: HubBackend, seams: BoxTimelineSeams): HubBa
         boxEventBase(fact, ws.id),
         stat ? pushLineStat(stat) : undefined,
       ]);
-      const previous = before?.branches[0];
       await recordTimelineEvent(ws.id, {
         type,
         ...stampFields(stamp),
         ...base,
         ...(diff ?? {}),
-        ...(branch
-          ? { branch, ...(previous && previous !== branch ? { base: previous } : {}) }
-          : {}),
+        ...(after && previous ? { base: previous } : {}),
       });
       deps.notify();
     });
@@ -594,11 +596,16 @@ export function withBoxTimeline(hub: HubBackend, seams: BoxTimelineSeams): HubBa
     recordAround(id, 'git.push', meta, () => gitPushHost(id, input, meta), {
       push: { hostOnly: true, ...(input?.as ? { as: input.as } : {}) },
     });
+  // A checkout with args restores paths and switches no branch.
   hub.gitCheckout = (id, branch, args, meta) =>
-    recordAround(id, 'box.branch', meta, () => gitCheckout(id, branch, args, meta), { branch });
+    args?.length
+      ? gitCheckout(id, branch, args, meta)
+      : recordAround(id, 'box.branch', meta, () => gitCheckout(id, branch, args, meta), {
+          branchSwitch: true,
+        });
   hub.gitNewBranch = (id, input, meta) =>
     recordAround(id, 'box.branch', meta, () => gitNewBranch(id, input, meta), {
-      branch: scratchBranchName(input.name),
+      branchSwitch: true,
     });
   return hub;
 }

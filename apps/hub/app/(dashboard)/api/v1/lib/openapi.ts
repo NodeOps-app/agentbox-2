@@ -86,11 +86,15 @@ const timelineEventProperties = {
   boxId: { type: 'string' },
   boxName: { type: 'string' },
   agent: { type: 'string' },
-  branch: { type: 'string', description: '`box.branch`: the branch the box switched to.' },
+  branch: {
+    type: 'string',
+    description:
+      '`box.branch`: the branch the box is on after the switch, as the hub sanctioned it.',
+  },
   base: {
     type: 'string',
     description:
-      "`box.created` / `box.ready`: the branch the box forked from (the create's `fromBranch`, else the branch the project's host checkout was on; absent when unknown). `box.branch`: the branch it switched away from.",
+      "`box.created`: the branch the box forked from (the create's `fromBranch`, else the branch the project's host checkout was on; absent when unknown). `box.ready`: the create's `fromBranch`, only when it had one. `box.branch`: the branch it switched away from.",
   },
   projectId: { type: 'string' },
   taskIds: {
