@@ -287,3 +287,4 @@ export {
   type AvailableSource,
   type ModelAuthGateArgs,
 } from './prompts/model-auth-gate.js';
+export { AGENT_SESSION_ENV_VARS, scrubAgentSessionEnv } from './agent-session-env.js';
