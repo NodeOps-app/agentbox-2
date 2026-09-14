@@ -270,12 +270,15 @@ After running it, surface both apps to the user. For **Codex**, render the deep 
 For **Claude desktop**, there's no deep link — tell the user to add an SSH connection to host
 `<ssh-alias>` (it's already in `~/.ssh/config`).
 
-## When you are the manager: say why on the timeline
+## Workspaces: tasks, and the timeline when you manage
 
-A claude or codex session that runs `agentbox` in a workspace is one of its managers, and every task,
-box and push it makes lands on the workspace timeline stamped with its turn. The timeline cannot see
-your reasoning, so when you re-plan — reorder, hold a task, split one, move work to another box — say
-why in the same call:
+A workspace has a task list (`T-n`). When the user asks to split or parallelize work across boxes, make
+tasks first (`agentbox tasks add "…"`), then start boxes with them (`agentbox claude -i --tasks T-1,T-2`)
+or hand one to a running box (`agentbox tasks assign T-3 --box <box>`).
+
+A claude or codex session running `agentbox` in a workspace is one of its managers: its tasks, boxes and
+pushes land on the timeline, stamped with its turn. The timeline can't see your reasoning, so when you
+re-plan (reorder, hold, split, move work between boxes), say why in the same call:
 
 ```bash
 agentbox tasks reorder T-14 T-11 T-12 --note "T-14 unblocks the payment tasks"
@@ -283,8 +286,8 @@ agentbox tasks assign T-17 --box b169ec5 --note "same files as T-16, same branch
 agentbox manager note "holding T-12 until #405 merges" --replan
 ```
 
-An approval from the timeline arrives as a new prompt (`Approved: merge PR #409 (checkout-copy, T-14,
-T-15).`): merge that PR, then mark its tasks done.
+An approval arrives as a new prompt (`Approved: merge PR #409 (checkout-copy, T-14, T-15).`): merge
+that PR, then mark its tasks done.
 
 ## Operating principles
 
