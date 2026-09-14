@@ -31,6 +31,7 @@ import {
   resolveWorkspaceDir,
   resumeManagerSession,
   RESUMABLE_MANAGER_AGENTS,
+  managerStatusFormat,
   startManagerSession,
   stopManagerSession,
   tmuxAvailable,
@@ -207,6 +208,58 @@ describe('startManagerSession', () => {
     ]);
     expect(rec).toMatchObject({ kind: 'hub', tmuxSession: `agentbox-manager-${manager.id}` });
     expect(await readManagers(id)).toEqual([rec]);
+  });
+
+  it('scopes mouse and the footer to the session, never the server', async () => {
+    const { id, root } = await makeWorkspace();
+    const { calls, exec } = fakeExec();
+    const manager = record({ id: newManagerId(), workspaceId: id, cwd: root, kind: 'hub' });
+    await startManagerSession({ wsId: id, manager, argv: ['claude'], exec });
+    const target = `=agentbox-manager-${manager.id}:`;
+    const sets = calls.slice(2).map((c) => c.args);
+    expect(sets.map((a) => a.slice(0, 4))).toEqual(
+      ['mouse', 'status', 'status-position', 'status-style', 'status-format[0]'].map((name) => [
+        'set-option',
+        '-t',
+        target,
+        name,
+      ]),
+    );
+    expect(sets[0]![4]).toBe('on');
+    for (const a of sets) {
+      expect(a).not.toContain('-g');
+      expect(a).not.toContain('-s');
+      expect(a).not.toContain('extended-keys');
+    }
+    const format = sets[4]![4]!;
+    expect(format).toContain(`manager claude · ${manager.id.slice(0, 8)}`);
+    expect(format).toContain('#{prefix} d');
+    expect(format).not.toContain('#(');
+  });
+
+  it('keeps going when tmux refuses an option', async () => {
+    const { id, root } = await makeWorkspace();
+    const { calls, exec } = fakeExec(['set-option']);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const manager = record({ id: newManagerId(), workspaceId: id, cwd: root, kind: 'hub' });
+    const rec = await startManagerSession({ wsId: id, manager, argv: ['claude'], exec });
+    expect(calls.filter((c) => c.args[0] === 'set-option')).toHaveLength(6);
+    expect(rec.kind).toBe('hub');
+    warn.mockRestore();
+  });
+});
+
+describe('managerStatusFormat', () => {
+  it('names the session and workspace, escaping what tmux would read as a directive', () => {
+    const format = managerStatusFormat({
+      agent: 'codex',
+      shortId: '5edc0ee0',
+      workspaceName: 'shop #2',
+    });
+    expect(format).toContain('manager codex · 5edc0ee0');
+    expect(format).toContain(' shop ##2');
+    expect(format).toContain('#[align=right]');
+    expect(managerStatusFormat({ agent: 'claude', shortId: 'abc' })).not.toContain('undefined');
   });
 
   it('keeps several managers in one workspace', async () => {

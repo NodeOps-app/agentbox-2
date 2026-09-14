@@ -505,7 +505,9 @@ agentbox manager note "split checkout into two boxes" 3f9a       # a manager by 
 A manager is either **external** — the Claude Code or Codex session in your own terminal, detected
 when it runs `agentbox` — or **hub-run**, started by the hub in a tmux session it owns, so the CLI, the
 tray and a plain `tmux attach` all reach the same running agent (the session is sized to the most
-recently active client, so two attached at once do not clamp each other). An external manager is
+recently active client, so two attached at once do not clamp each other). That session, and only
+that session, has the mouse on (the wheel scrolls its history) and an AgentBox footer naming the
+manager, its session and the workspace, with the detach key. An external manager is
 yours: the hub reports whether it is still running but never stops it. Once it has ended,
 `manager resume` reopens that same conversation in the hub's tmux (`claude --resume <id>` /
 `codex resume <id>`, in the folder it ran in), where any client can attach to it. Hub-run managers

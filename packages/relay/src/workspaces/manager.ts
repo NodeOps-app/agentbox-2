@@ -20,6 +20,7 @@ import {
   listWorkspaces,
   managerExitFile,
   managersFile,
+  readWorkspace,
   resolveWorkspaceDir,
   WORKSPACE_LOCK,
   workspaceDir,
@@ -764,6 +765,60 @@ export async function readReconciledManagers(
 /** A refusal that is about the manager's current state, not the request's shape. */
 export class ManagerConflictError extends Error {}
 
+export interface ManagerFooterInput {
+  agent: string;
+  /** The session id's head when known, else the manager id's. */
+  shortId: string;
+  workspaceName?: string;
+}
+
+/** The attach footer's colours (`statusLine` in the CLI): dark bar, blue brand block, white keys. */
+const FOOTER_BAR_STYLE = 'bg=#303030,fg=colour250';
+
+/** tmux reads `#` in a status format as a directive. */
+function tmuxFormatText(text: string): string {
+  return text.replace(/#/gu, '##');
+}
+
+/**
+ * The manager session's status line, drawn to look like the box attach footer.
+ * Static text and tmux's own variables only: a `#()` command would be re-run by
+ * every client's status refresh. `#{prefix}` is the user's real prefix key.
+ */
+export function managerStatusFormat(input: ManagerFooterInput): string {
+  const hint = (key: string, label: string): string =>
+    `#[fg=colour255]${key}#[fg=colour245]: ${label}`;
+  const hints = [hint('#{prefix} d', 'detach'), hint('wheel', 'scroll')].join('   │   ');
+  const label = `manager ${tmuxFormatText(input.agent)} · ${tmuxFormatText(input.shortId)}`;
+  const ws = input.workspaceName ? ` ${tmuxFormatText(input.workspaceName)}` : '';
+  return (
+    `#[bg=colour39,fg=colour16] agentbox ▸ #[bold]${label} #[nobold]` +
+    `#[${FOOTER_BAR_STYLE}]${ws}#[align=right]${hints} `
+  );
+}
+
+/**
+ * Options set on the manager session only (`-t`, never `-g`): the session lives
+ * on the user's own tmux server, whose config is not ours to change.
+ *
+ * `mouse on` makes the wheel scroll history in copy mode; without it the
+ * client's terminal turns the wheel into arrow keys the agent reads as prompt
+ * history. `extended-keys` (which would let Ctrl+Enter through with its
+ * modifier) is deliberately absent: it is a server option, and a `-t` target
+ * does not scope it — tmux silently sets it for every session on the server.
+ */
+export function managerSessionOptionsArgv(session: string, footer: ManagerFooterInput): string[][] {
+  const target = `${exactTarget(session)}:`;
+  const set = (name: string, value: string): string[] => ['set-option', '-t', target, name, value];
+  return [
+    set('mouse', 'on'),
+    set('status', 'on'),
+    set('status-position', 'bottom'),
+    set('status-style', FOOTER_BAR_STYLE),
+    set('status-format[0]', managerStatusFormat(footer)),
+  ];
+}
+
 export interface StartManagerSessionInput {
   wsId: string;
   /** The record to run: a new one for a fresh start, an existing one for a resume. */
@@ -826,6 +881,21 @@ export async function startManagerSession(input: StartManagerSessionInput): Prom
       `[manager] could not pin the tmux window size: ${err instanceof Error ? err.message : String(err)}`,
     );
   });
+  const workspaceName = await readWorkspace(input.wsId)
+    .then((ws) => ws?.name)
+    .catch(() => undefined);
+  const footer: ManagerFooterInput = {
+    agent: rec.agent,
+    shortId: (rec.sessionId ?? rec.id).slice(0, 8),
+    ...(workspaceName ? { workspaceName } : {}),
+  };
+  for (const argv of managerSessionOptionsArgv(session, footer)) {
+    await exec('tmux', argv, { env }).catch((err: unknown) => {
+      console.warn(
+        `[manager] could not set tmux ${argv[3] ?? 'option'}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    });
+  }
   const at = new Date().toISOString();
   const next: ManagerRecord = {
     ...rec,
