@@ -74,6 +74,25 @@ agentbox claude attach <name|n>       # reattach to a specific box
 
 From host Claude, run the **`/agentbox`** slash command (optional arg: `docker` | `daytona` | `hetzner` | `vercel` | `e2b`) to snapshot the *current* Claude Code session into a brand-new box that resumes it. With tmux or iTerm it opens in a new terminal tab; otherwise it starts in the background. The host session is unaffected — you get two parallel timelines. The underlying CLI is `agentbox fork` (`agentbox fork --help`); `/agentbox` requires `agentbox install` to have been run once. This is distinct from `-i`, which seeds a *new* prompt rather than resuming the live conversation. Fork **sends** the project's `carry:` block by default (the host is trusted; the box is the untrusted side, so host→box copy is safe) — opt out with `agentbox fork --carry skip`.
 
+## Workspaces: tasks, and the timeline when you manage
+
+A workspace has a task list (`T-n`). When the user asks to split or parallelize work across boxes, make
+tasks first (`agentbox tasks add "…"`), then start boxes with them (`agentbox claude -i --tasks T-1,T-2`)
+or hand one to a running box (`agentbox tasks assign T-3 --box <box>`).
+
+A claude or codex session running `agentbox` in a workspace is one of its managers: its tasks, boxes and
+pushes land on the timeline, stamped with its turn. The timeline can't see your reasoning, so when you
+re-plan (reorder, hold, split, move work between boxes), say why in the same call:
+
+```bash
+agentbox tasks reorder T-14 T-11 T-12 --note "T-14 unblocks the payment tasks"
+agentbox tasks assign T-17 --box b169ec5 --note "same files as T-16, same branch"
+agentbox manager note "holding T-12 until #405 merges" --replan
+```
+
+An approval arrives as a new prompt (`Approved: merge PR #409 (checkout-copy, T-14, T-15).`): merge
+that PR, then mark its tasks done.
+
 ## Driving one agent from another (`drive`, `agent`, `queue wait-for`)
 
 When *you* are the host-side agent and want to orchestrate other agents running inside boxes — read what they're doing, send them a prompt, wait until they're done or need input — use these three command families. Everything is stateless / one-shot, and the human-text default switches to machine-friendly JSON with `--json`.
@@ -269,25 +288,6 @@ After running it, surface both apps to the user. For **Codex**, render the deep 
 
 For **Claude desktop**, there's no deep link — tell the user to add an SSH connection to host
 `<ssh-alias>` (it's already in `~/.ssh/config`).
-
-## Workspaces: tasks, and the timeline when you manage
-
-A workspace has a task list (`T-n`). When the user asks to split or parallelize work across boxes, make
-tasks first (`agentbox tasks add "…"`), then start boxes with them (`agentbox claude -i --tasks T-1,T-2`)
-or hand one to a running box (`agentbox tasks assign T-3 --box <box>`).
-
-A claude or codex session running `agentbox` in a workspace is one of its managers: its tasks, boxes and
-pushes land on the timeline, stamped with its turn. The timeline can't see your reasoning, so when you
-re-plan (reorder, hold, split, move work between boxes), say why in the same call:
-
-```bash
-agentbox tasks reorder T-14 T-11 T-12 --note "T-14 unblocks the payment tasks"
-agentbox tasks assign T-17 --box b169ec5 --note "same files as T-16, same branch"
-agentbox manager note "holding T-12 until #405 merges" --replan
-```
-
-An approval arrives as a new prompt (`Approved: merge PR #409 (checkout-copy, T-14, T-15).`): merge
-that PR, then mark its tasks done.
 
 ## Operating principles
 
