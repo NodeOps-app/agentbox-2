@@ -5,6 +5,10 @@
 import {
   findManager,
   findWorkspaceContaining,
+  parseShortstat,
+  pushedRef,
+  pushLineStat,
+  readRefTip,
   listWorkspaces,
   readReconciledTasks,
   readTasks,
@@ -17,6 +21,7 @@ import {
   type TimelineEvent,
   type TimelineEventInput,
   type TimelinePr,
+  type PushStatInput,
   type TimelineStamp,
   type WorkTask,
 } from '@agentbox/relay';
@@ -226,15 +231,7 @@ export function buildTimelineSummary(
   };
 }
 
-/** `N files changed, A insertions(+), D deletions(-)`, any part optional. */
-export function parseShortstat(out: string): DiffStat {
-  const num = (re: RegExp): number => Number(re.exec(out)?.[1] ?? 0);
-  return {
-    filesChanged: num(/(\d+) files? changed/u),
-    additions: num(/(\d+) insertions?\(\+\)/u),
-    deletions: num(/(\d+) deletions?\(-\)/u),
-  };
-}
+export { parseShortstat };
 
 /** Where a row's repo is on the web, from what the GitHub sync already cached. */
 export interface RepoWebLookup {
@@ -454,6 +451,14 @@ export async function stampInWorkspace(
   return rec?.workspaceId === wsId ? stamp : HUMAN;
 }
 
+/** How a push route addresses the host ref it moves. */
+interface PushTarget {
+  remote?: string;
+  hostOnly?: boolean;
+  /** `push-host --as`: the local branch it lands on. */
+  as?: string;
+}
+
 export interface BoxTimelineSeams {
   deps: BackendDeps;
   /** A manager's stamp (turn + prompt), only when it is a manager of `wsId`. */
@@ -477,26 +482,44 @@ export function withBoxTimeline(hub: HubBackend, seams: BoxTimelineSeams): HubBa
     return deps.boxFact(id);
   }
 
+  /** Where a push's +/- lines are read, with the ref's tip before the push moves it. */
+  async function pushStatBefore(
+    fact: TimelineBoxFact | undefined,
+    push: PushTarget,
+  ): Promise<PushStatInput | undefined> {
+    const boxBranch = fact?.branches[0];
+    if (!fact || !boxBranch) return undefined;
+    const branch = push.hostOnly && push.as ? push.as : boxBranch;
+    const ref = pushedRef(branch, push);
+    const before = await readRefTip(fact.projectRoot, ref);
+    return { repo: fact.projectRoot, ref, branch, ...(before ? { before } : {}) };
+  }
+
   async function recordAround<R extends { ok: boolean }>(
     id: string,
     type: TimelineEvent['type'],
     meta: TimelineMeta | undefined,
     op: () => Promise<R>,
+    push?: PushTarget,
   ): Promise<R> {
-    // A destroyed box has no record left to name it by, so that one is read first.
-    const before = type === 'box.destroyed' ? await factOf(id).catch(() => undefined) : undefined;
+    // A destroyed box has no record left to name it by, and a push moves the
+    // ref its diff is measured from, so both are read first.
+    const early = type === 'box.destroyed' || push !== undefined;
+    const before = early ? await factOf(id).catch(() => undefined) : undefined;
+    const stat = push ? await pushStatBefore(before, push).catch(() => undefined) : undefined;
     const res = await op();
     if (!res.ok) return res;
     inBackground(async () => {
-      const fact = before ?? (type === 'box.destroyed' ? undefined : await factOf(id));
+      const fact = before ?? (early ? undefined : await factOf(id));
       if (!fact) return;
       const ws = await workspaceForPath(fact.projectRoot);
       if (!ws) return;
-      const [stamp, base] = await Promise.all([
+      const [stamp, base, diff] = await Promise.all([
         stampInWorkspace(meta, ws.id, seams.stampFor),
         boxEventBase(fact, ws.id),
+        stat ? pushLineStat(stat) : undefined,
       ]);
-      await recordTimelineEvent(ws.id, { type, ...stampFields(stamp), ...base });
+      await recordTimelineEvent(ws.id, { type, ...stampFields(stamp), ...base, ...(diff ?? {}) });
       deps.notify();
     });
     return res;
@@ -541,8 +564,13 @@ export function withBoxTimeline(hub: HubBackend, seams: BoxTimelineSeams): HubBa
   hub.destroy = (id, o, meta) =>
     recordAround(id, 'box.destroyed', meta, () => destroy(id, o, meta));
   hub.gitPush = (id, input, meta) =>
-    recordAround(id, 'git.push', meta, () => gitPush(id, input, meta));
+    recordAround(id, 'git.push', meta, () => gitPush(id, input, meta), {
+      ...(input?.remote ? { remote: input.remote } : {}),
+    });
   hub.gitPushHost = (id, input, meta) =>
-    recordAround(id, 'git.push', meta, () => gitPushHost(id, input, meta));
+    recordAround(id, 'git.push', meta, () => gitPushHost(id, input, meta), {
+      hostOnly: true,
+      ...(input?.as ? { as: input.as } : {}),
+    });
   return hub;
 }

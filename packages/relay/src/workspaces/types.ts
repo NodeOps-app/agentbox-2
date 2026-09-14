@@ -268,6 +268,9 @@ export interface TimelineEvent {
   noteKind?: TimelineNoteKind;
   /** `task.assigned`: the box was already running, i.e. it was given more work. */
   boxRunning?: boolean;
+  /** `git.push`: lines the push added and removed, read from the host repo when it was recorded. */
+  additions?: number;
+  deletions?: number;
   /** Dedupe key: an append carrying a key already in the log is a no-op. */
   key?: string;
 }

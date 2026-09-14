@@ -1,4 +1,5 @@
 import { recordBoxGhResult, recordBoxGitPush } from './timeline-hooks.js';
+import { pushedRef, readRefTip } from './workspaces/push-stat.js';
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
@@ -1084,26 +1085,36 @@ export function createRelayServer(opts: RelayServerOptions): RelayServerHandle {
             }
           }
         }
-        const result = await handleGitRpc(
-          reg,
-          body.method,
-          body.params as GitRpcParams | undefined,
-        );
-        if (body.method === 'git.push' && result.exitCode === 0) {
-          const pushParams = body.params as GitRpcParams | undefined;
-          const pushTree = resolveWorktree(reg, pushParams?.path ?? '/workspace');
-          if (pushTree) {
-            void recordBoxGitPush(
-              {
-                boxId: reg.boxId,
-                boxName: reg.name,
-                hostPath: pushTree.hostMainRepo,
-                branch: pushTree.sanctionedBranch ?? pushTree.branch,
-              },
-              { hostInitiated: pushHostInitiated, hostOnly: Boolean(pushParams?.hostOnly) },
-              result,
-            );
-          }
+        const pushParams = body.params as GitRpcParams | undefined;
+        const pushTree =
+          body.method === 'git.push'
+            ? resolveWorktree(reg, pushParams?.path ?? '/workspace')
+            : undefined;
+        const pushBranch = pushTree ? (pushTree.sanctionedBranch ?? pushTree.branch) : undefined;
+        // The old tip has to be read before the push moves it; only for a push
+        // the timeline hook will record (a host-initiated one is the hub's).
+        const pushStat =
+          pushTree && pushBranch && !pushHostInitiated
+            ? {
+                repo: pushTree.hostMainRepo,
+                ref: pushedRef(pushBranch, { remote: resolveRemote(pushParams?.remote) }),
+                branch: pushBranch,
+              }
+            : undefined;
+        const pushBefore = pushStat ? await readRefTip(pushStat.repo, pushStat.ref) : undefined;
+        const result = await handleGitRpc(reg, body.method, pushParams);
+        if (body.method === 'git.push' && result.exitCode === 0 && pushTree) {
+          void recordBoxGitPush(
+            {
+              boxId: reg.boxId,
+              boxName: reg.name,
+              hostPath: pushTree.hostMainRepo,
+              ...(pushBranch ? { branch: pushBranch } : {}),
+            },
+            { hostInitiated: pushHostInitiated, hostOnly: Boolean(pushParams?.hostOnly) },
+            result,
+            pushStat ? { ...pushStat, ...(pushBefore ? { before: pushBefore } : {}) } : undefined,
+          );
         }
         const status = result.exitCode === 0 ? 200 : 500;
         send(res, status, result);

@@ -230,10 +230,12 @@ push and pull-request events — plus the rows that are true right now.
 | `GET /workspaces/{id}/timeline` | `{ items, live, summary?, github }`, items newest first. `?before=<iso>&limit=` (default 100, max 500) pages back; `?since=<iso>` adds `summary: { since, merged, additions, deletions, tasksDone, awaiting }` and does not filter the items. |
 
 An event is `{ id, at, type, actor, managerId?, turn?, prompt?, boxId?, boxName?, agent?, branch?,
-projectId?, taskIds?, task?, pr?, text?, noteKind?, boxRunning?, key? }`. `actor` is `human`,
+projectId?, taskIds?, task?, pr?, text?, noteKind?, boxRunning?, additions?, deletions?, key? }`. `actor` is `human`,
 `manager`, `box`, `hub` or `github`. `type` is one of `task.created | status | assigned | unassigned |
 removed`, `manager.joined | started | resumed | stopped | note | message`, `box.created | ready |
-failed | started | stopped | destroyed`, `git.push`, and `pr.opened | ready | merged | closed`.
+failed | started | stopped | destroyed`, `git.push`, and `pr.opened | ready | merged | closed`. A
+`git.push` carries `additions`/`deletions` when the hub could read them from the host repo: from the
+old tip to the new one, or from the merge base with the default branch for a first push.
 `taskIds` is captured when the event is written, and `pr` is `{ repo, number, title, url, base, head,
 additions?, deletions?, checks?, mergeState?, autoMerge?, mergedBy? }`.
 

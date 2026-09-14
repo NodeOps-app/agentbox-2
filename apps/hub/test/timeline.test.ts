@@ -1,4 +1,5 @@
-import { mkdir, mkdtemp, readFile, realpath, rm } from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -677,6 +678,84 @@ describe('stamps from routes that do not name a workspace', () => {
       managerId: c.manager.id,
     });
     expect((await readTimeline(b.workspace.id)).some((e) => e.type.startsWith('box.'))).toBe(false);
+  });
+});
+
+describe('push rows', () => {
+  it('records the lines a push moved, and a push-host from the merge base', async () => {
+    const h = harness();
+    const { managers } = backends(h);
+    const root = await realpath(await mkdtemp(join(tmpdir(), 'agentbox-hubpush-')));
+    const git = (...args: string[]): string =>
+      execFileSync(
+        'git',
+        [
+          '-c',
+          'user.name=t',
+          '-c',
+          'user.email=t@t',
+          '-c',
+          'commit.gpgsign=false',
+          '-C',
+          root,
+          ...args,
+        ],
+        { encoding: 'utf8' },
+      ).trim();
+    const commit = async (file: string, lines: number): Promise<string> => {
+      await writeFile(join(root, file), 'x\n'.repeat(lines));
+      git('add', file);
+      git('commit', '-q', '-m', file);
+      return git('rev-parse', 'HEAD');
+    };
+    git('init', '-q', '-b', 'main');
+    await commit('base.txt', 2);
+    git('checkout', '-q', '-b', 'agentbox/box-one');
+    git('update-ref', 'refs/remotes/origin/agentbox/box-one', await commit('a.txt', 5));
+    const next = await commit('b.txt', 3);
+    const d = await managers.detectManager({
+      agent: 'claude',
+      sessionId: S1,
+      cwd: root,
+      host: 'laptop',
+    });
+    if (!d.ok) throw new Error(d.error);
+    h.boxes.push({
+      id: 'box1',
+      name: 'box-one',
+      branches: ['agentbox/box-one'],
+      state: 'running',
+      projectRoot: root,
+      projectId: 'p1',
+    });
+    const okResult = async () => ({ ok: true as const });
+    const hub = withBoxTimeline(
+      {
+        create: okResult,
+        start: okResult,
+        stop: okResult,
+        destroy: okResult,
+        gitPush: async () => {
+          git('update-ref', 'refs/remotes/origin/agentbox/box-one', next);
+          return { ok: true as const };
+        },
+        gitPushHost: async () => {
+          git('branch', 'landed', next);
+          return { ok: true as const };
+        },
+      } as unknown as HubBackend,
+      { deps: h.deps, stampFor: managers.timelineStamp },
+    );
+    await hub.gitPush('box1', {});
+    await hub.gitPushHost('box1', { as: 'landed' });
+    await backgroundSettled();
+
+    const pushes = (await readTimeline(d.workspace.id)).filter((e) => e.type === 'git.push');
+    // The push moved origin's ref by b.txt; the landing had no old tip, so it is measured from main.
+    expect(pushes.map((e) => [e.additions, e.deletions]).sort()).toEqual([
+      [3, 0],
+      [8, 0],
+    ]);
   });
 });
 

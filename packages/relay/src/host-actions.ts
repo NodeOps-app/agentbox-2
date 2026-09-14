@@ -17,6 +17,7 @@
 import { execa } from 'execa';
 import { toHttpsUrl } from './git-pat.js';
 import { recordBoxGhResult, recordBoxGitPush, type BoxTimelineContext } from './timeline-hooks.js';
+import { pushedRef, readRefTip, type PushStatInput } from './workspaces/push-stat.js';
 import { existsSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -383,13 +384,18 @@ export async function executeCloudAction(
     };
   }
   if (action.method === 'git.push' || action.method === 'git.fetch') {
-    const push = { hostInitiated: false };
+    const push: GitPushTrace = { hostInitiated: false };
     return runGitRpc(action, deps, push).then((result) => {
       if (action.method === 'git.push' && result.exitCode === 0) {
         const hostOnly = Boolean((action.params as GitRpcParams | undefined)?.hostOnly);
         void cloudTimelineContext(deps).then((ctx) =>
           ctx
-            ? recordBoxGitPush(ctx, { hostInitiated: push.hostInitiated, hostOnly }, result)
+            ? recordBoxGitPush(
+                ctx,
+                { hostInitiated: push.hostInitiated, hostOnly },
+                result,
+                push.stat,
+              )
             : undefined,
         );
       }
@@ -1271,11 +1277,18 @@ export async function resolveHostGitRepo(
   };
 }
 
+/** What a push learned on its way, for the timeline hook that runs after it. */
+interface GitPushTrace {
+  /** Set once the push's host-initiated token is checked. */
+  hostInitiated: boolean;
+  /** Where the push's +/- lines can be read; set only for a real host checkout. */
+  stat?: PushStatInput;
+}
+
 async function runGitRpc(
   action: HostAction,
   deps: CloudActionExecutorDeps,
-  /** Set once the push's host-initiated token is checked, for the timeline hook. */
-  push: { hostInitiated: boolean } = { hostInitiated: false },
+  trace: GitPushTrace = { hostInitiated: false },
 ): Promise<HostActionResult> {
   const params = (action.params ?? {}) as GitRpcParams;
   const lookup = await lookupCloudBox(deps.boxId);
@@ -1414,7 +1427,7 @@ async function runGitRpc(
       incomingHashGit,
     ) ??
       false);
-  push.hostInitiated = hostInitiatedOk;
+  trace.hostInitiated = hostInitiatedOk;
   if (action.method === 'git.push' && !bypassPushGate && tokenClaimedGit && !hostInitiatedOk) {
     return {
       exitCode: 10,
@@ -1517,6 +1530,13 @@ async function runGitRpc(
           stdout: '',
           stderr: `bundle create failed: ${make.stderr || make.stdout}`,
         };
+      }
+      // A scratch repo is deleted after the push, so there is nothing to read
+      // the diff from later. The old tip must be read before step 4 moves it.
+      if (!repo.scratch && !trace.hostInitiated) {
+        const ref = pushedRef(branch, { remote: remoteName });
+        const before = await readRefTip(repo.dir, ref);
+        trace.stat = { repo: repo.dir, ref, branch, ...(before ? { before } : {}) };
       }
       // 2b. Download to host tmp.
       await backend.downloadFile(handle, remoteBundle, hostBundle);

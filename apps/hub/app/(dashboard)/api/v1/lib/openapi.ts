@@ -109,6 +109,15 @@ const timelineEventProperties = {
     type: 'boolean',
     description: '`task.assigned`: the box was already running (it was given more work).',
   },
+  additions: {
+    type: 'number',
+    description:
+      '`git.push`: lines the push added, read from the host repo when it was recorded (the old tip to the new, or the merge base with the default branch for a first push). Absent when it could not be read.',
+  },
+  deletions: {
+    type: 'number',
+    description: '`git.push`: lines the push removed (see `additions`).',
+  },
   key: {
     type: 'string',
     description:

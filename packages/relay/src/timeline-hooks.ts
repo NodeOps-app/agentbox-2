@@ -6,6 +6,7 @@ import { readState } from '@agentbox/sandbox-core';
 import { ghRunContext, ghVerbArgv, resolveGhTarget, runHostGh } from './gh.js';
 import type { QueueJob } from './queue.js';
 import { managerIdForTarget } from './workspaces/manager.js';
+import { pushLineStat, type PushStatInput } from './workspaces/push-stat.js';
 import { readTasks } from './workspaces/task-store.js';
 import { GH_PR_JSON_FIELDS, parsePrUrl, prTimelineEvents } from './workspaces/timeline-pr.js';
 import type { GhPrJson } from './workspaces/timeline-pr.js';
@@ -42,14 +43,17 @@ export async function recordBoxGitPush(
   ctx: BoxTimelineContext,
   origin: GitPushOrigin,
   result: { exitCode: number },
+  /** Where to read the push's +/- lines; the row has no diff without it. */
+  stat?: PushStatInput,
 ): Promise<void> {
   if (result.exitCode !== 0 || origin.hostInitiated || origin.hostOnly) return;
   try {
     const ws = await workspaceForPath(ctx.hostPath);
     if (!ws) return;
-    const [taskIds, managerId] = await Promise.all([
+    const [taskIds, managerId, diff] = await Promise.all([
       boxTaskIds(ws.id, ctx.boxId),
       managerIdForTarget({ boxId: ctx.boxId }, { workspaceId: ws.id }),
+      stat ? pushLineStat(stat) : undefined,
     ]);
     await recordTimelineEvent(ws.id, {
       type: 'git.push',
@@ -59,6 +63,7 @@ export async function recordBoxGitPush(
       ...(ctx.branch ? { branch: ctx.branch } : {}),
       ...(managerId ? { managerId } : {}),
       ...(taskIds.length ? { taskIds } : {}),
+      ...(diff ?? {}),
     });
   } catch {
     /* best-effort */
