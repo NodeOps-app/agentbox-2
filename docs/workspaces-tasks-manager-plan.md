@@ -361,6 +361,8 @@ resume's prompt that starts with `-` gets a leading space so the agent cannot pa
 - **Relay-side writes fire no change event.** A push or PR from a box shows on the next poll or the
   next hub-side change.
 
+Open work after Phase 9 is tracked in [`workspaces-tasks-manager-backlog.md`](./workspaces-tasks-manager-backlog.md).
+
 ## Files to touch (representative)
 
 - `packages/relay/src/workspaces/{types,workspace-store,task-store,manager}.ts` + `index.ts`
