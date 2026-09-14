@@ -365,7 +365,7 @@ export function createTimelineBackend(
     async getTimeline(wsId: string, q: TimelineQuery = {}): Promise<TimelineResponse | null> {
       const ws = await readWorkspace(wsId);
       if (!ws) return null;
-      const github = sync.kick(ws);
+      const github = q.sync === false ? sync.status(wsId) : sync.kick(ws);
       const [events, workspaces, facts, ctx] = await Promise.all([
         readTimeline(wsId),
         listWorkspaces(),
@@ -503,14 +503,16 @@ export function withBoxTimeline(hub: HubBackend, seams: BoxTimelineSeams): HubBa
     push?: PushTarget,
   ): Promise<R> {
     // A destroyed box has no record left to name it by, and a push moves the
-    // ref its diff is measured from, so both are read first.
+    // ref its diff is measured from, so both are read first. A push still reads
+    // the fact again afterwards: the op may have hydrated the box from its Store
+    // registration, and then the row is logged without a diff.
     const early = type === 'box.destroyed' || push !== undefined;
     const before = early ? await factOf(id).catch(() => undefined) : undefined;
     const stat = push ? await pushStatBefore(before, push).catch(() => undefined) : undefined;
     const res = await op();
     if (!res.ok) return res;
     inBackground(async () => {
-      const fact = before ?? (early ? undefined : await factOf(id));
+      const fact = before ?? (type === 'box.destroyed' ? undefined : await factOf(id));
       if (!fact) return;
       const ws = await workspaceForPath(fact.projectRoot);
       if (!ws) return;

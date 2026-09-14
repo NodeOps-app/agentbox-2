@@ -32,6 +32,8 @@ export type PrLiveState = 'ready' | 'open' | 'merged' | 'closed';
 export interface GithubPrSync {
   /** Start a sync when the last one is older than the interval; answers the current status. */
   kick(ws: WorkspaceRecord): GithubSyncStatus;
+  /** The current status without starting a sync: `syncing` until one has finished. */
+  status(wsId: string): GithubSyncStatus;
   /** Run one sync now and wait for it (tests, and a caller that needs it done). */
   syncNow(ws: WorkspaceRecord): Promise<GithubSyncStatus>;
   /** The state a PR had at the last sync, when this hub has seen it. */
@@ -271,6 +273,9 @@ export function createGithubPrSync(
       const st = stateOf(ws.id);
       if (!st.running && now() - st.lastAt >= interval) void run(ws);
       return st.status ?? 'syncing';
+    },
+    status(wsId) {
+      return states.get(wsId)?.status ?? 'syncing';
     },
     syncNow: run,
     prState(repo, number) {

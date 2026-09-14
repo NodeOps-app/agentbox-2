@@ -775,9 +775,9 @@ export interface ManagerFooterInput {
 /** The attach footer's colours (`statusLine` in the CLI): dark bar, blue brand block, white keys. */
 const FOOTER_BAR_STYLE = 'bg=#303030,fg=colour250';
 
-/** tmux reads `#` in a status format as a directive. */
+/** tmux reads `#` in a status format as a directive, and passes the result through strftime. */
 function tmuxFormatText(text: string): string {
-  return text.replace(/#/gu, '##');
+  return text.replace(/#/gu, '##').replace(/%/gu, '%%');
 }
 
 /**

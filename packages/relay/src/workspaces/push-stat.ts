@@ -92,17 +92,27 @@ async function defaultBranchBase(git: Git, tip: string): Promise<string | undefi
   return undefined;
 }
 
+/** True only when git positively says `before` is an ancestor of `after` (exit 0). */
+async function isAncestor(git: Git, before: string, after: string): Promise<boolean> {
+  return (await git(['merge-base', '--is-ancestor', before, after])) !== undefined;
+}
+
 /**
- * Lines added and removed by a push: `before..after` when the old tip is known,
- * else from the merge base with the default branch. Undefined on anything
- * unexpected, including a push that moved nothing: the row just has no diff.
+ * Lines added and removed by a push: `before..after` when the old tip is known
+ * and still an ancestor, else from the merge base with the default branch (a
+ * first push, or a rebase + force-push whose `before..after` would count the
+ * upstream changes it was rebased onto). Undefined on anything unexpected,
+ * including a push that moved nothing: the row just has no diff.
  */
 export async function pushLineStat(input: PushStatInput): Promise<PushLineStat | undefined> {
   const git = gitWithin(input.repo, Date.now() + (input.timeoutMs ?? PUSH_STAT_TIMEOUT_MS));
   const after =
     (await tipWith(git, input.ref)) ?? (await tipWith(git, `refs/heads/${input.branch}`));
   if (!after) return undefined;
-  const base = input.before ?? (await defaultBranchBase(git, after));
+  const base =
+    input.before && (input.before === after || (await isAncestor(git, input.before, after)))
+      ? input.before
+      : await defaultBranchBase(git, after);
   if (!base || base === after) return undefined;
   const out = await git(['diff', '--shortstat', `${base}..${after}`]);
   if (out === undefined) return undefined;

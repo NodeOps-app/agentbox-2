@@ -262,6 +262,19 @@ describe('managerStatusFormat', () => {
     expect(managerStatusFormat({ agent: 'claude', shortId: 'abc' })).not.toContain('undefined');
   });
 
+  it('escapes % too, since tmux runs a status format through strftime', () => {
+    const format = managerStatusFormat({
+      agent: 'claude',
+      shortId: 'abc',
+      workspaceName: 'q3-%d-review',
+    });
+    expect(format).toContain(' q3-%%d-review');
+    expect(format).not.toMatch(/[^%]%d/u);
+    expect(
+      managerStatusFormat({ agent: 'claude', shortId: 'abc', workspaceName: '#1 100%' }),
+    ).toContain(' ##1 100%%');
+  });
+
   it('keeps several managers in one workspace', async () => {
     const { id, root } = await makeWorkspace();
     const { exec } = fakeExec();

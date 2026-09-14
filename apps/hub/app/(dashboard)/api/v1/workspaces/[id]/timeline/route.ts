@@ -1,8 +1,8 @@
 // GET /api/v1/workspaces/:id/timeline — what happened in the workspace, newest
 // first (`?before=<iso>&limit=`), plus the rows true right now (`live`) and, with
 // `?since=<iso>`, a summary of what changed since then. A GitHub PR sync starts
-// in the background when the last one is over a minute old; `github` says how it
-// stands, and a new row it finds fires the usual change event.
+// in the background when the last one is over a minute old (never with `?sync=0`);
+// `github` says how it stands, and a new row it finds fires the usual change event.
 import { backendOrNull } from '../../../lib/backend';
 import { fail, ok } from '../../../lib/envelope';
 import { parseTimelineQuery } from '../../../lib/validate';

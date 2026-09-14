@@ -449,6 +449,25 @@ describe('timeline writes and reads', () => {
     });
   });
 
+  it('starts no GitHub sync on a sync=0 read, and reports the last status', async () => {
+    const h = harness();
+    const { workspaces } = backends(h);
+    const added = await workspaces.addWorkspace({ path: await folder() });
+    if (!added.ok) throw new Error(added.error);
+    const sync = createGithubPrSync(h.deps);
+    const timeline = createTimelineBackend(h.deps, { sync });
+    const res = await timeline.getTimeline(added.workspace.id, { limit: 2, sync: false });
+    expect(res!.github).toBe('syncing');
+    await backgroundSettled();
+    expect(h.gh).not.toHaveBeenCalled();
+
+    expect(await sync.syncNow((await readWorkspace(added.workspace.id))!)).toBe('unavailable');
+    h.gh.mockClear();
+    const after = await timeline.getTimeline(added.workspace.id, { sync: false });
+    expect(after!.github).toBe('unavailable');
+    expect(h.gh).not.toHaveBeenCalled();
+  });
+
   it('reports GitHub unavailable when gh is not logged in', async () => {
     const h = harness();
     const { workspaces } = backends(h);
@@ -756,6 +775,51 @@ describe('push rows', () => {
       [3, 0],
       [8, 0],
     ]);
+  });
+});
+
+describe('a push on a box hydrated during the push', () => {
+  it('still records the push row, without a diff', async () => {
+    const h = harness();
+    const { managers } = backends(h);
+    const root = await folder();
+    const d = await managers.detectManager({
+      agent: 'claude',
+      sessionId: S1,
+      cwd: root,
+      host: 'laptop',
+    });
+    if (!d.ok) throw new Error(d.error);
+    const okResult = async () => ({ ok: true as const });
+    const hub = withBoxTimeline(
+      {
+        create: okResult,
+        start: okResult,
+        stop: okResult,
+        destroy: okResult,
+        // The box is only known once the op registered it from the Store.
+        gitPush: async () => {
+          h.boxes.push({
+            id: 'box1',
+            name: 'box-one',
+            branches: ['agentbox/box-one'],
+            state: 'running',
+            projectRoot: root,
+            projectId: 'p1',
+          });
+          return { ok: true as const };
+        },
+        gitPushHost: okResult,
+      } as unknown as HubBackend,
+      { deps: h.deps, stampFor: managers.timelineStamp },
+    );
+    await hub.gitPush('box1', {});
+    await backgroundSettled();
+
+    const pushes = (await readTimeline(d.workspace.id)).filter((e) => e.type === 'git.push');
+    expect(pushes).toHaveLength(1);
+    expect(pushes[0]).toMatchObject({ boxId: 'box1', boxName: 'box-one' });
+    expect(pushes[0]!.additions).toBeUndefined();
   });
 });
 

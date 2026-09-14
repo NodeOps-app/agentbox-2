@@ -15,6 +15,7 @@ import {
   parseTaskCreate,
   parseTaskReorder,
   parseTaskUpdate,
+  parseTimelineQuery,
   parseWorkspaceAdd,
 } from '../app/(dashboard)/api/v1/lib/validate';
 
@@ -585,5 +586,15 @@ describe('parseManagerMessage', () => {
     expect(parseManagerMessage({ text: 'go', prNumber: 3, repo: 'o/r/x' }).ok).toBe(false);
     expect(parseManagerMessage({ text: 'go', prNumber: 3, repo: 7 }).ok).toBe(false);
     expect(parseManagerMessage({ text: 'go', repo: 'o/r' }).ok).toBe(false);
+  });
+});
+
+describe('parseTimelineQuery', () => {
+  const q = (search: string) => parseTimelineQuery(new URL(`http://h/t${search}`));
+  it('turns sync=0 into sync: false and leaves any other value to the default', () => {
+    expect(q('?limit=2&sync=0')).toEqual({ ok: true, value: { limit: 2, sync: false } });
+    expect(q('?sync=1')).toEqual({ ok: true, value: {} });
+    expect(q('?sync=')).toEqual({ ok: true, value: {} });
+    expect(q('')).toEqual({ ok: true, value: {} });
   });
 });

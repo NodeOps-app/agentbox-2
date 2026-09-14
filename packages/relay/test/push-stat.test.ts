@@ -80,6 +80,28 @@ describe('pushLineStat', () => {
     ).toEqual({ additions: 7, deletions: 0 });
   });
 
+  it('measures a rebase + force-push from the merge base, not the upstream it moved onto', async () => {
+    const { dir, commit } = await repo();
+    await git(dir, 'checkout', '-q', '-b', 'feat');
+    const old = await commit('a.txt', 4);
+    await git(dir, 'update-ref', 'refs/remotes/origin/feat', old);
+    await git(dir, 'checkout', '-q', 'main');
+    await commit('main-only.txt', 50);
+    await git(dir, 'update-ref', 'refs/remotes/origin/main', 'main');
+    await git(dir, 'checkout', '-q', 'feat');
+    await git(dir, '-c', 'core.editor=true', 'rebase', '-q', 'main');
+    const rebased = await git(dir, 'rev-parse', 'HEAD');
+    await git(dir, 'update-ref', 'refs/remotes/origin/feat', rebased);
+    expect(
+      await pushLineStat({
+        repo: dir,
+        ref: 'refs/remotes/origin/feat',
+        branch: 'feat',
+        before: old,
+      }),
+    ).toEqual({ additions: 4, deletions: 0 });
+  });
+
   it('measures a first push from the merge base with the default branch', async () => {
     const { dir, commit } = await repo();
     await git(dir, 'checkout', '-q', '-b', 'feat');

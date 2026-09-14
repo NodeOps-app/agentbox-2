@@ -112,7 +112,7 @@ const timelineEventProperties = {
   additions: {
     type: 'number',
     description:
-      '`git.push`: lines the push added, read from the host repo when it was recorded (the old tip to the new, or the merge base with the default branch for a first push). Absent when it could not be read.',
+      '`git.push`: lines the push added, read from the host repo when it was recorded (the old tip to the new, or the merge base with the default branch for a first push or a force-push that rewrote the old tip). Absent when it could not be read.',
   },
   deletions: {
     type: 'number',
@@ -1899,6 +1899,13 @@ export function buildOpenApi(): Record<string, unknown> {
               in: 'query',
               schema: { type: 'string' },
               description: 'ISO time the summary counts from; items are not filtered by it.',
+            },
+            {
+              name: 'sync',
+              in: 'query',
+              schema: { type: 'string', enum: ['0'] },
+              description:
+                '`0`: do not start a GitHub sync; `github` reports the last one (`syncing` before any). For a small read on every refresh. Any other value, or none, keeps the default.',
             },
           ],
           responses: {

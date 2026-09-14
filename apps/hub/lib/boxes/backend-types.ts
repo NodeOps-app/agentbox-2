@@ -1036,6 +1036,8 @@ export interface TimelineQuery {
   before?: string;
   since?: string;
   limit?: number;
+  /** `false`: report the GitHub sync's last status without starting one (a frequent, cheap read). */
+  sync?: boolean;
 }
 
 export type ManagerNoteResult = { ok: true; event: TimelineEvent } | { ok: false; error: string };

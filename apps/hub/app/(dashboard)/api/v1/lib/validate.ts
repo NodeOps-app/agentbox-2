@@ -1002,8 +1002,9 @@ export const TIMELINE_LIMIT_MAX = 500;
 /** `?before=&since=` are ISO times (normalized, so they compare with stored ones); `?limit=` 1–500. */
 export function parseTimelineQuery(
   url: URL,
-): Parsed<{ before?: string; since?: string; limit?: number }> {
-  const out: { before?: string; since?: string; limit?: number } = {};
+): Parsed<{ before?: string; since?: string; limit?: number; sync?: boolean }> {
+  const out: { before?: string; since?: string; limit?: number; sync?: boolean } = {};
+  if (url.searchParams.get('sync') === '0') out.sync = false;
   for (const field of ['before', 'since'] as const) {
     const raw = url.searchParams.get(field);
     if (raw === null || raw === '') continue;
