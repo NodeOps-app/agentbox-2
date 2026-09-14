@@ -16,7 +16,7 @@ review, merge), as before.
 | 2 | **Show every workspace box in Plan, even with no tasks** | S | By box mode draws a card only for boxes holding tasks. Draw an empty card (state, agent, branch, Web, `…`, "no tasks · drop one here") for the workspace's other boxes, after the ones with tasks. It is a drop target like the rest. |
 | 3 | **New Box from the Manager window preselects the project** | S | `ManagerTitleBar` New Box → `CreateBoxPanel`: preselect the sidebar's selected project, else the project whose root equals the workspace root (single-project workspace), else today's default. |
 | 4 | **Last 2 timeline items on top of Plan** | M | A compact strip above the Tasks header, using `TimelineRowView` in a condensed mode (no quote, one line). "View all" switches to Timeline. Fetch the timeline in Plan mode too, with `limit=2` + live rows, on the same refresh. The 60 s GitHub check must stay tied to Timeline mode (`limit=2` must not kick it), or it runs whenever the window is open. |
-| 5 | **Manager terminal in the Timeline view too** | M | **Clarify first**: Plan already shows the manager terminal under the task list. Presumed intent: Timeline keeps the terminal pane under the timeline instead of hiding the whole split. Swap only the top pane (tasks ⇄ timeline) and leave the terminal attached at the same size (never resize the tmux client). |
+| 5   | **Manager terminal in the Timeline view too** | M | Confirmed: Timeline keeps the terminal pane under the timeline instead of hiding the whole split. Swap only the top pane (tasks ⇄ timeline) and leave the terminal attached at the same size (never resize the tmux client). |
 
 ## Phase 10b — Manager terminal (hub + tray)
 
@@ -41,7 +41,7 @@ The manager runs in a hub-owned tmux session (`startManagerSession`,
 | # | Item | Size | Notes |
 |---|------|------|-------|
 | 11 | **+/− lines on push rows** | M | Compute when the push is recorded, from the host repo, never by a remote exec: the relay push path already has the host repo and the old/new tips, so `git diff --shortstat <old>..<new>` there is a local, sub-10 ms call. The hub-route push (`git/push`, `push-host`) does the same against the host checkout after the push. Store `additions/deletions` on the `git.push` event (the tray already renders a diff line). Skip silently when the old tip is unknown (first push → diff against the merge base with the default branch, capped). |
-| 12 | **Host skill: use tasks when parallelizing** | S | `apps/cli/share/host-skills/agentbox-info/SKILL.md` (+ `plugins/agentbox`, `pnpm check:plugin-skill`): 3–4 lines max. Workspaces have tasks (`T-n`); when the user asks to split or parallelize work across boxes: `agentbox tasks add …`, then start boxes with those tasks / `agentbox tasks assign`. **Confirm**: the request said "tags"; read as tasks. |
+| 12 | **Host skill: use tasks when parallelizing** | S | `apps/cli/share/host-skills/agentbox-info/SKILL.md` (+ `plugins/agentbox`, `pnpm check:plugin-skill`): 3–4 lines max. Workspaces have tasks (`T-n`); when the user asks to split or parallelize work across boxes: `agentbox tasks add …`, then start boxes with those tasks / `agentbox tasks assign`. Confirmed: tasks. |
 | 13 | **Timeline notes via CLI/REST** | done | Already shipped in Phase 9: `agentbox manager note "…" [--replan\|--plan]`, `--note` on `tasks add/update/assign/reorder`, `POST /api/v1/managers/{id}/notes`. The skill's manager section already shows it; only tighten the wording while doing #12. |
 
 ## Parked (decided to look at later)
