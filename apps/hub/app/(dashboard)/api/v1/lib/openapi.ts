@@ -58,6 +58,7 @@ const timelineEventTypes = [
   'box.started',
   'box.stopped',
   'box.destroyed',
+  'box.branch',
   'git.push',
   'pr.opened',
   'pr.ready',
@@ -85,7 +86,12 @@ const timelineEventProperties = {
   boxId: { type: 'string' },
   boxName: { type: 'string' },
   agent: { type: 'string' },
-  branch: { type: 'string' },
+  branch: { type: 'string', description: '`box.branch`: the branch the box switched to.' },
+  base: {
+    type: 'string',
+    description:
+      "`box.created` / `box.ready`: the branch the box forked from (the create's `fromBranch`, else the branch the project's host checkout was on; absent when unknown). `box.branch`: the branch it switched away from.",
+  },
   projectId: { type: 'string' },
   taskIds: {
     type: 'array',
@@ -3657,6 +3663,39 @@ export function buildOpenApi(): Record<string, unknown> {
           description:
             "The row's branch on the web, e.g. `https://github.com/acme/storefront-web/tree/feat/checkout-copy`, each branch segment URL-encoded. Added at read time, never stored. Present only when the row names a branch (`pr.head` on a PR row, else `branch`) and its repo is known: from `pr.url`, else a repo the GitHub sync resolved, else the row's project or box repo as the last sync cached it.",
         },
+        TimelineLane: {
+          type: 'object',
+          description:
+            'Where a row sits when the timeline is drawn as a branch graph. Assigned at read time over the whole log before paging, so a lane keeps its id on every page; set on every item and live row.',
+          properties: {
+            id: {
+              type: 'string',
+              description:
+                '`trunk`, `box:<boxId>`, or `branch:<head>` for a pull request no box is known to own.',
+            },
+            kind: { type: 'string', enum: ['trunk', 'box', 'branch'] },
+            from: {
+              type: 'string',
+              description:
+                "On the lane's oldest row: the lane it forked from (the box lane that last carried its `base`, else `trunk`). Absent on a page that does not reach the fork.",
+            },
+            into: {
+              type: 'string',
+              description:
+                '`pr.merged`: the lane it merged into (the box lane carrying `pr.base`, else `trunk`). The row stays on its own lane.',
+            },
+            branch: {
+              type: 'string',
+              description: "The lane's branch, on its first row and on every row where it changes.",
+            },
+            open: {
+              type: 'boolean',
+              description:
+                "On the lane's live rows and its newest item when the lane goes on: a live row exists, or the box still exists and is running or has unmerged work.",
+            },
+          },
+          required: ['id', 'kind'],
+        },
         TimelineItem: {
           type: 'object',
           description:
@@ -3670,6 +3709,7 @@ export function buildOpenApi(): Record<string, unknown> {
               description: '`pr.merged`: a message about this PR was sent before it merged.',
             },
             branchUrl: { $ref: '#/components/schemas/TimelineBranchUrl' },
+            lane: { $ref: '#/components/schemas/TimelineLane' },
           },
           required: ['id', 'at', 'type', 'actor'],
         },
@@ -3698,6 +3738,7 @@ export function buildOpenApi(): Record<string, unknown> {
             pr: { $ref: '#/components/schemas/TimelinePr' },
             awaiting: { type: 'boolean' },
             approved: { type: 'boolean' },
+            lane: { $ref: '#/components/schemas/TimelineLane' },
           },
           required: ['id', 'type', 'at'],
         },

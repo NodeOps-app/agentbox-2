@@ -238,6 +238,7 @@ export type TimelineEventType =
   | 'box.started'
   | 'box.stopped'
   | 'box.destroyed'
+  | 'box.branch'
   | 'git.push'
   | 'pr.opened'
   | 'pr.ready'
@@ -284,6 +285,11 @@ export interface TimelineEvent {
   boxName?: string;
   agent?: string;
   branch?: string;
+  /**
+   * The branch the work started from: `box.created`/`box.ready`, the branch the
+   * box forked from; `box.branch`, the branch it switched away from.
+   */
+  base?: string;
   projectId?: string;
   /** Captured at write time: reconciliation later clears a task's box pointer. */
   taskIds?: string[];

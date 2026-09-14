@@ -25,9 +25,11 @@ import {
   type TimelineStamp,
   type WorkTask,
 } from '@agentbox/relay';
+import { scratchBranchName } from '@agentbox/sandbox-core';
 import { inBackground } from './background';
 import { reconcileContext, type BackendDeps, type DiffStat, type TimelineBoxFact } from './deps';
 import { createGithubPrSync, type GithubPrSync } from './github-prs';
+import { assignLanes } from './timeline-lanes';
 import type {
   HubBackend,
   TimelineBackend,
@@ -376,7 +378,14 @@ export function createTimelineBackend(
       const boxes = facts.filter(
         (b) => findWorkspaceContaining(workspaces, b.projectRoot)?.id === wsId,
       );
-      let items = aggregateTimeline(events);
+      // Copies: an aggregated item can be the parsed event itself, and lanes are never stored.
+      const all = aggregateTimeline(events).map((i) => ({ ...i }));
+      const live = [
+        ...(await liveBoxItems(boxes, tasks, events)),
+        ...liveReadyItems(events, (repo, n) => sync.prState(repo, n), sync.synced(wsId)),
+      ];
+      assignLanes(all, live, boxes);
+      let items = all;
       if (q.before) items = items.filter((i) => i.at < q.before!);
       items = items.slice(0, q.limit ?? TIMELINE_DEFAULT_LIMIT);
       // Links come from the sync's cache only: a read never waits on `gh`.
@@ -391,16 +400,13 @@ export function createTimelineBackend(
         },
       };
       items = items.map((i) => withBranchUrl(i, lookup));
-      const live = [
-        ...(await liveBoxItems(boxes, tasks, events)),
-        ...liveReadyItems(events, (repo, n) => sync.prState(repo, n), sync.synced(wsId)),
-      ].map((l) => withBranchUrl(l, lookup));
+      const liveRows = live.map((l) => withBranchUrl(l, lookup));
       const boxIds = new Set(boxes.map((b) => b.id));
       const pending = (deps.pendingApprovalBoxIds?.() ?? []).filter((id) => boxIds.has(id)).length;
       return {
         items,
-        live,
-        ...(q.since ? { summary: buildTimelineSummary(events, q.since, live, pending) } : {}),
+        live: liveRows,
+        ...(q.since ? { summary: buildTimelineSummary(events, q.since, liveRows, pending) } : {}),
         github,
       };
     },
@@ -467,10 +473,10 @@ export interface BoxTimelineSeams {
 
 /**
  * Wrap the box routes that change what a workspace's timeline says: create,
- * start/stop/destroy, and the two pushes. Wrapped rather than threaded through
- * each method's many return paths. Every record runs in the background after the
- * operation answered, so it neither delays the response nor turns a success
- * into a failure.
+ * start/stop/destroy, the two pushes, and checkout/new branch. Wrapped rather
+ * than threaded through each method's many return paths. Every record runs in
+ * the background after the operation answered, so it neither delays the
+ * response nor turns a success into a failure.
  */
 export function withBoxTimeline(hub: HubBackend, seams: BoxTimelineSeams): HubBackend {
   const { deps } = seams;
@@ -500,13 +506,14 @@ export function withBoxTimeline(hub: HubBackend, seams: BoxTimelineSeams): HubBa
     type: TimelineEvent['type'],
     meta: TimelineMeta | undefined,
     op: () => Promise<R>,
-    push?: PushTarget,
+    { push, branch }: { push?: PushTarget; branch?: string } = {},
   ): Promise<R> {
-    // A destroyed box has no record left to name it by, and a push moves the
-    // ref its diff is measured from, so both are read first. A push still reads
-    // the fact again afterwards: the op may have hydrated the box from its Store
+    // A destroyed box has no record left to name it by, a push moves the ref
+    // its diff is measured from, and a branch switch replaces the branch it
+    // switches away from, so all three are read first. A push still reads the
+    // fact again afterwards: the op may have hydrated the box from its Store
     // registration, and then the row is logged without a diff.
-    const early = type === 'box.destroyed' || push !== undefined;
+    const early = type === 'box.destroyed' || push !== undefined || branch !== undefined;
     const before = early ? await factOf(id).catch(() => undefined) : undefined;
     const stat = push ? await pushStatBefore(before, push).catch(() => undefined) : undefined;
     const res = await op();
@@ -521,7 +528,16 @@ export function withBoxTimeline(hub: HubBackend, seams: BoxTimelineSeams): HubBa
         boxEventBase(fact, ws.id),
         stat ? pushLineStat(stat) : undefined,
       ]);
-      await recordTimelineEvent(ws.id, { type, ...stampFields(stamp), ...base, ...(diff ?? {}) });
+      const previous = before?.branches[0];
+      await recordTimelineEvent(ws.id, {
+        type,
+        ...stampFields(stamp),
+        ...base,
+        ...(diff ?? {}),
+        ...(branch
+          ? { branch, ...(previous && previous !== branch ? { base: previous } : {}) }
+          : {}),
+      });
       deps.notify();
     });
     return res;
@@ -533,6 +549,8 @@ export function withBoxTimeline(hub: HubBackend, seams: BoxTimelineSeams): HubBa
   const destroy = hub.destroy.bind(hub);
   const gitPush = hub.gitPush.bind(hub);
   const gitPushHost = hub.gitPushHost.bind(hub);
+  const gitCheckout = hub.gitCheckout.bind(hub);
+  const gitNewBranch = hub.gitNewBranch.bind(hub);
 
   hub.create = async (input, meta) => {
     const res = await create(input, meta);
@@ -548,6 +566,8 @@ export function withBoxTimeline(hub: HubBackend, seams: BoxTimelineSeams): HubBa
       const stamp = named ?? (await stampInWorkspace(meta, ws.id, seams.stampFor));
       const name = input.name?.trim();
       const branch = input.opts?.useBranch ?? (name ? `agentbox/${name}` : undefined);
+      const base =
+        input.fromBranch?.trim() || (await deps.projectBranch?.(projectId).catch(() => undefined));
       await recordTimelineEvent(ws.id, {
         type: 'box.created',
         ...stampFields(stamp),
@@ -555,6 +575,7 @@ export function withBoxTimeline(hub: HubBackend, seams: BoxTimelineSeams): HubBa
         ...(name ? { boxName: name } : {}),
         ...(input.agent !== 'none' ? { agent: input.agent } : {}),
         ...(branch ? { branch } : {}),
+        ...(base ? { base } : {}),
         projectId,
       });
       deps.notify();
@@ -567,12 +588,17 @@ export function withBoxTimeline(hub: HubBackend, seams: BoxTimelineSeams): HubBa
     recordAround(id, 'box.destroyed', meta, () => destroy(id, o, meta));
   hub.gitPush = (id, input, meta) =>
     recordAround(id, 'git.push', meta, () => gitPush(id, input, meta), {
-      ...(input?.remote ? { remote: input.remote } : {}),
+      push: { ...(input?.remote ? { remote: input.remote } : {}) },
     });
   hub.gitPushHost = (id, input, meta) =>
     recordAround(id, 'git.push', meta, () => gitPushHost(id, input, meta), {
-      hostOnly: true,
-      ...(input?.as ? { as: input.as } : {}),
+      push: { hostOnly: true, ...(input?.as ? { as: input.as } : {}) },
+    });
+  hub.gitCheckout = (id, branch, args, meta) =>
+    recordAround(id, 'box.branch', meta, () => gitCheckout(id, branch, args, meta), { branch });
+  hub.gitNewBranch = (id, input, meta) =>
+    recordAround(id, 'box.branch', meta, () => gitNewBranch(id, input, meta), {
+      branch: scratchBranchName(input.name),
     });
   return hub;
 }

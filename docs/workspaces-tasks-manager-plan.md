@@ -55,6 +55,8 @@ the manager's own instructions come after.
 | 8b | Tray: boxes grouped by manager, the Manager window's session picker | planned |
 | 9a | Timeline: per-workspace event log, GitHub PR sync, `GET …/timeline`, manager notes and messages | **done** |
 | 9b | Tray: Plan / Timeline in the Manager window, Approve → message the manager | in progress |
+| 11a | Timeline as a branch graph: `lane` on timeline rows, `base`, `box.branch` | **done** |
+| 11b | Tray: draw the timeline as a branch graph | in progress |
 
 ### Known gaps
 
@@ -419,6 +421,54 @@ resume's prompt that starts with `-` gets a leading space so the agent cannot pa
   next hub-side change.
 
 Open work after Phase 9 is tracked in [`workspaces-tasks-manager-backlog.md`](./workspaces-tasks-manager-backlog.md).
+
+## Phase 11 — the timeline as a branch graph
+
+The Manager window draws the timeline like a git graph: each box is a coloured lane that forks off the
+line it started from, runs beside the others, and merges back into its pull request's base. The hub
+decides the lanes, so a web view gets the same graph; the tray only packs lanes into columns and
+draws them.
+
+**What is recorded.**
+
+| Field / event | Written by |
+| --- | --- |
+| `base` on `box.created` | the hub's create: `fromBranch`, else the branch the project's host checkout is on (`git symbolic-ref --short HEAD`, 1 s, through `BackendDeps.projectBranch`). Absent on a detached HEAD or any failure; never fails the create |
+| `base` on `box.ready` | the queue worker, from the job's `createOpts.fromBranch` when it has one |
+| `box.branch` `{boxId, boxName, branch, base?}` | `withBoxTimeline` around `gitCheckout` and `gitNewBranch`, after success. `branch` is the new branch, `base` the one the box left. No dedupe key |
+
+The relay has no in-box checkout RPC. A switch made inside the box shows only when a later push or PR
+names the new head.
+
+**Lanes** (`apps/hub/lib/backend/timeline-lanes.ts`, pure). `getTimeline` aggregates the whole log,
+builds the live rows, and calls `assignLanes` before `before`/`limit` apply, so ids are stable across
+pages. The walk runs oldest to newest and stamps `lane: {id, kind, from?, into?, branch?, open?}` on
+every item and live row:
+
+- **`id`**, first match wins:
+  - `box:<boxId>`, from the row's `boxId` or its job key. `box.created` has no box id, but its job's
+    `box.ready`/`box.failed` does.
+  - For `pr.*` and `git.push`, the lane that last carried the head branch.
+  - `branch:<head>` for a PR.
+  - Otherwise `trunk`: tasks without a box, managers, notes, plans, and a create whose job has not
+    finished.
+- **`from`**, on a lane's oldest row: the box lane that last carried the lane's `base`, else `trunk`.
+  A PR lane uses `pr.base`.
+- **`into`**, on `pr.merged`: the box lane carrying `pr.base`, else `trunk`. The row stays on its own
+  lane.
+- **`branch`**, on the first row and wherever the lane's branch changes: `box.branch`, or a push or PR
+  on a new head after a merge.
+- **`open`**, on every live row, and on the lane's newest item when the lane goes on. That is when a
+  live row exists, or the box still exists and either is running or its last work was not a merge or
+  a close (start and stop rows don't count as work).
+
+A branch first met as a base that no lane carried (`main`) stays the trunk's. A box that later checks
+it out does not take it over, so later forks and merges don't hang off that box.
+
+**Known gaps.**
+- A multi-repo workspace shares one trunk.
+- A create whose job has not finished sits on the trunk until its `box.ready`.
+- A branch lane that merged and gets a new PR on the same head reuses its lane without a new fork.
 
 ## Files to touch (representative)
 

@@ -89,7 +89,9 @@ session); building it needs a Swift 6 toolchain:
   (`start`/`pause`/`resume`/`stop`/`destroy`), git, rename, and services routes. Approvals use
   `/api/v1/approvals` (+ `…/{id}/answer`), live events the SSE `/api/events` stream.
   The Manager window's Timeline reads `GET /api/v1/workspaces/{id}/timeline` (`{items, live, summary,
-  github}`; a row naming a branch with a known GitHub repo carries `branchUrl`) and its Approve posts `POST /api/v1/managers/{id}/message` (`{text, prNumber?, repo?}`; `409`
+  github}`; a row naming a branch with a known GitHub repo carries `branchUrl`, and every item and live row
+  carries `lane` — `{id: trunk|box:<id>|branch:<head>, kind, from?, into?, branch?, open?}` — for drawing the
+  timeline as a branch graph; `box.branch` rows mark a box's branch switch) and its Approve posts `POST /api/v1/managers/{id}/message` (`{text, prNumber?, repo?}`; `409`
   `manager_unreachable` means copy the text for the user to paste). Boxes group under
   their manager session in the menu: `Box.managerId` joins a box to a row of `GET /api/v1/managers`
   (host claude/codex sessions, detected or hub-run; `…/{id}/resume` reopens one in the hub's tmux; `…/{id}/attach` opens a claude manager's detached Claude background session (`background` on the manager) in a hub tmux session, and a stop on one closes only that attach session), and

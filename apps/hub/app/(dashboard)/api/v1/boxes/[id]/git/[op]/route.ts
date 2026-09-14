@@ -47,13 +47,13 @@ export async function POST(
     case 'checkout': {
       const p = parseGitCheckout(body);
       if (!p.ok) return fail('invalid_request', p.message, p.details);
-      res = await backend.gitCheckout(id, p.value.branch, p.value.args);
+      res = await backend.gitCheckout(id, p.value.branch, p.value.args, meta);
       break;
     }
     case 'branch': {
       const p = parseGitBranch(body);
       if (!p.ok) return fail('invalid_request', p.message, p.details);
-      res = await backend.gitNewBranch(id, p.value);
+      res = await backend.gitNewBranch(id, p.value, meta);
       break;
     }
     case 'pull': {

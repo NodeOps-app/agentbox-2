@@ -71,6 +71,8 @@ export interface BackendDeps {
    * reads its runtime state (a docker inspect, or a cloud box's last state).
    */
   boxFact?(id: string, opts?: { withState?: boolean }): Promise<TimelineBoxFact | undefined>;
+  /** The branch a project's host checkout is on (a create's default base); undefined on any failure. */
+  projectBranch?(projectId: string): Promise<string | undefined>;
   /** `git diff --shortstat` in a running box; null when the exec fails. */
   boxDiffStat?(box: TimelineBoxFact): Promise<DiffStat | null>;
   /** Box ids with a pending host-action approval. */

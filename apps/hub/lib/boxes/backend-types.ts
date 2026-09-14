@@ -630,9 +630,18 @@ export interface HubBackend extends WorkspaceBackend, ManagerBackend, TimelineBa
   // ── box git operations ──
   // Change the box's working branch (git checkout, local to the worktree).
   // `args` are extra flags forwarded to `git checkout` (e.g. a pathspec).
-  gitCheckout(id: string, branch: string, args?: string[]): Promise<BoxOpResult>;
+  gitCheckout(
+    id: string,
+    branch: string,
+    args?: string[],
+    meta?: TimelineMeta,
+  ): Promise<BoxOpResult>;
   // Create a fresh agentbox/* branch from HEAD (or `from`) and switch onto it.
-  gitNewBranch(id: string, input: { name: string; from?: string }): Promise<BoxOpResult>;
+  gitNewBranch(
+    id: string,
+    input: { name: string; from?: string },
+    meta?: TimelineMeta,
+  ): Promise<BoxOpResult>;
   // Push the box's branch to the remote via the host relay. `args` are extra
   // flags forwarded to the host-built `git push` (e.g. --tags, --force-with-lease).
   gitPush(
@@ -979,6 +988,24 @@ export interface TimelineMeta {
   note?: string;
 }
 
+/**
+ * Where a row sits when the timeline is drawn as a branch graph. Added at read
+ * time over the whole log, so a lane keeps its id and fork on every page.
+ */
+export interface TimelineLane {
+  /** `trunk`, `box:<boxId>`, or `branch:<head>` for a pull request no box is known to own. */
+  id: string;
+  kind: 'trunk' | 'box' | 'branch';
+  /** On the lane's oldest row: the lane it forked from. */
+  from?: string;
+  /** `pr.merged`: the lane it merged into. The row itself stays on its own lane. */
+  into?: string;
+  /** The lane's branch, on its first row and on every row where it changes. */
+  branch?: string;
+  /** On the lane's newest item and on its live rows: the lane goes on past that row. */
+  open?: boolean;
+}
+
 /** A timeline row: an event, or a `plan` that several `task.created` events collapsed into. */
 export interface TimelineItem extends Omit<TimelineEvent, 'type'> {
   type: TimelineEventType | 'plan';
@@ -988,6 +1015,7 @@ export interface TimelineItem extends Omit<TimelineEvent, 'type'> {
   approvedByYou?: boolean;
   /** The branch on the web (`…/tree/<branch>`); added at read time, only when its GitHub repo is known. */
   branchUrl?: string;
+  lane?: TimelineLane;
 }
 
 /** A row that is true now, built at read time and never stored. */
@@ -1013,6 +1041,8 @@ export interface TimelineLiveItem {
   awaiting?: boolean;
   /** `pr.ready`: a message about it was already sent to the manager. */
   approved?: boolean;
+  /** As on {@link TimelineItem}; always `open`. */
+  lane?: TimelineLane;
 }
 
 export interface TimelineSummary {

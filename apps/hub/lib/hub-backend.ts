@@ -57,6 +57,7 @@ import {
   isValidBoxStatus,
   loadQueue,
   queueLogPath,
+  readCurrentBranch,
   readJob,
   registrationToBoxRecord,
   writeQueueLoginCode,
@@ -2103,6 +2104,10 @@ export function createHubBackend(handle: RelayServerHandle): HubBackend {
       providerForBox,
     }),
     pendingApprovalBoxIds: () => handle.prompts.all().map((p) => p.boxId),
+    async projectBranch(projectId) {
+      const root = await resolveProjectPath(projectId);
+      return root ? readCurrentBranch(root) : undefined;
+    },
   };
   const workspaces = createWorkspaceBackend(backendDeps);
   const prSync = createGithubPrSync(backendDeps);

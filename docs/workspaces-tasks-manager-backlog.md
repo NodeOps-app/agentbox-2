@@ -44,6 +44,15 @@ The manager runs in a hub-owned tmux session (`startManagerSession`,
 | 12 | **Host skill: use tasks when parallelizing** | done | New "Workspaces: tasks, and the timeline when you manage" section: make tasks first (`tasks add`), then `agentbox claude -i --tasks T-1,T-2` or `tasks assign T-3 --box <box>`. Plugin copy synced. |
 | 13 | **Timeline notes via CLI/REST** | done | Shipped in Phase 9; the skill's manager wording was tightened with #12 (same examples, fewer lines). |
 
+## Phase 11 — Timeline as a branch graph (hub + tray)
+
+Design in [`workspaces-tasks-manager-plan.md`](./workspaces-tasks-manager-plan.md#phase-11--the-timeline-as-a-branch-graph).
+
+| # | Item | Size | Notes |
+|---|------|------|-------|
+| 14 | **Hub: lanes on the timeline API** | done | `lane: {id, kind, from?, into?, branch?, open?}` on every item and live row, assigned at read time before paging (`timeline-lanes.ts`). `base` on `box.created`/`box.ready`, `box.branch` after checkout/new branch. OpenAPI + api.mdx. |
+| 15 | **Tray: draw the graph** | in progress | Column packing (`TimelineGraph.layout`), lane colours, curves at forks and merges, an inline type glyph before the title. |
+
 ## Parked (decided to look at later)
 
 - **Realtime box activity / in-box pushes and PRs**: the relay status store and the relay timeline hooks don't fire the hub change signal, so those arrive on the 30 s poll. Fix: notify from both, debounced.

@@ -223,6 +223,7 @@ export async function recordCreateJobTimeline(job: QueueJob): Promise<void> {
       ...(name ? { boxName: name } : {}),
       ...(agent ? { agent } : {}),
       ...(branch ? { branch } : {}),
+      ...(job.createOpts.fromBranch ? { base: job.createOpts.fromBranch } : {}),
       ...(managerId ? { managerId } : {}),
       ...(taskIds.length ? { taskIds } : {}),
       ...(!ready && job.reason ? { text: job.reason.slice(0, 500) } : {}),

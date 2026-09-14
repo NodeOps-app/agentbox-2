@@ -23,6 +23,7 @@ import {
 import type { BackendDeps, TimelineBoxFact } from '../lib/backend/deps';
 import type { HubBackend } from '../lib/boxes/backend-types';
 import { hashProjectPath } from '@agentbox/config';
+import { scratchBranchName } from '@agentbox/sandbox-core';
 import {
   readTimeline,
   readWorkspace,
@@ -629,6 +630,8 @@ describe('stamps from routes that do not name a workspace', () => {
       destroy: okResult,
       gitPush: okResult,
       gitPushHost: okResult,
+      gitCheckout: okResult,
+      gitNewBranch: okResult,
     } as unknown as HubBackend;
   }
 
@@ -762,6 +765,8 @@ describe('push rows', () => {
           git('branch', 'landed', next);
           return { ok: true as const };
         },
+        gitCheckout: okResult,
+        gitNewBranch: okResult,
       } as unknown as HubBackend,
       { deps: h.deps, stampFor: managers.timelineStamp },
     );
@@ -810,6 +815,8 @@ describe('a push on a box hydrated during the push', () => {
           return { ok: true as const };
         },
         gitPushHost: okResult,
+        gitCheckout: okResult,
+        gitNewBranch: okResult,
       } as unknown as HubBackend,
       { deps: h.deps, stampFor: managers.timelineStamp },
     );
@@ -1004,5 +1011,154 @@ describe('branch links', () => {
     expect(h.gh.mock.calls.some(([args]) => args[0] === 'repo')).toBe(false);
     const raw = await readFile(timelineFile((await resolveWorkspaceDir(wsId))!), 'utf8');
     expect(raw).not.toContain('branchUrl');
+  });
+});
+
+describe('branch graph', () => {
+  function branchHub(ok = true): HubBackend {
+    const result = async () => (ok ? { ok: true as const } : { ok: false as const, error: 'no' });
+    let jobs = 0;
+    return {
+      // Distinct jobs: one job's create key would dedupe the second create away.
+      create: async () => ({ ok: true as const, jobId: `job${String((jobs += 1))}` }),
+      start: result,
+      stop: result,
+      destroy: result,
+      gitPush: result,
+      gitPushHost: result,
+      gitCheckout: result,
+      gitNewBranch: result,
+    } as unknown as HubBackend;
+  }
+
+  it("records a create's base: its fromBranch, else the project's current branch", async () => {
+    const h = harness();
+    const { workspaces, managers } = backends(h);
+    const added = await workspaces.addWorkspace({ path: await folder() });
+    if (!added.ok) throw new Error(added.error);
+    const projectId = added.workspace.projectIds[0]!;
+    const asked: string[] = [];
+    h.deps.projectBranch = async (id) => {
+      asked.push(id);
+      return 'develop';
+    };
+    const hub = withBoxTimeline(branchHub(), { deps: h.deps, stampFor: managers.timelineStamp });
+    type CreateInput = Parameters<HubBackend['create']>[0];
+    await hub.create({ projectId, agent: 'claude', name: 'plain' } as CreateInput);
+    await backgroundSettled();
+    await hub.create({
+      projectId,
+      agent: 'claude',
+      name: 'stacked',
+      fromBranch: 'agentbox/plain',
+    } as CreateInput);
+    await backgroundSettled();
+
+    const creates = (await readTimeline(added.workspace.id)).filter(
+      (e) => e.type === 'box.created',
+    );
+    expect(creates.find((e) => e.boxName === 'plain')?.base).toBe('develop');
+    expect(creates.find((e) => e.boxName === 'stacked')?.base).toBe('agentbox/plain');
+    expect(asked).toEqual([projectId]);
+  });
+
+  it('writes box.branch after a checkout or a new branch, and nothing when it fails', async () => {
+    const h = harness();
+    const { workspaces, managers } = backends(h);
+    const root = await folder();
+    const added = await workspaces.addWorkspace({ path: root });
+    if (!added.ok) throw new Error(added.error);
+    const box: TimelineBoxFact = {
+      id: 'box1',
+      name: 'box-one',
+      branches: ['agentbox/box-one'],
+      state: 'running',
+      projectRoot: root,
+      projectId: 'p1',
+    };
+    h.boxes.push(box);
+    const seams = { deps: h.deps, stampFor: managers.timelineStamp };
+    await withBoxTimeline(branchHub(false), seams).gitCheckout('box1', 'feat/nope');
+    await backgroundSettled();
+    const hub = withBoxTimeline(branchHub(), seams);
+    await hub.gitCheckout('box1', 'feat/x');
+    await backgroundSettled();
+    box.branches = ['feat/x', 'agentbox/box-one'];
+    await hub.gitNewBranch('box1', { name: 'retry' });
+    await backgroundSettled();
+
+    const rows = (await readTimeline(added.workspace.id)).filter((e) => e.type === 'box.branch');
+    expect(rows).toHaveLength(2);
+    expect(rows.find((e) => e.branch === 'feat/x')).toMatchObject({
+      actor: 'human',
+      boxId: 'box1',
+      boxName: 'box-one',
+      base: 'agentbox/box-one',
+    });
+    expect(rows.find((e) => e.branch === scratchBranchName('retry'))).toMatchObject({
+      boxId: 'box1',
+      base: 'feat/x',
+    });
+  });
+
+  it('returns lanes on every row, the same on a short page, and never stores them', async () => {
+    const h = harness();
+    const { workspaces } = backends(h);
+    const root = await folder();
+    const added = await workspaces.addWorkspace({ path: root });
+    if (!added.ok) throw new Error(added.error);
+    const wsId = added.workspace.id;
+    h.boxes.push({
+      id: 'box1',
+      name: 'box-one',
+      branches: ['agentbox/box-one'],
+      state: 'running',
+      projectRoot: root,
+      projectId: 'p1',
+    });
+    const at = (s: number) => new Date(Date.UTC(2026, 8, 13, 10, 0, s)).toISOString();
+    await recordTimelineEvent(wsId, {
+      type: 'box.created',
+      actor: 'human',
+      at: at(1),
+      key: 'job:j1:created',
+      boxName: 'box-one',
+      branch: 'agentbox/box-one',
+      base: 'main',
+    });
+    await recordTimelineEvent(wsId, {
+      type: 'box.ready',
+      actor: 'hub',
+      at: at(2),
+      key: 'job:j1:ready',
+      boxId: 'box1',
+      branch: 'agentbox/box-one',
+    });
+    await recordTimelineEvent(wsId, {
+      type: 'manager.note',
+      actor: 'human',
+      at: at(3),
+      text: 'pushing next',
+    });
+    await recordTimelineEvent(wsId, {
+      type: 'git.push',
+      actor: 'box',
+      at: at(4),
+      boxId: 'box1',
+      branch: 'agentbox/box-one',
+    });
+
+    const timeline = createTimelineBackend(h.deps, { sync: createGithubPrSync(h.deps) });
+    const res = await timeline.getTimeline(wsId, { sync: false });
+    expect(res!.items.map((i) => [i.type, i.lane])).toEqual([
+      ['git.push', { id: 'box:box1', kind: 'box', open: true }],
+      ['manager.note', { id: 'trunk', kind: 'trunk' }],
+      ['box.ready', { id: 'box:box1', kind: 'box' }],
+      ['box.created', { id: 'box:box1', kind: 'box', from: 'trunk', branch: 'agentbox/box-one' }],
+    ]);
+    const page = await timeline.getTimeline(wsId, { sync: false, limit: 1 });
+    expect(page!.items[0]!.lane).toEqual({ id: 'box:box1', kind: 'box', open: true });
+    const raw = await readFile(timelineFile((await resolveWorkspaceDir(wsId))!), 'utf8');
+    expect(raw).not.toContain('lane');
   });
 });

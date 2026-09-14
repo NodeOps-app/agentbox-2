@@ -83,6 +83,12 @@ export function readRefTip(
   return tipWith(gitWithin(repo, Date.now() + timeoutMs), ref);
 }
 
+/** The branch a checkout is on; undefined on a detached HEAD, a slow git, or no repo. */
+export function readCurrentBranch(repo: string, timeoutMs = 1000): Promise<string | undefined> {
+  const git = gitWithin(repo, Date.now() + timeoutMs);
+  return git(['symbolic-ref', '--quiet', '--short', 'HEAD']).then((s) => s || undefined);
+}
+
 async function defaultBranchBase(git: Git, tip: string): Promise<string | undefined> {
   const head = await git(['symbolic-ref', '--quiet', 'refs/remotes/origin/HEAD']);
   for (const ref of [...(head ? [head] : []), ...DEFAULT_BRANCH_REFS]) {
