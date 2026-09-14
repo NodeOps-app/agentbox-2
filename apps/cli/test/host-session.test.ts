@@ -109,6 +109,40 @@ describe('detectHostSession: claude', () => {
       detectHostSession(deps({ env: { ...env, AGENTBOX_MANAGER: '--evil' }, files })),
     ).not.toHaveProperty('managerId');
   });
+
+  it('names the AgentBox tmux session its pane belongs to, and no other session', () => {
+    const files = { [join(transcriptDir('/work/repo'), `${ID}.jsonl`)]: NOW };
+    const env = { CLAUDE_CODE_SESSION_ID: ID, TMUX: '/tmp/tmux-501/default,1,0', TMUX_PANE: '%0' };
+    const asked: string[] = [];
+    const sessionOf =
+      (name: string) =>
+      (pane: string): string => {
+        asked.push(pane);
+        return name;
+      };
+    expect(
+      detectHostSession(
+        deps({ env, files, tmuxSessionOf: sessionOf('agentbox-manager-1020d6ffc6aa4e07') }),
+      ),
+    ).toMatchObject({ tmuxPane: '%0', tmuxSession: 'agentbox-manager-1020d6ffc6aa4e07' });
+    expect(asked).toEqual(['%0']);
+    expect(
+      detectHostSession(deps({ env, files, tmuxSessionOf: sessionOf('work') })),
+    ).not.toHaveProperty('tmuxSession');
+    // Without TMUX (a session in Claude's background daemon) tmux is never asked.
+    asked.length = 0;
+    const outside = { CLAUDE_CODE_SESSION_ID: ID, TMUX_PANE: '%0' };
+    expect(
+      detectHostSession(
+        deps({
+          env: outside,
+          files,
+          tmuxSessionOf: sessionOf('agentbox-manager-1020d6ffc6aa4e07'),
+        }),
+      ),
+    ).not.toHaveProperty('tmuxSession');
+    expect(asked).toEqual([]);
+  });
 });
 
 describe('detectHostSession: codex and refusals', () => {

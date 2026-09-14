@@ -92,7 +92,7 @@ session); building it needs a Swift 6 toolchain:
   github}`; a row naming a branch with a known GitHub repo carries `branchUrl`) and its Approve posts `POST /api/v1/managers/{id}/message` (`{text, prNumber?, repo?}`; `409`
   `manager_unreachable` means copy the text for the user to paste). Boxes group under
   their manager session in the menu: `Box.managerId` joins a box to a row of `GET /api/v1/managers`
-  (host claude/codex sessions, detected or hub-run; `…/{id}/resume` reopens one in the hub's tmux), and
+  (host claude/codex sessions, detected or hub-run; `…/{id}/resume` reopens one in the hub's tmux; `…/{id}/attach` opens a claude manager's detached Claude background session (`background` on the manager) in a hub tmux session, and a stop on one closes only that attach session), and
   `Box.pr` (`{repo, number, url?, state: open|ready|merged|closed}`, from the workspace timeline) labels a
   row with its pull request. **Auth to
   remember when changing the hub:** both `/api/v1/*` and `/api/events` go through the same gate

@@ -6,15 +6,22 @@ import { stat } from 'node:fs/promises';
 import { homedir, hostname as osHostname } from 'node:os';
 import {
   addWorkspace,
+  attachBackgroundSession,
   attachBoxToManager,
+  backgroundFor,
   buildManagerArgv,
   canonicalWorkspaceRoot,
+  createBackgroundSessionLookup,
+  detachBackgroundSession,
   findManager,
   findManagerBySession,
   findWorkspaceContaining,
   isResumableManagerAgent,
   listResumableHostSessions,
+  listTmuxSessions,
   listWorkspaces,
+  liveBackgroundSession,
+  MANAGER_SESSION_RE,
   managerSessionName,
   managerStatus,
   newManagerId,
@@ -35,12 +42,16 @@ import {
   stampFields,
   startManagerSession,
   stopManagerSession,
+  terminalSessionFor,
   tmuxAvailable,
   toManagerView,
   UNTITLED_SESSION,
   upsertDetectedManager,
   usesLegacySession,
   RESUMABLE_MANAGER_AGENTS,
+  type BackgroundSessionLookup,
+  type BackgroundSession,
+  type BackgroundSessionSnapshot,
   type ManagerProbe,
   type ManagerRecord,
   type ReconcileContext,
@@ -92,7 +103,13 @@ export interface ManagerBackendOptions {
   sessionTurn?: typeof sessionTurn;
   /** The pause between typing a message and submitting it; tests pass a no-op. */
   sleep?: (ms: number) => Promise<void>;
+  /** Seam for Claude's background sessions; production reads `claude agents` through `managerExec`. */
+  claudeBackground?: BackgroundSessionLookup;
 }
+
+/** What a stop answers for a manager whose session lives in Claude's daemon. */
+export const BACKGROUND_STOP_NOTICE =
+  "The Claude session keeps running in Claude's background daemon; only this hub's terminal for it was closed. End the session itself with `claude stop <id>`.";
 
 /**
  * How long a session whose title could not be read is left alone. `GET /managers`
@@ -157,6 +174,29 @@ export function createManagerBackend(
     return { ...rec, title };
   }
 
+  const lookupBackground =
+    opts.claudeBackground ??
+    createBackgroundSessionLookup(deps.managerExec ? { exec: deps.managerExec } : {});
+
+  /** The live daemon session a claude manager's session id names; only for a session on this machine. */
+  async function daemonSession(
+    rec: ManagerRecord,
+    fresh = false,
+  ): Promise<BackgroundSession | undefined> {
+    if (rec.agent !== 'claude' || !rec.sessionId || !storeIsLocal(rec)) return undefined;
+    return liveBackgroundSession(rec, await lookupBackground({ fresh }));
+  }
+
+  /** Running by its process, or by a session Claude's daemon still hosts. */
+  async function effectiveStatus(rec: ManagerRecord): Promise<'running' | 'stopped'> {
+    if (await daemonSession(rec)) return 'running';
+    return managerStatus(rec, probe);
+  }
+
+  function backgroundResumeRefusal(rec: ManagerRecord, s: BackgroundSession): string {
+    return `manager ${rec.id} is still running as a Claude background session (${s.id}); attach to it instead of resuming it`;
+  }
+
   const lookupTurn = opts.sessionTurn ?? sessionTurn;
 
   /** A manager as a timeline actor, with its current turn when its transcript is here. */
@@ -216,10 +256,32 @@ export function createManagerBackend(
     const records = await readReconciledManagers(ws.id, ctx);
     if (records.length === 0) return [];
     const tasks = await readTasks(ws.id);
+    // Only a claude session on this machine can be in Claude's daemon or in a
+    // tmux session here; a workspace without one never pays for the lookup.
+    const snap: BackgroundSessionSnapshot | undefined = records.some(
+      (r) => r.agent === 'claude' && storeIsLocal(r),
+    )
+      ? await lookupBackground()
+      : undefined;
+    const claimed = new Set<string>();
+    for (const r of records) {
+      claimed.add(managerSessionName(r.id));
+      if (r.tmuxSession) claimed.add(r.tmuxSession);
+    }
     return Promise.all(
       records.map(async (raw) => {
         const rec = await withTitle(raw);
-        const status = await managerStatus(rec, probe);
+        const local = snap !== undefined && rec.agent === 'claude' && storeIsLocal(rec);
+        const background = local ? backgroundFor(rec, snap) : undefined;
+        const inDaemon = local ? liveBackgroundSession(rec, snap) : undefined;
+        const status = background || inDaemon ? 'running' : await managerStatus(rec, probe);
+        const own = managerSessionName(rec.id);
+        const attachSession =
+          background && snap?.managerTmux.some((t) => t.session === own) ? own : null;
+        const terminalSession =
+          local && snap && rec.kind === 'external' && status === 'running'
+            ? terminalSessionFor(rec, snap, claimed)
+            : undefined;
         const lastExit =
           status === 'stopped' && rec.kind === 'hub' && rec.lastExit === undefined
             ? await readManagerExit(ws.id, rec.id, { legacy: usesLegacySession(rec) })
@@ -229,6 +291,8 @@ export function createManagerBackend(
           hostname: hostname(),
           workspaceName: ws.name,
           tasks,
+          ...(background ? { background, attachSession } : {}),
+          ...(terminalSession ? { terminalSession } : {}),
           ...(lastExit === undefined ? {} : { lastExit }),
         });
       }),
@@ -289,6 +353,57 @@ export function createManagerBackend(
     return running.length === 1 ? running[0] : undefined;
   }
 
+  /**
+   * The record a detect's `managerId` hint names, when it can be believed. Claude's
+   * daemon hands the env of the client that spawned it to every session it hosts,
+   * so `$AGENTBOX_MANAGER` reaches sessions that have nothing to do with that
+   * manager. Believed only for a record in the same folder that has no session
+   * yet (a hub start whose agent reports for the first time) or that is hub-run
+   * and running (its agent after a `/clear`).
+   */
+  async function trustedHint(
+    managerId: string | undefined,
+    cwd: string,
+  ): Promise<ManagerRecord | undefined> {
+    if (!managerId) return undefined;
+    const rec = await findManager(managerId);
+    if (!rec || rec.cwd !== cwd) return undefined;
+    if (!rec.sessionId) return rec;
+    if (rec.kind === 'hub' && (await managerStatus(rec, probe)) === 'running') return rec;
+    return undefined;
+  }
+
+  async function findManagerByTmux(session: string): Promise<ManagerRecord | undefined> {
+    for (const ws of await listWorkspaces()) {
+      const hit = (await readManagers(ws.id)).find((m) => m.tmuxSession === session);
+      if (hit) return hit;
+    }
+    return undefined;
+  }
+
+  /**
+   * The AgentBox tmux session a detect says it runs in, when it exists on this
+   * machine and started in the detect's folder: the manager that owns it, or the
+   * session itself to adopt when none does (the single-manager layout's
+   * `agentbox-manager-<workspaceId>`, whose migrated record was never written).
+   */
+  async function tmuxHome(
+    input: DetectManagerInput,
+    cwd: string,
+  ): Promise<{ owner?: ManagerRecord; adopt?: string } | undefined> {
+    const name = input.tmuxSession;
+    if (!name || !MANAGER_SESSION_RE.test(name) || input.host !== hostname()) return undefined;
+    const found = (await listTmuxSessions(deps.managerExec)).find((t) => t.session === name);
+    if (!found) return undefined;
+    const path = await canonicalWorkspaceRoot(found.path).catch(() => found.path);
+    if (path !== cwd) return undefined;
+    const owner =
+      (await findManager(name.slice('agentbox-manager-'.length))) ??
+      (await findManagerByTmux(name));
+    if (owner) return owner.cwd === cwd ? { owner } : undefined;
+    return { adopt: name };
+  }
+
   /** Running first, then the most recently seen. */
   function sortViews(views: ManagerView[]): ManagerView[] {
     return [...views].sort((a, b) => {
@@ -305,11 +420,11 @@ export function createManagerBackend(
   return {
     async detectManager(input: DetectManagerInput): Promise<DetectManagerResult> {
       const cwd = await canonicalWorkspaceRoot(input.cwd);
+      const home = await tmuxHome(input, cwd);
+      const hinted = home?.owner ?? (await trustedHint(input.managerId, cwd));
       // A session already registered stays where it is, even when this call came
       // from a subfolder another workspace contains.
-      const known =
-        (await findManagerBySession(input.agent, input.sessionId)) ??
-        (input.managerId ? await findManager(input.managerId) : null);
+      const known = (await findManagerBySession(input.agent, input.sessionId)) ?? hinted ?? null;
       let ws = known ? await readWorkspace(known.workspaceId) : null;
       let workspaceCreated = false;
       if (!ws) {
@@ -331,7 +446,7 @@ export function createManagerBackend(
           ? await (deps.processStartTime ?? processStartTime)(input.pid).catch(() => undefined)
           : undefined;
       const managerId =
-        input.managerId ?? (known ? undefined : await legacyManagerFor(ws.id, input.agent, cwd));
+        hinted?.id ?? (known ? undefined : await legacyManagerFor(ws.id, input.agent, cwd));
       const { manager, created, sessionChanged } = await upsertDetectedManager(ws.id, {
         agent: input.agent,
         sessionId: input.sessionId,
@@ -341,6 +456,7 @@ export function createManagerBackend(
         ...(input.host ? { host: input.host } : {}),
         ...(managerId ? { managerId } : {}),
         ...(input.tmuxPane ? { tmuxPane: input.tmuxPane } : {}),
+        ...(home?.adopt ? { tmuxSession: home.adopt } : {}),
       });
       if (input.boxId) await attachBoxToManager(ws.id, manager.id, { boxId: input.boxId });
       else if (input.boxJobId) {
@@ -395,6 +511,8 @@ export function createManagerBackend(
         // boxes and tasks it collected stay with it instead of forking a duplicate.
         const existing = await findManagerBySession(input.agent, input.sessionId);
         if (existing) {
+          const inDaemon = await daemonSession(existing, true);
+          if (inDaemon) return err(backgroundResumeRefusal(existing, inDaemon));
           try {
             if (
               input.restart &&
@@ -443,6 +561,8 @@ export function createManagerBackend(
     async resumeManager(id: string, meta?: TimelineMeta): Promise<ManagerResult> {
       const rec = await findManager(id);
       if (!rec) return err(`unknown manager ${id}`);
+      const inDaemon = await daemonSession(rec, true);
+      if (inDaemon) return err(backgroundResumeRefusal(rec, inDaemon));
       if (!(await tmuxAvailable(deps.managerExec))) return err(TMUX_MISSING);
       try {
         await resumeManagerSession(rec.workspaceId, id, probe);
@@ -454,9 +574,52 @@ export function createManagerBackend(
       return answer(id);
     },
 
+    async attachManager(id: string): Promise<ManagerResult> {
+      const rec = await findManager(id);
+      if (!rec) return err(`unknown manager ${id}`);
+      const snap =
+        rec.agent === 'claude' && storeIsLocal(rec)
+          ? await lookupBackground({ fresh: true })
+          : undefined;
+      const background = snap ? backgroundFor(rec, snap) : undefined;
+      if (!background) {
+        return err(
+          snap && liveBackgroundSession(rec, snap)
+            ? `manager ${id}'s Claude session may already be open in a terminal (an AgentBox tmux session in its folder, or a claude attach client); the hub attaches only to a session nothing shows`
+            : `manager ${id} has no running Claude background session to attach to`,
+        );
+      }
+      if (!(await tmuxAvailable(deps.managerExec))) return err(TMUX_MISSING);
+      try {
+        await attachBackgroundSession({
+          wsId: rec.workspaceId,
+          manager: rec,
+          backgroundId: background.id,
+          ...(deps.managerExec ? { exec: deps.managerExec } : {}),
+        });
+      } catch (e) {
+        return err(`could not attach: ${messageOf(e)}`);
+      }
+      // The snapshot predates the session just started; the answer must show it.
+      await lookupBackground({ fresh: true });
+      deps.notify();
+      return answer(id);
+    },
+
     async stopManager(id: string, meta?: TimelineMeta): Promise<ManagerResult> {
       const rec = await findManager(id);
       if (!rec) return err(`unknown manager ${id}`);
+      const inDaemon = await daemonSession(rec, true);
+      if (inDaemon && rec.kind === 'external') {
+        // Its session is Claude's daemon's, not the hub's: only the attach client goes.
+        await detachBackgroundSession(rec.workspaceId, id, deps.managerExec);
+        await lookupBackground({ fresh: true });
+        deps.notify();
+        const view = await viewOf(id);
+        return view
+          ? { ok: true, manager: view, notice: BACKGROUND_STOP_NOTICE }
+          : err(`unknown manager ${id}`);
+      }
       const wasRunning = (await managerStatus(rec, probe)) === 'running';
       try {
         await stopManagerSession(rec.workspaceId, id, probe);
@@ -466,7 +629,8 @@ export function createManagerBackend(
       // Stop is idempotent: stopping a session that had already ended is not an event.
       if (wasRunning) await recordManagerEvent(rec, 'manager.stopped', meta);
       deps.notify();
-      return answer(id);
+      const stopped = await answer(id);
+      return stopped.ok && inDaemon ? { ...stopped, notice: BACKGROUND_STOP_NOTICE } : stopped;
     },
 
     async removeManager(id: string, opts: { force?: boolean } = {}): Promise<ActionResult> {
@@ -476,7 +640,7 @@ export function createManagerBackend(
       // leave a tmux session (or a terminal session's boxes) nothing points at.
       // `force` is the way out when the status is wrong (a pid the probe cannot
       // tell apart, a last-seen window that has not lapsed yet).
-      if (!opts.force && (await managerStatus(rec, probe)) === 'running') {
+      if (!opts.force && (await effectiveStatus(rec)) === 'running') {
         return err(`manager ${id} is running; stop it before forgetting it (or force it)`);
       }
       await removeManagerRecord(rec.workspaceId, id);

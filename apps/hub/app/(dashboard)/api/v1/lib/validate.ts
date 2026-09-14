@@ -1362,6 +1362,7 @@ export interface ManagerDetectInput {
   host?: string;
   managerId?: string;
   tmuxPane?: string;
+  tmuxSession?: string;
   boxId?: string;
   boxJobId?: string;
 }
@@ -1379,9 +1380,16 @@ export function parseManagerDetect(
   allowedAgents: readonly string[] = MANAGER_AGENT_NAMES,
 ): Parsed<ManagerDetectInput> {
   if (!isObject(body)) return { ok: false, message: 'body must be a JSON object' };
-  const { agent, sessionId, cwd, pid, host, managerId, boxId, boxJobId, tmuxPane } = body;
+  const { agent, sessionId, cwd, pid, host, managerId, boxId, boxJobId, tmuxPane, tmuxSession } =
+    body;
   if (tmuxPane !== undefined && (typeof tmuxPane !== 'string' || !/^%\d+$/.test(tmuxPane))) {
     return { ok: false, message: 'tmuxPane must be a tmux pane id like %3' };
+  }
+  if (
+    tmuxSession !== undefined &&
+    (typeof tmuxSession !== 'string' || !/^agentbox-manager-[0-9a-f]{16}$/.test(tmuxSession))
+  ) {
+    return { ok: false, message: 'tmuxSession must be an agentbox-manager-<16 hex> session name' };
   }
   if (typeof agent !== 'string' || !allowedAgents.includes(agent)) {
     return { ok: false, message: `agent must be one of ${allowedAgents.join(', ')}` };
@@ -1419,6 +1427,7 @@ export function parseManagerDetect(
       ...(parsedHost.value ? { host: parsedHost.value } : {}),
       ...(parsedManager.value ? { managerId: parsedManager.value } : {}),
       ...(typeof tmuxPane === 'string' ? { tmuxPane } : {}),
+      ...(typeof tmuxSession === 'string' ? { tmuxSession } : {}),
       ...(parsedBox.value ? { boxId: parsedBox.value } : {}),
       ...(parsedJob.value ? { boxJobId: parsedJob.value } : {}),
     },

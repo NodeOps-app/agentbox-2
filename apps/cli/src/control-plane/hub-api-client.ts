@@ -504,8 +504,12 @@ export interface HubApiManager {
   pid?: number;
   pidStartedAt?: string;
   tmuxSession?: string;
-  /** Ready-to-run tmux attach command; only for a running hub-run manager. */
+  /** Ready-to-run tmux attach command: a running hub-run manager, or an attached background session. */
   attachCommand?: string;
+  /** A detached Claude background session `POST /managers/{id}/attach` can open. */
+  background?: { id: string; status?: string; state?: string; name?: string };
+  /** An unclaimed AgentBox tmux session in the manager's folder. */
+  terminalSession?: string;
   boxIds: string[];
   boxJobIds: string[];
   taskCounts: { open: number; done: number };
@@ -525,6 +529,7 @@ export interface HubApiManagerDetect {
   host?: string;
   managerId?: string;
   tmuxPane?: string;
+  tmuxSession?: string;
   boxId?: string;
   boxJobId?: string;
 }
@@ -1324,6 +1329,11 @@ export class HubApiClient {
   /** Reopen a stopped manager's session in the hub's tmux. */
   resumeManager(id: string): Promise<HubApiManager> {
     return this.request<HubApiManager>('POST', `/managers/${encodeURIComponent(id)}/resume`);
+  }
+
+  /** Open a claude manager's Claude background session in a hub tmux session. */
+  attachManager(id: string): Promise<HubApiManager> {
+    return this.request<HubApiManager>('POST', `/managers/${encodeURIComponent(id)}/attach`);
   }
 
   stopManager(id: string): Promise<HubApiManager> {

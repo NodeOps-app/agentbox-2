@@ -1066,7 +1066,14 @@ export type TaskResult =
   | { ok: true; task: WorkTask }
   | { ok: false; error: string; invalid?: true };
 export type TasksResult = { ok: true; tasks: WorkTask[] } | { ok: false; error: string };
-export type ManagerResult = { ok: true; manager: ManagerView } | { ok: false; error: string };
+export type ManagerResult =
+  | {
+      ok: true;
+      manager: ManagerView;
+      /** Said with a stop that left the agent's session running (Claude's background daemon). */
+      notice?: string;
+    }
+  | { ok: false; error: string };
 export type DetectManagerResult =
   | { ok: true; manager: ManagerView; workspace: WorkspaceView; created: boolean }
   | { ok: false; error: string; invalid?: true };
@@ -1135,6 +1142,12 @@ export interface DetectManagerInput {
   managerId?: string;
   /** `$TMUX_PANE` of the session's terminal, so a message can be typed into it. */
   tmuxPane?: string;
+  /**
+   * The AgentBox tmux session (`agentbox-manager-*`) the caller runs in. The hub
+   * checks it exists here and starts in `cwd`, then records the manager as run
+   * from it.
+   */
+  tmuxSession?: string;
   /** A box (or create job) this session just made, attached in the same call. */
   boxId?: string;
   boxJobId?: string;
@@ -1159,6 +1172,11 @@ export interface ManagerBackend {
   startManager(wsId: string, input: StartManagerInput, meta?: TimelineMeta): Promise<ManagerResult>;
   resumeManager(id: string, meta?: TimelineMeta): Promise<ManagerResult>;
   stopManager(id: string, meta?: TimelineMeta): Promise<ManagerResult>;
+  /**
+   * Open a claude manager's detached Claude background session in a hub tmux
+   * session (`claude attach`). The record's kind and session are unchanged.
+   */
+  attachManager(id: string): Promise<ManagerResult>;
   /**
    * The timeline stamp for a session (the CLI's `X-AgentBox-Session`) or a
    * manager id: its manager, turn and that turn's prompt. With `wsId`, only a

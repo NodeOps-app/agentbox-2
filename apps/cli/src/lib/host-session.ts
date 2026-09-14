@@ -90,6 +90,8 @@ export interface HostSessionHint {
   managerId?: string;
   /** `$TMUX_PANE` when the session's terminal runs inside tmux: where the hub can type to it. */
   tmuxPane?: string;
+  /** The AgentBox manager tmux session (`agentbox-manager-*`) that pane belongs to. */
+  tmuxSession?: string;
 }
 
 export interface HostSessionDeps {
@@ -108,6 +110,22 @@ export interface HostSessionDeps {
   now?: () => number;
   /** Skip the ancestor walk that finds codex's pid: a caller that only names the session. */
   pidless?: boolean;
+  /** The name of the tmux session a pane belongs to, or undefined when tmux cannot say. */
+  tmuxSessionOf?: (pane: string, timeoutMs: number) => string | undefined;
+}
+
+const MANAGER_TMUX_SESSION_RE = /^agentbox-manager-[0-9a-f]{16}$/;
+
+function defaultTmuxSessionOf(pane: string, timeoutMs: number): string | undefined {
+  try {
+    const r = spawnSync('tmux', ['display-message', '-p', '-t', pane, '#{session_name}'], {
+      encoding: 'utf8',
+      timeout: timeoutMs,
+    });
+    return r.status === 0 ? r.stdout.trim() || undefined : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function defaultPs(pid: number, timeoutMs: number): { ppid: number; comm: string } | undefined {
@@ -202,10 +220,19 @@ export function detectHostSession(deps: HostSessionDeps = {}): HostSessionHint |
   const managerId = hint && MANAGER_ID_RE.test(hint) ? hint : undefined;
   // TMUX_PANE alone can be inherited stale by a process outside tmux; TMUX says it is live.
   const pane = (env['TMUX'] ?? '').length > 0 ? env['TMUX_PANE']?.trim() : undefined;
+  const livePane = pane && TMUX_PANE_RE.test(pane) ? pane : undefined;
+  // Only an AgentBox manager session is worth naming: the hub runs the manager
+  // from it. A session hosted by Claude's background daemon never gets here, since
+  // the daemon drops TMUX. Skipped with the pid walk, for the same cheap callers.
+  const session =
+    livePane && !deps.pidless
+      ? (deps.tmuxSessionOf ?? defaultTmuxSessionOf)(livePane, 1000)
+      : undefined;
   const base = {
     host,
     ...(managerId ? { managerId } : {}),
-    ...(pane && TMUX_PANE_RE.test(pane) ? { tmuxPane: pane } : {}),
+    ...(livePane ? { tmuxPane: livePane } : {}),
+    ...(session && MANAGER_TMUX_SESSION_RE.test(session) ? { tmuxSession: session } : {}),
   };
 
   if (agent === 'codex') {

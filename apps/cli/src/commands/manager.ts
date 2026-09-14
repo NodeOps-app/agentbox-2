@@ -157,7 +157,7 @@ async function hubIsLocal(): Promise<boolean> {
 
 /** Attach to a hub-run manager's tmux session in this terminal (or a new pane). */
 async function attachToSession(m: HubApiManager, openIn?: AttachOpenIn): Promise<boolean> {
-  if (m.kind !== 'hub' || !m.tmuxSession || !m.attachCommand) {
+  if (!m.tmuxSession || !m.attachCommand) {
     log.error(
       `manager ${m.id} runs in a terminal of its own, not in a session the hub can attach to.`,
     );
@@ -382,7 +382,11 @@ const attachCommand = new Command('attach')
         }
         manager = running[0]!;
       }
-      if (manager.kind === 'external' && manager.status === 'running') {
+      if (manager.background && !manager.attachCommand) {
+        // A Claude background session: the hub opens it in a tmux session of its own.
+        manager = await client.attachManager(manager.id);
+      }
+      if (manager.kind === 'external' && manager.status === 'running' && !manager.attachCommand) {
         log.info(
           `manager ${manager.id} is running in your terminal${manager.pid !== undefined ? ` (pid ${String(manager.pid)})` : ''}; switch to that window.`,
         );

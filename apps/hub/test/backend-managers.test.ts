@@ -33,7 +33,10 @@ function harness(over: { boxIds?: string[]; jobs?: Partial<QueueJob>[] } = {}): 
     hostname: () => 'laptop',
     isPidAlive: (pid: number) => alive.has(pid),
     processStartTime: async (pid: number) => started.get(pid),
-    managerExec: async (_file: string, args: string[]) => {
+    managerExec: async (file: string, args: string[]) => {
+      // Read-only probes (`claude agents`, `ps`, `tmux list-sessions`) answer nothing
+      // here and are not what these tests assert.
+      if (file !== 'tmux' || args[0] === 'list-sessions') return { exitCode: 0 };
       spawned.push(args);
       if (args[0] === 'new-session') tmux.add(args[3]!);
       if (args[0] === 'kill-session') tmux.delete(args[2]!.slice(1));

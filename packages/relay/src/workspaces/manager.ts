@@ -14,7 +14,11 @@ import { homedir, hostname as osHostname } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { execa } from 'execa';
 import { withFileLock } from '@agentbox/config';
-import { encodeClaudeProjectsKey } from '@agentbox/sandbox-core';
+import {
+  AGENT_SESSION_ENV_VARS,
+  encodeClaudeProjectsKey,
+  scrubAgentSessionEnv,
+} from '@agentbox/sandbox-core';
 import {
   legacyManagerFiles,
   listWorkspaces,
@@ -29,6 +33,7 @@ import type { ReconcileContext } from './task-store.js';
 import type {
   HostSession,
   ManagerAgent,
+  ManagerBackground,
   ManagerFile,
   ManagerRecord,
   ManagerResumeBlock,
@@ -37,12 +42,12 @@ import type {
   WorkTask,
 } from './types.js';
 
-/** Seam for every tmux call, so tests assert argv without a terminal. */
+/** Seam for every tmux, `ps` and `claude agents` call, so tests assert argv without a terminal. */
 export type ManagerExec = (
   file: string,
   args: string[],
-  opts?: { env?: NodeJS.ProcessEnv },
-) => Promise<{ exitCode?: number | undefined }>;
+  opts?: { env?: NodeJS.ProcessEnv; timeout?: number },
+) => Promise<{ exitCode?: number | undefined; stdout?: string }>;
 
 const defaultExec: ManagerExec = (file, args, opts) => execa(file, args, opts);
 
@@ -123,9 +128,17 @@ export function newManagerId(): string {
   return randomBytes(8).toString('hex');
 }
 
+const MANAGER_SESSION_PREFIX = 'agentbox-manager-';
+
 export function managerSessionName(managerId: string): string {
-  return `agentbox-manager-${managerId}`;
+  return `${MANAGER_SESSION_PREFIX}${managerId}`;
 }
+
+/**
+ * A tmux session name the hub itself creates: `agentbox-manager-<managerId>`, or
+ * the single-manager layout's `agentbox-manager-<workspaceId>`. Both are 16 hex.
+ */
+export const MANAGER_SESSION_RE = /^agentbox-manager-[0-9a-f]{16}$/u;
 
 /**
  * `=name` is tmux's exact-match prefix. Without it `has-session -t foo` matches
@@ -176,6 +189,15 @@ export function shellJoin(argv: string[]): string {
 }
 
 /**
+ * The `unset` a manager's pane script starts with. A tmux server that already
+ * runs hands its own global environment to a new session, so scrubbing the
+ * client's env does not reach the pane. TMUX stays: tmux sets it for the pane.
+ */
+function unsetAgentSessionEnv(): string {
+  return `unset ${AGENT_SESSION_ENV_VARS.join(' ')}`;
+}
+
+/**
  * The script the login shell runs. The env rides HERE rather than on `tmux -e`
  * so this works on any tmux version and leaks nothing into other sessions; the
  * trailing capture records the agent's exit code, which is the only trace left
@@ -189,7 +211,7 @@ export function buildManagerShellScript(opts: {
   const exports = Object.entries(opts.env)
     .map(([k, v]) => `export ${k}=${shellQuote(v)}`)
     .join('; ');
-  return `${exports}; ${shellJoin(opts.argv)}; __agentbox_rc=$?; printf %s "$__agentbox_rc" > ${shellQuote(opts.exitFile)}; exit $__agentbox_rc`;
+  return `${unsetAgentSessionEnv()}; ${exports}; ${shellJoin(opts.argv)}; __agentbox_rc=$?; printf %s "$__agentbox_rc" > ${shellQuote(opts.exitFile)}; exit $__agentbox_rc`;
 }
 
 /**
@@ -556,6 +578,16 @@ export function toManagerView(
     lastExit?: number;
     /** The hub's hostname, for `resumable`; defaults to this machine's. */
     hostname?: string;
+    /** The manager's detached Claude background session (see `backgroundFor`). */
+    background?: ManagerBackground;
+    /**
+     * With `background`: the hub's attach session when it is up, else null. It
+     * replaces the hub-run rule for `attachCommand`: the manager runs whether or
+     * not anything is attached.
+     */
+    attachSession?: string | null;
+    /** An unclaimed AgentBox tmux session in the manager's folder (see `terminalSessionFor`). */
+    terminalSession?: string;
   },
 ): ManagerView {
   const block = managerResumeBlock(rec, ctx.status, ctx.hostname);
@@ -571,11 +603,18 @@ export function toManagerView(
     },
   };
   delete view.argv;
+  if (ctx.terminalSession) view.terminalSession = ctx.terminalSession;
+  if (ctx.background) {
+    view.background = ctx.background;
+    if (ctx.attachSession) view.attachCommand = managerAttachCommand(ctx.attachSession);
+    // An external record keeps the name of an attach session that has ended.
+    else if (rec.kind === 'external') delete view.tmuxSession;
+  }
   if (ctx.status === 'running') {
     // A live session next to a previous run's ending reads as contradictory state.
     delete view.stoppedAt;
     delete view.lastExit;
-    if (rec.kind === 'hub') {
+    if (rec.kind === 'hub' && !ctx.background) {
       view.attachCommand = managerAttachCommand(rec.tmuxSession ?? managerSessionName(rec.id));
     }
   } else if (view.lastExit === undefined && ctx.lastExit !== undefined) {
@@ -599,6 +638,12 @@ export interface DetectManagerInput {
   managerId?: string;
   /** `$TMUX_PANE` when the session's terminal runs inside tmux. */
   tmuxPane?: string;
+  /**
+   * An AgentBox manager tmux session the caller runs in, already checked by the
+   * hub to exist on this machine and to start in `cwd`. The record is run from
+   * that session from now on (`hub`), whatever it was before.
+   */
+  tmuxSession?: string;
 }
 
 /**
@@ -623,24 +668,39 @@ export async function upsertDetectedManager(
       );
       if (idx === -1 && input.managerId) idx = managers.findIndex((m) => m.id === input.managerId);
       if (idx === -1) {
-        const manager: ManagerRecord = {
-          id: newManagerId(),
-          workspaceId: wsId,
-          agent: input.agent,
-          kind: 'external',
-          cwd: input.cwd,
-          sessionId: input.sessionId,
-          ...(input.host ? { host: input.host } : {}),
-          ...(input.pid !== undefined ? { pid: input.pid } : {}),
-          ...(input.pid !== undefined && input.pidStartedAt
-            ? { pidStartedAt: input.pidStartedAt }
-            : {}),
-          ...(input.tmuxPane ? { tmuxPane: input.tmuxPane } : {}),
-          boxIds: [],
-          boxJobIds: [],
-          createdAt: at,
-          lastSeenAt: at,
-        };
+        const manager: ManagerRecord = input.tmuxSession
+          ? {
+              id: newManagerId(),
+              workspaceId: wsId,
+              agent: input.agent,
+              kind: 'hub',
+              cwd: input.cwd,
+              sessionId: input.sessionId,
+              ...(input.host ? { host: input.host } : {}),
+              tmuxSession: input.tmuxSession,
+              boxIds: [],
+              boxJobIds: [],
+              createdAt: at,
+              lastSeenAt: at,
+            }
+          : {
+              id: newManagerId(),
+              workspaceId: wsId,
+              agent: input.agent,
+              kind: 'external',
+              cwd: input.cwd,
+              sessionId: input.sessionId,
+              ...(input.host ? { host: input.host } : {}),
+              ...(input.pid !== undefined ? { pid: input.pid } : {}),
+              ...(input.pid !== undefined && input.pidStartedAt
+                ? { pidStartedAt: input.pidStartedAt }
+                : {}),
+              ...(input.tmuxPane ? { tmuxPane: input.tmuxPane } : {}),
+              boxIds: [],
+              boxJobIds: [],
+              createdAt: at,
+              lastSeenAt: at,
+            };
         return {
           managers: [...managers, manager],
           result: { manager, created: true, sessionChanged: false },
@@ -652,7 +712,17 @@ export async function upsertDetectedManager(
       // the old one.
       if (prev.sessionId !== input.sessionId) delete next.title;
       const fromOwnSession = input.managerId !== undefined && input.managerId === prev.id;
-      if (prev.kind === 'hub' && !fromOwnSession && input.pid !== undefined) {
+      if (input.tmuxSession) {
+        // Run from an AgentBox tmux session: that session is its home, whatever
+        // was detected before (an external record from the same session's pid).
+        next.kind = 'hub';
+        next.tmuxSession = input.tmuxSession;
+        delete next.pid;
+        delete next.pidStartedAt;
+        delete next.tmuxPane;
+        delete next.stoppedAt;
+        delete next.lastExit;
+      } else if (prev.kind === 'hub' && !fromOwnSession && input.pid !== undefined) {
         // The session is being run from somewhere other than the hub's tmux — the
         // user resumed it in a terminal. Observe that process from now on.
         next.kind = 'external';
@@ -851,14 +921,73 @@ export async function startManagerSession(input: StartManagerSessionInput): Prom
     env: { AGENTBOX_WORKSPACE: input.wsId, AGENTBOX_MANAGER: rec.id },
     exitFile: exit,
   });
-  // TMUX/TMUX_PANE would make tmux refuse to nest when the hub itself was
-  // started from inside a tmux pane.
-  const env = { ...(input.env ?? process.env) };
-  delete env['TMUX'];
-  delete env['TMUX_PANE'];
+  const workspaceName = await readWorkspace(input.wsId)
+    .then((ws) => ws?.name)
+    .catch(() => undefined);
+  await openManagerTmuxSession({
+    session,
+    cwd: rec.cwd,
+    script,
+    footer: {
+      agent: rec.agent,
+      shortId: (rec.sessionId ?? rec.id).slice(0, 8),
+      ...(workspaceName ? { workspaceName } : {}),
+    },
+    exec,
+    ...(input.env ? { env: input.env } : {}),
+  });
+  const at = new Date().toISOString();
+  const next: ManagerRecord = {
+    ...rec,
+    kind: 'hub',
+    tmuxSession: session,
+    argv: input.argv,
+    startedAt: at,
+    lastSeenAt: at,
+  };
+  delete next.pid;
+  delete next.pidStartedAt;
+  delete next.tmuxPane;
+  delete next.stoppedAt;
+  delete next.lastExit;
+  return updateManagers(input.wsId, (managers) => {
+    const idx = managers.findIndex((m) => m.id === rec.id);
+    const out = [...managers];
+    if (idx === -1) out.push(next);
+    else out[idx] = next;
+    return { managers: out, result: next };
+  });
+}
+
+/**
+ * A detached tmux session on the user's default server running `script` under
+ * their login shell, with the manager session's options (window size, mouse,
+ * footer). Shared by a hub-run manager and an attach to a background session.
+ */
+async function openManagerTmuxSession(input: {
+  session: string;
+  cwd: string;
+  script: string;
+  footer: ManagerFooterInput;
+  exec: ManagerExec;
+  env?: NodeJS.ProcessEnv;
+}): Promise<void> {
+  const { session, exec } = input;
+  const env = scrubAgentSessionEnv(input.env ?? process.env);
   await exec(
     'tmux',
-    ['new-session', '-d', '-s', session, '-c', rec.cwd, '--', loginShell(env), '-lc', script],
+    [
+      'new-session',
+      '-d',
+      '-s',
+      session,
+      '-c',
+      input.cwd,
+      '--',
+      loginShell(env),
+      '-lc',
+      input.script,
+    ],
     { env },
   );
   // `latest` sizes the window to the most recently active client, so a tray pane
@@ -881,41 +1010,294 @@ export async function startManagerSession(input: StartManagerSessionInput): Prom
       `[manager] could not pin the tmux window size: ${err instanceof Error ? err.message : String(err)}`,
     );
   });
-  const workspaceName = await readWorkspace(input.wsId)
-    .then((ws) => ws?.name)
-    .catch(() => undefined);
-  const footer: ManagerFooterInput = {
-    agent: rec.agent,
-    shortId: (rec.sessionId ?? rec.id).slice(0, 8),
-    ...(workspaceName ? { workspaceName } : {}),
-  };
-  for (const argv of managerSessionOptionsArgv(session, footer)) {
+  for (const argv of managerSessionOptionsArgv(session, input.footer)) {
     await exec('tmux', argv, { env }).catch((err: unknown) => {
       console.warn(
         `[manager] could not set tmux ${argv[3] ?? 'option'}: ${err instanceof Error ? err.message : String(err)}`,
       );
     });
   }
-  const at = new Date().toISOString();
-  const next: ManagerRecord = {
-    ...rec,
-    kind: 'hub',
-    tmuxSession: session,
-    argv: input.argv,
-    startedAt: at,
-    lastSeenAt: at,
+}
+
+/** Every tmux session on the user's default server with the folder it started in; [] without tmux. */
+export async function listTmuxSessions(
+  exec: ManagerExec = defaultExec,
+): Promise<{ session: string; path: string }[]> {
+  try {
+    const r = await exec('tmux', ['list-sessions', '-F', '#{session_name}\t#{session_path}'], {
+      timeout: 3000,
+    });
+    return (r.stdout ?? '')
+      .split('\n')
+      .map((line) => line.split('\t'))
+      .filter((cols) => cols.length >= 2 && cols[0])
+      .map(([session, path]) => ({ session: session!, path: path! }));
+  } catch {
+    return [];
+  }
+}
+
+// ── Claude background sessions ──
+//
+// Claude Code 2.1.270 can host a session in its daemon (`claude --bg`, or a TUI
+// that sent its session to the background). `claude agents --json` lists those
+// as `kind: "background"` whether or not a client shows them, and nothing it or
+// the daemon writes says which client, if any, is attached. The daemon is shared
+// and hands the env of the client that spawned it to every session it hosts, so
+// neither the session's env nor its process ancestry says either. What the hub
+// can see is its own tmux sessions and `claude attach <id>` processes.
+
+/** One row of `claude agents --json` with `kind: "background"`. */
+export interface BackgroundSession extends ManagerBackground {
+  sessionId: string;
+  pid?: number;
+  cwd?: string;
+}
+
+/** The background rows of `claude agents --json`; anything unparseable is no rows. */
+export function parseBackgroundSessions(stdout: string): BackgroundSession[] {
+  let rows: unknown;
+  try {
+    rows = JSON.parse(stdout);
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(rows)) return [];
+  const out: BackgroundSession[] = [];
+  for (const row of rows as Record<string, unknown>[]) {
+    if (row?.['kind'] !== 'background') continue;
+    const { id, sessionId, pid, status, state, name, cwd } = row;
+    if (typeof id !== 'string' || typeof sessionId !== 'string') continue;
+    out.push({
+      id,
+      sessionId,
+      ...(typeof pid === 'number' ? { pid } : {}),
+      ...(typeof status === 'string' ? { status } : {}),
+      ...(typeof state === 'string' ? { state } : {}),
+      ...(typeof name === 'string' ? { name } : {}),
+      ...(typeof cwd === 'string' ? { cwd } : {}),
+    });
+  }
+  return out;
+}
+
+/**
+ * Still running in Claude's daemon. Measured on claude 2.1.270: a running
+ * session (busy or idle) lists a `pid` and a `status`; one ended with `claude
+ * stop`, or one that failed, lists neither while `state` stays `done`/`failed`.
+ */
+export function isLiveBackgroundSession(s: BackgroundSession): boolean {
+  return typeof s.pid === 'number' && s.status !== 'completed';
+}
+
+/** `claude attach <id>` in a `ps` command column. */
+const ATTACH_CLIENT_RE = /(?:^|\/)claude attach ([A-Za-z0-9_-]+)\s*$/u;
+
+export interface BackgroundSessionSnapshot {
+  /** Live background sessions by session id. */
+  sessions: Map<string, BackgroundSession>;
+  /** The hub's own tmux sessions (`agentbox-manager-*`) and the folder each started in. */
+  managerTmux: { session: string; path: string }[];
+  /** How many `claude attach <id>` clients run, by short id. */
+  attachClients: Map<string, number>;
+}
+
+export type BackgroundSessionLookup = (opts?: {
+  fresh?: boolean;
+}) => Promise<BackgroundSessionSnapshot>;
+
+function emptySnapshot(): BackgroundSessionSnapshot {
+  return { sessions: new Map(), managerTmux: [], attachClients: new Map() };
+}
+
+/**
+ * One snapshot of Claude's background sessions and the hub's tmux sessions,
+ * shared by every caller for `ttlMs`: `GET /managers` is polled, so `claude
+ * agents --json --all` runs at most once per window with one read in flight, and
+ * gives up after `timeoutMs`. `ps` is read only when some session is live. A
+ * failed read is empty for the same window; a missing `claude` is not asked again
+ * for `missingRetryMs`. `fresh` skips the cache (an attach re-checks before it acts).
+ */
+export function createBackgroundSessionLookup(
+  opts: {
+    exec?: ManagerExec;
+    ttlMs?: number;
+    timeoutMs?: number;
+    missingRetryMs?: number;
+    now?: () => number;
+  } = {},
+): BackgroundSessionLookup {
+  const exec = opts.exec ?? defaultExec;
+  const ttl = opts.ttlMs ?? 15_000;
+  const timeout = opts.timeoutMs ?? 3000;
+  const missingRetry = opts.missingRetryMs ?? 10 * 60_000;
+  const now = opts.now ?? Date.now;
+  let cached: { until: number; value: BackgroundSessionSnapshot } | undefined;
+  let inflight: Promise<BackgroundSessionSnapshot> | undefined;
+  let missingUntil = 0;
+
+  async function readSessions(value: BackgroundSessionSnapshot): Promise<void> {
+    if (now() < missingUntil) return;
+    try {
+      const r = await exec('claude', ['agents', '--json', '--all'], { timeout });
+      for (const s of parseBackgroundSessions(r.stdout ?? '')) {
+        if (isLiveBackgroundSession(s)) value.sessions.set(s.sessionId, s);
+      }
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') missingUntil = now() + missingRetry;
+    }
+  }
+
+  async function read(): Promise<BackgroundSessionSnapshot> {
+    const value = emptySnapshot();
+    const [, tmux] = await Promise.all([readSessions(value), listTmuxSessions(exec)]);
+    value.managerTmux = tmux.filter((t) => MANAGER_SESSION_RE.test(t.session));
+    if (value.sessions.size > 0) {
+      const ps = await exec('ps', ['-Ao', 'command='], { timeout }).catch(() => ({ stdout: '' }));
+      for (const line of (ps.stdout ?? '').split('\n')) {
+        const id = ATTACH_CLIENT_RE.exec(line.trim())?.[1];
+        if (id) value.attachClients.set(id, (value.attachClients.get(id) ?? 0) + 1);
+      }
+    }
+    cached = { until: now() + ttl, value };
+    return value;
+  }
+
+  return (o = {}) => {
+    if (!o.fresh && cached && now() < cached.until) return Promise.resolve(cached.value);
+    inflight ??= read().finally(() => {
+      inflight = undefined;
+    });
+    return inflight;
   };
-  delete next.pid;
-  delete next.pidStartedAt;
-  delete next.tmuxPane;
-  delete next.stoppedAt;
-  delete next.lastExit;
-  return updateManagers(input.wsId, (managers) => {
-    const idx = managers.findIndex((m) => m.id === rec.id);
-    const out = [...managers];
-    if (idx === -1) out.push(next);
-    else out[idx] = next;
-    return { managers: out, result: next };
+}
+
+/** The daemon session a claude manager's session id names, live or not attachable. */
+export function liveBackgroundSession(
+  rec: ManagerRecord,
+  snap: BackgroundSessionSnapshot,
+): BackgroundSession | undefined {
+  if (rec.agent !== 'claude' || !rec.sessionId) return undefined;
+  return snap.sessions.get(rec.sessionId);
+}
+
+/**
+ * The manager's session as a DETACHED background session the hub may attach to,
+ * or undefined. Detached means live in the daemon and shown by nothing the hub
+ * can see: no AgentBox tmux session starts in its folder (a TUI there may be
+ * showing it — the single-manager layout's session is exactly that) other than
+ * this manager's own attach session, and no `claude attach <id>` client runs
+ * outside that attach session. A TUI outside AgentBox's tmux that shows the
+ * session cannot be seen, which is why a second client is possible.
+ */
+export function backgroundFor(
+  rec: ManagerRecord,
+  snap: BackgroundSessionSnapshot,
+): ManagerBackground | undefined {
+  const s = liveBackgroundSession(rec, snap);
+  if (!s) return undefined;
+  const own = managerSessionName(rec.id);
+  const ownLive = snap.managerTmux.some((t) => t.session === own);
+  const hubSession = rec.kind === 'hub' ? (rec.tmuxSession ?? own) : undefined;
+  // A hub-run manager whose tmux session is up is shown there, unless that
+  // session is the attach this function allowed.
+  if (hubSession && hubSession !== own && snap.managerTmux.some((t) => t.session === hubSession)) {
+    return undefined;
+  }
+  const others = snap.managerTmux.filter((t) => t.session !== own && t.path === rec.cwd);
+  if (others.length > 0) return undefined;
+  const clients = snap.attachClients.get(s.id) ?? 0;
+  if (clients > (ownLive ? 1 : 0)) return undefined;
+  return {
+    id: s.id,
+    ...(s.status ? { status: s.status } : {}),
+    ...(s.state ? { state: s.state } : {}),
+    ...(s.name ? { name: s.name } : {}),
+  };
+}
+
+/**
+ * The one AgentBox tmux session that starts in this manager's folder and that
+ * no manager of `claimed` owns — the terminal an external manager was probably
+ * started from (the single-manager layout's session is the case this exists
+ * for). A guess, so it is only ever offered to a user to open, never adopted.
+ */
+export function terminalSessionFor(
+  rec: ManagerRecord,
+  snap: BackgroundSessionSnapshot,
+  claimed: ReadonlySet<string>,
+): string | undefined {
+  const candidates = snap.managerTmux.filter(
+    (t) =>
+      t.path === rec.cwd && t.session !== managerSessionName(rec.id) && !claimed.has(t.session),
+  );
+  return candidates.length === 1 ? candidates[0]!.session : undefined;
+}
+
+/** The ids `claude attach` takes are short hex; anything else never reaches argv. */
+const BACKGROUND_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/u;
+
+/**
+ * Open a Claude background session in this manager's hub tmux session (`claude
+ * attach <id>`), reusing the session when it already runs. The record only
+ * learns the session's name: its kind, session id and pid stay the detected
+ * process's, and the agent keeps running in Claude's daemon when this ends.
+ */
+export async function attachBackgroundSession(input: {
+  wsId: string;
+  manager: ManagerRecord;
+  backgroundId: string;
+  exec?: ManagerExec;
+  env?: NodeJS.ProcessEnv;
+}): Promise<ManagerRecord> {
+  const exec = input.exec ?? defaultExec;
+  const rec = input.manager;
+  if (!BACKGROUND_ID_RE.test(input.backgroundId)) {
+    throw new Error(`not a background session id: ${input.backgroundId}`);
+  }
+  const session = managerSessionName(rec.id);
+  if (!(await tmuxSessionExists(session, exec))) {
+    const workspaceName = await readWorkspace(input.wsId)
+      .then((ws) => ws?.name)
+      .catch(() => undefined);
+    await openManagerTmuxSession({
+      session,
+      cwd: rec.cwd,
+      script: `${unsetAgentSessionEnv()}; exec ${shellJoin(['claude', 'attach', input.backgroundId])}`,
+      footer: {
+        agent: rec.agent,
+        shortId: (rec.sessionId ?? rec.id).slice(0, 8),
+        ...(workspaceName ? { workspaceName } : {}),
+      },
+      exec,
+      ...(input.env ? { env: input.env } : {}),
+    });
+  }
+  const next = await patchManager(input.wsId, rec.id, (cur) =>
+    cur.tmuxSession === session ? cur : { ...cur, tmuxSession: session },
+  );
+  if (!next) throw new Error(`unknown manager ${rec.id}`);
+  return next;
+}
+
+/**
+ * End the hub's attach session for a manager whose session runs in Claude's
+ * daemon. Only the attach client goes: the background session keeps running.
+ */
+export async function detachBackgroundSession(
+  wsId: string,
+  id: string,
+  exec: ManagerExec = defaultExec,
+): Promise<ManagerRecord | null> {
+  const rec = (await readManagers(wsId)).find((m) => m.id === id);
+  if (!rec) return null;
+  const session = managerSessionName(rec.id);
+  await exec('tmux', ['kill-session', '-t', exactTarget(session)]).catch(() => {});
+  if (rec.tmuxSession !== session || rec.kind === 'hub') return rec;
+  return patchManager(wsId, id, (cur) => {
+    const next = { ...cur };
+    delete next.tmuxSession;
+    return next;
   });
 }
 

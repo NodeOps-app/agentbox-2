@@ -1675,6 +1675,12 @@ export function buildOpenApi(): Record<string, unknown> {
                       description:
                         "`$TMUX_PANE` of the session's terminal, so POST /managers/{id}/message can type into it.",
                     },
+                    tmuxSession: {
+                      type: 'string',
+                      pattern: '^agentbox-manager-[0-9a-f]{16}$',
+                      description:
+                        "The AgentBox manager tmux session that pane belongs to. When it exists on the hub's machine and started in `cwd`, the manager is recorded as `hub`-run from it (a session from before managers were detected is adopted). A session hosted by Claude's background daemon never sends it: the daemon drops TMUX.",
+                    },
                     boxId: { type: 'string' },
                     boxJobId: { type: 'string' },
                   },
@@ -1751,11 +1757,12 @@ export function buildOpenApi(): Record<string, unknown> {
           tags: ['Managers'],
           summary: 'Stop a hub-run manager',
           description:
-            'Kills its tmux session. Idempotent; the record is kept so it can be resumed. An external manager is your own terminal process, which the hub never signals: 409 while it runs, a no-op once it has exited.',
+            "Kills its tmux session. Idempotent; the record is kept so it can be resumed. An external manager is your own terminal process, which the hub never signals: 409 while it runs, a no-op once it has exited. A claude manager whose session runs in Claude's background daemon is never ended by this: only the hub's attach session (POST /managers/{id}/attach) is closed, and the answer carries `notice` saying the session keeps running (end it with `claude stop <id>`).",
           parameters: [managerIdParam],
           responses: {
             '200': {
-              description: 'Manager',
+              description:
+                "Manager, plus `notice` (string) when the agent session was left running in Claude's background daemon.",
               content: { 'application/json': { schema: { $ref: '#/components/schemas/Manager' } } },
             },
             '401': errorResponse,
@@ -1771,6 +1778,25 @@ export function buildOpenApi(): Record<string, unknown> {
           summary: "Resume a manager's session in the hub",
           description:
             "Reopens the session in a tmux session the hub owns (`claude --resume <id>` / `codex resume <id>`, run in the manager's `cwd`), and the manager becomes `hub`-run. 409 while the session still runs anywhere (two processes writing one transcript corrupt it), for a manager with no session id, for an agent whose sessions cannot be resumed, and for an external session reported from another host (its transcript is not on this machine); 503 when the hub host has no tmux.",
+          parameters: [managerIdParam],
+          responses: {
+            '200': {
+              description: 'Manager',
+              content: { 'application/json': { schema: { $ref: '#/components/schemas/Manager' } } },
+            },
+            '401': errorResponse,
+            '404': errorResponse,
+            '409': errorResponse,
+            '503': errorResponse,
+          },
+        },
+      },
+      '/managers/{id}/attach': {
+        post: {
+          tags: ['Managers'],
+          summary: "Open a manager's Claude background session in the hub",
+          description:
+            "For a claude manager whose session is a detached Claude Code background session (`background` on the manager): starts, or reuses, the tmux session `agentbox-manager-<managerId>` on the hub user's default tmux server running `claude attach <background.id>` in the manager's `cwd`, and answers the manager with `attachCommand` for it. The record keeps its kind, session id and pid. The session keeps running in Claude's daemon when that tmux session ends, and the manager stays `running`. 409 when the manager has no running background session, or when something the hub can see may already show it (an AgentBox tmux session starting in its folder, or a `claude attach` client); 503 when the hub host has no tmux.",
           parameters: [managerIdParam],
           responses: {
             '200': {
@@ -3794,7 +3820,25 @@ export function buildOpenApi(): Record<string, unknown> {
             },
             attachCommand: {
               type: 'string',
-              description: 'Ready-to-run tmux attach command; only for a running hub-run manager.',
+              description:
+                "Ready-to-run tmux attach command: a running hub-run manager's session, or the hub's attach session for a Claude background session while it is up.",
+            },
+            background: {
+              type: 'object',
+              description:
+                "A claude manager whose session is a detached Claude Code background session (`claude --bg`, listed by `claude agents`): running in Claude's daemon and shown by nothing the hub can see. POST /managers/{id}/attach opens it. The manager is `running` while the session is, whatever else is attached. Read from `claude agents --json --all` at most every 15 s.",
+              properties: {
+                id: { type: 'string', description: 'The short id `claude attach` takes.' },
+                status: { type: 'string', description: '`busy`, `idle`, `waiting`, …' },
+                state: { type: 'string', description: '`working`, `done`, …' },
+                name: { type: 'string' },
+              },
+              required: ['id'],
+            },
+            terminalSession: {
+              type: 'string',
+              description:
+                "A running external manager's likely terminal: the one AgentBox tmux session (`agentbox-manager-*`) that started in its folder and no manager owns, such as a session from before managers were detected. A guess, never adopted: a client may offer to open it (`tmux attach -t =<name>`).",
             },
             boxIds: { type: 'array', items: { type: 'string' } },
             boxJobIds: {

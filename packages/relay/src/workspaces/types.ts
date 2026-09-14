@@ -177,11 +177,37 @@ export interface ManagerView extends Omit<ManagerRecord, 'argv'> {
   resumable: boolean;
   /** Why `resumable` is false; absent when it is true. */
   resumeBlockedBy?: ManagerResumeBlock;
-  /** Ready-to-run attach command; only for a RUNNING hub-run manager. */
+  /**
+   * Ready-to-run attach command: a running hub-run manager's tmux session, or the
+   * hub's attach session for a Claude background session while that session is up.
+   */
   attachCommand?: string;
+  /**
+   * Set when this claude manager's session is a live Claude Code background session
+   * (`claude --bg`, listed by `claude agents`). `POST /managers/{id}/attach` opens it
+   * in a hub tmux session; the session itself runs in Claude's own daemon.
+   */
+  background?: ManagerBackground;
+  /**
+   * A running external manager's likely terminal: the one AgentBox tmux session
+   * (`agentbox-manager-*`) that starts in its folder and no manager owns. Offered
+   * to open, never adopted — nothing ties the session to this manager for sure.
+   */
+  terminalSession?: string;
   workspaceName: string;
   /** Tasks whose `managerId` is this manager. */
   taskCounts: { open: number; done: number };
+}
+
+/** A Claude Code background session, as `claude agents --json` reports it. */
+export interface ManagerBackground {
+  /** The short id `claude attach` takes. */
+  id: string;
+  /** `busy`, `idle`, `waiting`, … */
+  status?: string;
+  /** `working`, `done`, … */
+  state?: string;
+  name?: string;
 }
 
 /** One resumable agent session found in the host agent's own store. */

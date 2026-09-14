@@ -253,6 +253,63 @@ with `hostname` / `isPidAlive` seams on `BackendDeps` so the status matrix is te
 sessions | forget <id>`; `agentbox tasks list --manager <id> | --mine`. A `tasks` / `workspace` /
 `manager` command in a folder no workspace contains registers the session instead of failing.
 
+### Claude background sessions (follow-up, Phase 10)
+
+Claude Code 2.1.270 can host a session in a daemon (`claude --bg`, or a TUI that sent its session to
+the background): `claude daemon run` → `bg-pty-host` → `bg-spare`, reached with `claude attach <short
+id>`. Measured on this machine, three facts shape everything below:
+
+- `claude agents --json` lists every daemon-hosted session as `kind: "background"`, **whether or not a
+  client shows it**, and nothing the daemon writes (`~/.claude/sessions/<pid>.json`,
+  `~/.claude/jobs/<id>/state.json`, `daemon.log`) says which client is attached.
+- The daemon drops `TMUX`/`TMUX_PANE` from the sessions it hosts, and hands **the environment of the
+  client that spawned it** to every session it hosts. A `claude --bg` started from a plain shell
+  saw the acme-saas manager's `AGENTBOX_MANAGER=1` / `AGENTBOX_WORKSPACE`, and not its own launcher's
+  variables. The daemon is shared, so the ppid chain of a detached session can run through another
+  client's tmux pane too.
+- A session live in the daemon lists a `pid` and a `status`; one ended with `claude stop` (or failed)
+  lists neither.
+
+What the hub does with them:
+
+- **Background detection** (`createBackgroundSessionLookup`, `backgroundFor` in `manager.ts`). One
+  cached snapshot per hub process (15 s TTL, one read in flight, 3 s timeout): `claude agents --json
+  --all`, `tmux list-sessions` (name + start folder), and `ps` for `claude attach <id>` clients when a
+  session is live. Only a workspace with a claude manager on this machine asks; a missing `claude` is
+  not asked again for 10 minutes. A claude manager's session is **background** when it is live in
+  the daemon, no `agentbox-manager-*` tmux session other than its own attach session started in its
+  folder (a TUI there may be showing it), and no `claude attach` client runs outside that attach
+  session. The view carries `background: { id, status, state, name }`, and the manager is `running`
+  while the daemon runs the session.
+- **`POST /managers/{id}/attach`** re-checks that with a fresh snapshot, then starts (or reuses)
+  `agentbox-manager-<managerId>` running `claude attach <id>` in the manager's folder, with the
+  manager session options. The record only learns `tmuxSession`: kind, session id and pid stay the
+  detected ones, and `attachCommand` is sent while that tmux session is up. 409 without a detached
+  live session, 503 without tmux. **Stop** on such a manager kills only the attach session and
+  answers `notice`; resume answers 409 while the daemon runs the session.
+- **`terminalSession`** on a running external claude manager names the one unclaimed
+  `agentbox-manager-*` tmux session that started in its folder — a guess the tray offers as
+  *Open terminal here*, never adopted.
+- **Detect.** The CLI sends `tmuxSession` when `$TMUX` is set and the pane's session is an
+  `agentbox-manager-*` one; the hub records the manager as `hub`-run from it when that session exists
+  here and started in the detect's folder (the owning record joins by id; an unowned session, such
+  as the single-manager layout's `agentbox-manager-<workspaceId>`, is adopted). Because of the env
+  leak, a `managerId` hint is believed only for a manager in the same folder that has no session yet
+  or is hub-run and running.
+- **Env scrub.** `scrubAgentSessionEnv` (`@agentbox/sandbox-core`) drops the agent-session variables
+  (`CLAUDECODE`, `CLAUDE_PID`, `CLAUDE_CODE_SESSION_ID` and the other `CLAUDE_CODE_*` session vars,
+  `CLAUDE_BG_*`, `CODEX_THREAD_ID`, `AGENTBOX_MANAGER`, `AGENTBOX_WORKSPACE`, `TMUX`, `TMUX_PANE`)
+  from the hub daemon's spawn env and from a manager's tmux client env, and a manager's pane script
+  starts with `unset` of the same list (a running tmux server hands its own global env to new
+  sessions). A hub started from inside a claude session no longer passes that session's identity to
+  the managers it runs.
+
+**Not repaired: a session already in the daemon.** A pre-Phase-8 manager whose agent moved to the
+daemon (acme-saas's kanban session, live in `agentbox-manager-1020d6ffc6aa4e07`) is still an
+`external` record with the daemon pid: its `agentbox` calls cannot send `tmuxSession` (no `TMUX`), and
+nothing links the session to that pane for sure. It reads running, gets no `background` (the legacy
+session starts in its folder), and gets `terminalSession`, which the tray opens on request.
+
 ## Phase 9 — the timeline
 
 The Manager window shows what is planned and the manager's terminal. The timeline shows what
