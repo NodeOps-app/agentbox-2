@@ -10,6 +10,7 @@
 
 import { Command } from 'commander';
 import {
+  buildDoctorReport,
   formatDetailed,
   runAllChecks,
   runProviderChecks,
@@ -24,6 +25,7 @@ import { renderControlBoxProviders } from './prepare.js';
 
 interface DoctorOptions {
   provider?: string;
+  json?: boolean;
 }
 
 export const doctorCommand = new Command('doctor')
@@ -33,6 +35,10 @@ export const doctorCommand = new Command('doctor')
   .option(
     '-p, --provider <name>',
     'limit checks to one provider (docker | daytona | hetzner | vercel | e2b)',
+  )
+  .option(
+    '--json',
+    'print the report as JSON ({ version, platform, status, groups, portless }) — what the menu-bar app reads',
   )
   .action(async (opts: DoctorOptions) => {
     let groups: CheckGroup[];
@@ -56,6 +62,15 @@ export const doctorCommand = new Command('doctor')
       groups = [{ title: 'system', results: sys }, prov, { title: 'tools', results: tools }];
     } else {
       groups = await runAllChecks();
+    }
+
+    if (opts.json === true) {
+      // JSON only on stdout: no control-box inventory (a network call) and no
+      // trailing prose. The exit code keeps the fail rule below.
+      const report = await buildDoctorReport(groups);
+      process.stdout.write(JSON.stringify(report, null, 2) + '\n');
+      if (report.status === 'fail') process.exit(1);
+      return;
     }
 
     process.stdout.write(formatDetailed(groups).join('\n') + '\n');

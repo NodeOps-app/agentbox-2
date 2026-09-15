@@ -13,6 +13,8 @@ CLI, not the raw commits.
 
 ### Added
 
+- **`agentbox doctor --json`** prints the report as JSON, with the Portless facts as a top-level block; the system group now also reports `gh`. The menu-bar app's setup wizard reads it.
+
 - **`agentbox clone` of a bot gives you a second bot, not a copy of the first.**
   A clone of a service-agent box runs that agent, drops the files it regenerates,
   rewrites the ones naming the bot through an `identity` rule-set, and requires a

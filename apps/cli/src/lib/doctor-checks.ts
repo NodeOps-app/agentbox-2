@@ -24,7 +24,9 @@ import {
   type CheckResult,
   type CheckStatus,
 } from '@agentbox/sandbox-core';
+import { detectEngine, detectPortless, portlessServiceStatus } from '@agentbox/sandbox-docker';
 import { getRuntimeProviderNames, loadProviderModule } from '../provider/loaders.js';
+import { AGENTBOX_VERSION } from '../version.js';
 import { dockerProvidersHidden, isDockerProvider } from '../control-plane/remote-hub.js';
 import { evaluateBaseFreshness } from '../checkpoint-lookup.js';
 
@@ -113,6 +115,20 @@ async function checkGit(): Promise<CheckResult> {
       };
 }
 
+// gh is what the built-in host-tool grant and the PR flows shell; a box can
+// still push without it, so a miss is `warn` and labelled optional.
+async function checkGh(): Promise<CheckResult> {
+  const v = await probeVersion('gh');
+  return v
+    ? { label: 'gh', status: 'ok', detail: v }
+    : {
+        label: 'gh',
+        status: 'warn',
+        detail: 'not found',
+        hint: 'optional: `brew install gh` — needed for PRs from a box (the built-in gh host tool)',
+      };
+}
+
 async function checkSsh(): Promise<CheckResult> {
   // ssh -V prints to stderr; probeVersion concatenates both streams.
   const v = await probeVersion('ssh', ['-V']);
@@ -161,13 +177,14 @@ function checkMacfuse(): CheckResult {
 }
 
 export async function runSystemChecks(): Promise<CheckResult[]> {
-  const [git, ssh, sshfs, config] = await Promise.all([
+  const [git, gh, ssh, sshfs, config] = await Promise.all([
     checkGit(),
+    checkGh(),
     checkSsh(),
     checkSshfs(),
     checkConfig(),
   ]);
-  const results = [checkNode(), checkPlatform(), checkAgentboxHome(), git, ssh, sshfs];
+  const results = [checkNode(), checkPlatform(), checkAgentboxHome(), git, gh, ssh, sshfs];
   results.push(...(await checkBoxesOnStaleRelayPort()));
   // macFUSE is a macOS concept; on Linux FUSE is a kernel module and sshfs alone
   // is the signal, so don't show a spurious row.
@@ -448,6 +465,64 @@ export function worstStatus(groups: CheckGroup[]): CheckStatus {
     if (w === 'warn') worst = 'warn';
   }
   return worst;
+}
+
+/** Portless facts for `doctor --json`, independent of the docker group. */
+export interface PortlessReport {
+  /** False on OrbStack, which serves per-box `.orb.local` URLs natively. */
+  relevant: boolean;
+  installed: boolean;
+  version?: string;
+  proxyRunning: boolean;
+  serviceInstalled: boolean;
+}
+
+/** The `agentbox doctor --json` envelope (consumed by the menu-bar app's setup wizard). */
+export interface DoctorReport {
+  version: string;
+  platform: { os: string; arch: string };
+  status: CheckStatus;
+  groups: CheckGroup[];
+  portless: PortlessReport;
+}
+
+/**
+ * The docker group's own portless row is dropped on OrbStack and whenever the
+ * daemon is down — the first-run state where a GUI most needs to offer the
+ * install — so the JSON carries the facts as a top-level block, probed here
+ * rather than read back out of a row's prose. `probes` is injectable for tests.
+ */
+export async function buildDoctorReport(
+  groups: CheckGroup[],
+  probes: {
+    engine: () => Promise<string>;
+    portless: () => Promise<{ installed: boolean; version?: string; proxyRunning: boolean }>;
+    service: () => Promise<{ installed: boolean }>;
+  } = {
+    engine: () => detectEngine(),
+    portless: () => detectPortless(),
+    service: () => portlessServiceStatus(),
+  },
+): Promise<DoctorReport> {
+  const noPortless = { installed: false, proxyRunning: false, version: undefined };
+  const [engine, state, service] = await Promise.all([
+    probes.engine().catch(() => 'other'),
+    probes.portless().catch(() => noPortless),
+    probes.service().catch(() => ({ installed: false })),
+  ]);
+  return {
+    version: AGENTBOX_VERSION,
+    platform: { os: process.platform, arch: process.arch },
+    status: worstStatus(groups),
+    groups,
+    portless: {
+      relevant: engine !== 'orbstack',
+      installed: state.installed,
+      ...(state.version ? { version: state.version } : {}),
+      proxyRunning: state.proxyRunning,
+      serviceInstalled: service.installed,
+    },
+  };
 }
 
 function summaryToken(group: CheckGroup): string {
