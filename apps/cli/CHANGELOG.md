@@ -9,11 +9,44 @@ Entries are generated from the commit history with `/release-notes` and then
 hand-reviewed — they describe what changed for someone using the `agentbox`
 CLI, not the raw commits.
 
-## [Unreleased]
+## [0.32.0] - 2026-09-15
 
 ### Added
 
-- **`agentbox doctor --json`** prints the report as JSON, with the Portless facts as a top-level block; the system group now also reports `gh`. The menu-bar app's setup wizard reads it.
+- **Workspaces, tasks and the manager.** A workspace is a host folder grouping
+  several projects and owning a task list; the manager is a coding agent the hub
+  runs locally in that folder, in a tmux session every client can attach to.
+  `agentbox workspace` registers a folder and discovers its projects,
+  `agentbox tasks` is the work list (`--note`, `--manager`, `--mine`), and
+  `agentbox manager` starts, resumes, attaches to, stops and forgets manager
+  sessions. `create --tasks T-1,T-2` assigns tasks to the box it makes. A host
+  Claude Code or Codex session that runs `agentbox` is detected and registered
+  as that workspace's manager, Codex sessions resume too, and a Claude
+  background session (`claude --bg`) can be attached through the hub.
+  Everything is behind `/api/v1/workspaces`, `/api/v1/tasks` and
+  `/api/v1/managers`.
+- **Workspace timeline.** The hub keeps an append-only timeline per workspace
+  (box lifecycle, pushes with their `+/-` line counts, pull requests synced
+  from GitHub, manager notes and messages, session turns), served by
+  `GET /api/v1/workspaces/{id}/timeline` with `lane` and `branchUrl` on every
+  row so a client can draw it as a branch graph. Boxes now carry their pull
+  request (`Box.pr`) and manager (`Box.managerId`) on the API payload.
+- **`agentbox doctor --json`** prints the report as JSON, with the Portless
+  facts as a top-level block; the system group now also reports `gh`. The
+  menu-bar app's setup wizard reads it.
+
+### Fixed
+
+- **Portless install could crash-loop beside an older proxy.** An orphan proxy
+  holding `:443` kept the boot service from binding while everything reported
+  healthy. The install now stops stale listeners first and judges the outcome
+  by the service state; `doctor` reports a failing service.
+- **A create run inside a Claude or Codex session no longer fails or starts a
+  hub** when the hub is unreachable: the session registration is quiet and
+  best-effort. A session started in another folder is found by its transcript,
+  and a Codex launched from inside Claude is attributed to Codex.
+- **A hub started from inside an agent session** no longer hands that
+  session's identity to the managers it runs.
 
 ## [0.31.4] - 2026-09-11
 
