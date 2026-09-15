@@ -1,3 +1,5 @@
+import { recordBoxGhResult, recordBoxGitPush } from './timeline-hooks.js';
+import { pushedRef, readRefTip } from './workspaces/push-stat.js';
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
@@ -991,6 +993,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServerHandle {
         // Per-box `agentbox/<name>` branches are the box's own scratch branch
         // — pushes to them are the whole point of agentbox, so they bypass
         // the y/N gate. Any other branch still prompts.
+        let pushHostInitiated = false;
         if (body.method === 'git.push') {
           const hostOnlyParams = body.params as GitRpcParams | undefined;
           if (hostOnlyParams?.hostOnly) {
@@ -1048,6 +1051,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServerHandle {
             !bypassPushGate &&
             tokenClaimed &&
             hostInitiatedTokens.consume(params?.hostInitiated, reg.boxId, 'git.push', incomingHash);
+          pushHostInitiated = hostInitiatedOk;
           if (!bypassPushGate && tokenClaimed && !hostInitiatedOk) {
             send(res, 500, {
               exitCode: 10,
@@ -1081,11 +1085,37 @@ export function createRelayServer(opts: RelayServerOptions): RelayServerHandle {
             }
           }
         }
-        const result = await handleGitRpc(
-          reg,
-          body.method,
-          body.params as GitRpcParams | undefined,
-        );
+        const pushParams = body.params as GitRpcParams | undefined;
+        const pushTree =
+          body.method === 'git.push'
+            ? resolveWorktree(reg, pushParams?.path ?? '/workspace')
+            : undefined;
+        const pushBranch = pushTree ? (pushTree.sanctionedBranch ?? pushTree.branch) : undefined;
+        // The old tip has to be read before the push moves it; only for a push
+        // the timeline hook will record (a host-initiated one is the hub's).
+        const pushStat =
+          pushTree && pushBranch && !pushHostInitiated
+            ? {
+                repo: pushTree.hostMainRepo,
+                ref: pushedRef(pushBranch, { remote: resolveRemote(pushParams?.remote) }),
+                branch: pushBranch,
+              }
+            : undefined;
+        const pushBefore = pushStat ? await readRefTip(pushStat.repo, pushStat.ref) : undefined;
+        const result = await handleGitRpc(reg, body.method, pushParams);
+        if (body.method === 'git.push' && result.exitCode === 0 && pushTree) {
+          void recordBoxGitPush(
+            {
+              boxId: reg.boxId,
+              boxName: reg.name,
+              hostPath: pushTree.hostMainRepo,
+              ...(pushBranch ? { branch: pushBranch } : {}),
+            },
+            { hostInitiated: pushHostInitiated, hostOnly: Boolean(pushParams?.hostOnly) },
+            result,
+            pushStat ? { ...pushStat, ...(pushBefore ? { before: pushBefore } : {}) } : undefined,
+          );
+        }
         const status = result.exitCode === 0 ? 200 : 500;
         send(res, status, result);
         return;
@@ -1294,13 +1324,31 @@ export function createRelayServer(opts: RelayServerOptions): RelayServerHandle {
         return;
       }
       if (body.method === 'gh.exec') {
+        const ghParams = body.params as GhExecRpcParams | undefined;
         const result = await handleGhExecRpc(
           reg,
-          body.params as GhExecRpcParams | undefined,
+          ghParams,
           prompts,
           subscribers,
           hostInitiatedTokens,
         );
+        const ghTree =
+          result.exitCode === 0 ? resolveWorktree(reg, ghParams?.path ?? '/workspace') : undefined;
+        if (ghTree) {
+          void recordBoxGhResult(
+            {
+              boxId: reg.boxId,
+              boxName: reg.name,
+              hostPath: ghTree.hostMainRepo,
+              branch: ghTree.sanctionedBranch ?? ghTree.branch,
+              ...(reg.originUrl ? { originUrl: reg.originUrl } : {}),
+            },
+            Array.isArray(ghParams?.args)
+              ? ghParams.args.filter((a): a is string => typeof a === 'string')
+              : [],
+            result,
+          );
+        }
         const status = result.exitCode === 0 ? 200 : 500;
         send(res, status, result);
         return;

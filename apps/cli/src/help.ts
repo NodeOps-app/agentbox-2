@@ -32,6 +32,11 @@ export const HELP_GROUPS: HelpGroup[] = [
     commands: ['git', 'git push', 'git pull', 'git pr', 'download', 'cp', 'checkpoint', 'queue'],
   },
   {
+    title: 'Workspaces & tasks',
+    hint: 'group projects in a folder, plan the work, run a manager agent over it',
+    commands: ['workspace', 'tasks', 'manager'],
+  },
+  {
     title: 'Providers',
     commands: [
       'prepare',
@@ -69,6 +74,9 @@ export const HELP_GROUPS: HelpGroup[] = [
 // live description would wrap need an entry; buildGroupedHelp falls back to
 // the live description and clips as a safety net either way.
 export const SHORT_DESCRIPTIONS: Record<string, string> = {
+  workspace: 'Register a folder grouping several projects, with its own task list',
+  tasks: 'Units of work in a workspace, assigned to boxes (not agentbox.yaml tasks)',
+  manager: 'Agent sessions that create and watch boxes: detected, or run by the hub',
   create: 'Create and start a new agent box (no agent launched)',
   claude: 'Create a box and launch Claude Code (detachable tmux session)',
   codex: 'Create a box and launch OpenAI Codex (detachable tmux session)',

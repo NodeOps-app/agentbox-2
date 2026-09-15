@@ -418,6 +418,123 @@ agentbox tools rm terraform
 
 See [Configuration](/docs/configuration), [agentbox.yaml](/docs/agentbox-yaml), and [Environment](/docs/environment).
 
+## Workspaces & tasks
+
+A **workspace** is a folder on your machine that groups one or more projects — the unit you plan
+across when a feature spans several repos. It owns a **task** list and its **managers**: the coding
+agent sessions that read the list, group tasks into boxes so their diffs do not collide, and drive
+them.
+
+You do not have to set any of this up. Run `agentbox create`, an agent command or `agentbox tasks add`
+from inside a Claude Code or Codex session and that session is registered as a manager; if no
+workspace contains its folder, one is created there, named after the folder. The boxes it creates
+group under it, and so do the tasks it adds.
+
+These tasks are the work items you and the manager write. They are not the `tasks:` block in
+`agentbox.yaml`, which is the setup commands the in-box supervisor runs — see
+[Services & tasks](/docs/services-and-tasks) for those.
+
+```bash
+# Register a folder (its subfolders with a .git or agentbox.yaml become projects)
+agentbox workspace add ~/code
+agentbox workspace add                # the current directory
+agentbox workspace list
+agentbox workspace show
+agentbox workspace rescan             # pick up a repo cloned in after registration
+agentbox workspace rename storefront
+agentbox workspace rm -y              # unregisters only; the folder and its boxes stay
+agentbox workspace rm -y --force      # even while one of its managers reads as running
+```
+
+Every command below finds its workspace the same way: `--workspace <id|path>` if you pass one, else
+`$AGENTBOX_WORKSPACE` (which a hub-run manager's session has set), else the registered workspace
+containing your current directory — and, inside a Claude Code or Codex session with none of those,
+the workspace registering that session creates. That never happens at `/`, your home folder or a
+folder above it (you get a warning: run `agentbox workspace add <project folder>` instead), and a
+workspace you name with `--workspace` never gets another one created beside it: a session from a
+different workspace just isn't attached to the task.
+
+```bash
+# Plan the work. List order is the priority.
+agentbox tasks add "Retry failed charges with backoff" -p <project-id>
+agentbox tasks add "Add copy snapshot tests" --depends-on T-11
+agentbox tasks list                   # open tasks
+agentbox tasks list --by-box          # grouped by the box working them
+agentbox tasks list --mine            # the tasks of the session running this command
+agentbox tasks list --manager 3f9a    # one manager's tasks
+agentbox tasks list -a --json
+agentbox tasks show T-11
+agentbox tasks update T-11 --status blocked
+agentbox tasks reorder T-14 T-11 T-12 # list every id
+agentbox tasks reorder T-14 T-11 T-12 --note "T-14 unblocks the payment tasks"  # say why
+agentbox tasks done T-11
+agentbox tasks rm T-11 -y
+
+# Put tasks on a box — or take them back
+agentbox tasks assign T-11 T-12 --box b169ec5
+agentbox tasks assign T-11 --box none
+```
+
+`--tasks` assigns while the box is being created, on `agentbox create` and on every agent command:
+
+```bash
+agentbox create -n payment-retries --tasks T-11,T-12,T-13
+agentbox claude -n checkout-copy --tasks T-14,T-15
+```
+
+The ids are checked before anything is provisioned. While the box is still building the tasks point
+at the create job; they move to the box the moment it lands. Destroy the box and they return to the
+backlog with their progress intact.
+
+```bash
+# Managers: the agent sessions that create and watch boxes
+agentbox manager list                       # running first; -w to filter, --running, -j
+agentbox manager status                     # this session's manager, else the workspace's
+agentbox manager status 3f9a                # one manager, by id or unique prefix
+agentbox manager resume 3f9a --attach       # reopen an ended session in the hub's tmux
+agentbox manager stop 3f9a                  # hub-run managers only
+agentbox manager forget 3f9a -y             # drop a stopped manager's record
+agentbox manager forget 3f9a -y --force     # drop it even if it reads as running
+agentbox manager start --agent claude       # a new hub-run manager; offers to resume a session
+agentbox manager start --agent codex --new  # --new skips the resume picker
+agentbox manager attach                     # the running hub-run manager, or a Claude background session (opened through the hub); or --attach-in split|window|tab
+agentbox manager sessions --agent codex     # resumable sessions in this folder
+agentbox manager note "holding T-12 until #405 merges" --replan  # on the timeline, at this turn
+agentbox manager note "split checkout into two boxes" 3f9a       # a manager by id, from anywhere
+```
+
+A manager is either **external** — the Claude Code or Codex session in your own terminal, detected
+when it runs `agentbox` — or **hub-run**, started by the hub in a tmux session it owns, so the CLI, the
+tray and a plain `tmux attach` all reach the same running agent (the session is sized to the most
+recently active client, so two attached at once do not clamp each other). That session, and only
+that session, has the mouse on (the wheel scrolls its history) and an AgentBox footer naming the
+manager, its session and the workspace, with the detach key. An external manager is
+yours: the hub reports whether it is still running but never stops it. Once it has ended,
+`manager resume` reopens that same conversation in the hub's tmux (`claude --resume <id>` /
+`codex resume <id>`, in the folder it ran in), where any client can attach to it. Hub-run managers
+need `tmux` on the machine running the hub; `agentbox doctor` tells you if it is missing.
+
+`manager sessions` lists the sessions in the workspace folder a manager could pick up, read from the
+agent's own store; `--session <id>` on `start` resumes one. Only `claude` and `codex` are resumable —
+each with its own spelling — and the rest report that they are unsupported rather than quietly
+starting a fresh agent that looks resumed.
+
+Every change a manager session makes through `agentbox` lands on the workspace **timeline** — the
+tray's Manager window, and `GET /api/v1/workspaces/{id}/timeline` — stamped with the session's turn,
+next to the boxes that session started, their pushes and the pull requests that merged. The timeline
+cannot see the reasoning, so say it: `--note` on `tasks add | update | assign | reorder` and
+`manager note` (with `--replan` or `--plan`) record why next to the change. Outside a session,
+`manager note` needs a manager id. A message the tray's **Approve** sends reaches a hub-run manager in
+its tmux session, and an external one only when its terminal runs inside tmux.
+
+Detection has limits. OpenCode and Pi export no session id, so their sessions are never registered.
+Codex's default `workspace-write` sandbox blocks loopback, so the CLI cannot reach the hub from inside
+it at all: set `[sandbox_workspace_write] network_access = true` in `~/.codex/config.toml` (or use a
+full-access sandbox). Even then `ps` is not permitted in that sandbox, so a sandboxed Codex manager has
+no pid and counts as running for 30 minutes after it last ran `agentbox`. A Claude Code session counts
+as running exactly as long as its process lives — the hub records the process's start time, so a pid
+the system later hands to another process does not keep it running.
+
 ## Providers
 
 The provider commands are both credential/management groups and sugar prefixes. `agentbox <provider> <verb>` is rewritten to `--provider <provider>`, so `agentbox hetzner claude` ≡ `agentbox claude --provider hetzner`.

@@ -30,6 +30,7 @@ import { pushCreateSeed } from '../control-plane/create-target.js';
 import { CustodyClient } from '../control-plane/custody-client.js';
 import { makeProgressReporter } from '@agentbox/cli-kit';
 import type { AgentId } from '@agentbox/core';
+import { registerCurrentSession } from '../lib/host-session.js';
 
 /**
  * Run a hub create under ONE self-updating status line.
@@ -182,7 +183,10 @@ export async function createCloudBoxViaHubAndAdopt(
   });
 
   const client = new HubApiClient(apiTarget);
+  // Inside a claude/codex session the box groups under that session on the hub.
+  const manager = await registerCurrentSession(client);
   const { jobId } = await client.createBox({
+    ...(manager ? { managerId: manager.managerId } : {}),
     repoUrl,
     provider: providerSpecFor(providerName, remoteHost),
     agent,
@@ -294,7 +298,10 @@ export async function enqueueAgentJobViaHub(
   });
 
   const client = new HubApiClient(apiTarget);
+  // Inside a claude/codex session the box groups under that session on the hub.
+  const manager = await registerCurrentSession(client);
   const { jobId } = await client.createBox({
+    ...(manager ? { managerId: manager.managerId } : {}),
     repoUrl,
     provider: providerSpecFor(providerName, remoteHost),
     agent,

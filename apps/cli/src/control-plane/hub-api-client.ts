@@ -162,6 +162,8 @@ export interface HubApiCreateBoxInput {
   setupWizard?: boolean;
   /** Box-shaping knobs (image, snapshot, limits, size/location, carry, ...). */
   opts?: Record<string, unknown>;
+  /** The manager session this create came from (`detectManager`). */
+  managerId?: string;
 }
 
 /**
@@ -418,12 +420,178 @@ export interface HubApiHealth {
  * own on `GET /api/v1/health` (`apiVersion`); a hub outside this set is refused up
  * front with an upgrade hint rather than failing on a missing/changed field later.
  */
+// ── workspaces / tasks / manager ──
+
+/** A folder on the hub host grouping one or more projects (`GET /workspaces`). */
+export interface HubApiWorkspace {
+  id: string;
+  name: string;
+  root: string;
+  projectIds: string[];
+  taskCounts?: { open: number; done: number };
+  managers?: { running: number; total: number };
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type HubApiTaskStatus = 'todo' | 'in_progress' | 'blocked' | 'done';
+
+/** A unit of work. Many tasks map to one box (`GET /workspaces/:id/tasks`). */
+export interface HubApiTask {
+  id: string;
+  workspaceId: string;
+  projectId?: string;
+  title: string;
+  description?: string;
+  status: HubApiTaskStatus;
+  order: number;
+  boxId?: string;
+  boxJobId?: string;
+  managerId?: string;
+  dependsOn?: string[];
+  createdBy: 'human' | 'manager' | 'api';
+  externalRef?: { kind: string; id: string; url?: string };
+  createdAt: string;
+  updatedAt: string;
+  doneAt?: string;
+}
+
+export interface HubApiTaskCreate {
+  title: string;
+  description?: string;
+  projectId?: string;
+  dependsOn?: string[];
+  createdBy?: 'human' | 'manager' | 'api';
+  boxId?: string;
+  boxJobId?: string;
+  managerId?: string;
+  /** Why: recorded on the workspace timeline next to the create. */
+  note?: string;
+}
+
+export interface HubApiTaskUpdate {
+  title?: string;
+  description?: string;
+  status?: HubApiTaskStatus;
+  /** `null` clears the project scope. */
+  projectId?: string | null;
+  dependsOn?: string[];
+  /** `null` clears the manager. */
+  managerId?: string | null;
+  note?: string;
+}
+
+/** A box that exists, or the create job that will become one. */
+export type HubApiAssignTarget = { boxId: string } | { boxJobId: string };
+
+/** A host agent session that creates and watches boxes (`GET /managers`). */
+export interface HubApiManager {
+  id: string;
+  workspaceId: string;
+  workspaceName: string;
+  agent: string;
+  /** `external`: a session in someone's terminal. `hub`: one the hub runs in tmux. */
+  kind: 'external' | 'hub';
+  status: 'running' | 'stopped';
+  /** Whether `POST /managers/{id}/resume` would be accepted now. */
+  resumable?: boolean;
+  /** Why `resumable` is false; absent when it is true. */
+  resumeBlockedBy?: 'running' | 'other-host' | 'unsupported-agent' | 'no-session';
+  cwd: string;
+  sessionId?: string;
+  title?: string;
+  host?: string;
+  pid?: number;
+  pidStartedAt?: string;
+  tmuxSession?: string;
+  /** Ready-to-run tmux attach command: a running hub-run manager, or an attached background session. */
+  attachCommand?: string;
+  /** A detached Claude background session `POST /managers/{id}/attach` can open. */
+  background?: { id: string; status?: string; state?: string; name?: string };
+  /** An unclaimed AgentBox tmux session in the manager's folder. */
+  terminalSession?: string;
+  boxIds: string[];
+  boxJobIds: string[];
+  taskCounts: { open: number; done: number };
+  createdAt: string;
+  lastSeenAt: string;
+  startedAt?: string;
+  stoppedAt?: string;
+  lastExit?: number;
+}
+
+/** Body for `POST /managers/detect`. */
+export interface HubApiManagerDetect {
+  agent: string;
+  sessionId: string;
+  cwd: string;
+  pid?: number;
+  host?: string;
+  managerId?: string;
+  tmuxPane?: string;
+  tmuxSession?: string;
+  boxId?: string;
+  boxJobId?: string;
+}
+
+/** One event on a workspace timeline (`POST /managers/{id}/notes` answers with it). */
+export interface HubApiTimelineEvent {
+  id: string;
+  at: string;
+  type: string;
+  actor: 'human' | 'manager' | 'box' | 'hub' | 'github';
+  managerId?: string;
+  turn?: number;
+  prompt?: string;
+  taskIds?: string[];
+  text?: string;
+  noteKind?: 'note' | 'replan' | 'plan';
+}
+
+export interface HubApiManagerFilter {
+  workspaceId?: string;
+  status?: 'running' | 'stopped';
+}
+
+export interface HubApiManagerStart {
+  agent: string;
+  sessionId?: string;
+  restart?: boolean;
+}
+
+export interface HubApiHostSession {
+  id: string;
+  agent: string;
+  title: string;
+  updatedAt: string;
+}
+
+export interface HubApiManagerSessions {
+  agent: string;
+  /** False when this agent's session format is not one the hub can resume. */
+  supported: boolean;
+  sessions: HubApiHostSession[];
+}
+
+export interface HubApiTaskFilter {
+  workspaceId?: string;
+  projectId?: string;
+  boxId?: string;
+  status?: HubApiTaskStatus;
+  managerId?: string;
+}
+
 export const SUPPORTED_HUB_API_VERSIONS = ['v1'] as const;
 
 export interface HubApiTarget {
   url: string;
   apiKey: string;
   fetchImpl?: typeof fetch;
+  /**
+   * The `X-AgentBox-Session` value to send. Undefined detects the host agent
+   * session this process runs inside; `null` sends none.
+   */
+  session?: string | null;
 }
 
 /** An error carrying the `/api/v1` envelope's code + HTTP status (+ optional details). */
@@ -453,18 +621,35 @@ export class HubApiClient {
   private readonly base: string;
   private readonly token: string;
   private readonly fetchImpl: typeof fetch;
+  private readonly sessionOverride: string | null | undefined;
+  private sessionValue: Promise<string | undefined> | undefined;
 
   constructor(target: HubApiTarget) {
     this.base = target.url.replace(/\/+$/, '');
     this.token = target.apiKey;
     this.fetchImpl = target.fetchImpl ?? fetch;
+    this.sessionOverride = target.session;
+  }
+
+  /** Which host agent session is calling, so the hub can stamp its timeline. */
+  private sessionHeader(): Promise<string | undefined> {
+    if (this.sessionOverride !== undefined) {
+      return Promise.resolve(this.sessionOverride ?? undefined);
+    }
+    // Loaded lazily: host-session imports this module for its error type.
+    this.sessionValue ??= import('../lib/host-session.js')
+      .then((m) => m.currentSessionHeader())
+      .catch(() => undefined);
+    return this.sessionValue;
   }
 
   private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
+    const session = await this.sessionHeader();
     const res = await this.fetchImpl(`${this.base}/api/v1${path}`, {
       method,
       headers: {
         Authorization: `Bearer ${this.token}`,
+        ...(session ? { 'X-AgentBox-Session': session } : {}),
         ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
       },
       ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
@@ -984,6 +1169,200 @@ export class HubApiClient {
     }
     return { status };
   }
+
+  // ── workspaces / tasks / manager ──
+
+  /** Workspaces the hub has registered. Empty on a hosted hub (host state only). */
+  async listWorkspaces(): Promise<HubApiWorkspace[]> {
+    return (await this.request<{ workspaces: HubApiWorkspace[] }>('GET', '/workspaces')).workspaces;
+  }
+
+  getWorkspace(id: string): Promise<HubApiWorkspace> {
+    return this.request<HubApiWorkspace>('GET', `/workspaces/${encodeURIComponent(id)}`);
+  }
+
+  /**
+   * Register a folder ON THE HUB'S MACHINE as a workspace. The path is resolved
+   * and scanned there, so a remote hub registers ITS folder, not the caller's.
+   */
+  addWorkspace(body: { path: string; name?: string }): Promise<HubApiWorkspace> {
+    return this.request<HubApiWorkspace>('POST', '/workspaces', body);
+  }
+
+  async removeWorkspace(id: string, opts: { force?: boolean } = {}): Promise<void> {
+    const q = opts.force ? '?force=1' : '';
+    await this.request<{ ok: true }>('DELETE', `/workspaces/${encodeURIComponent(id)}${q}`);
+  }
+
+  renameWorkspace(id: string, name: string): Promise<HubApiWorkspace> {
+    return this.request<HubApiWorkspace>('POST', `/workspaces/${encodeURIComponent(id)}/rename`, {
+      name,
+    });
+  }
+
+  rescanWorkspace(id: string): Promise<HubApiWorkspace> {
+    return this.request<HubApiWorkspace>('POST', `/workspaces/${encodeURIComponent(id)}/rescan`);
+  }
+
+  async listTasks(wsId: string, filter: HubApiTaskFilter = {}): Promise<HubApiTask[]> {
+    const q = taskQuery(filter);
+    const suffix = q ? `?${q}` : '';
+    const path = `/workspaces/${encodeURIComponent(wsId)}/tasks${suffix}`;
+    return (await this.request<{ tasks: HubApiTask[] }>('GET', path)).tasks;
+  }
+
+  /** Tasks across every workspace — "what is assigned to this box" without knowing its workspace. */
+  async listAllTasks(filter: HubApiTaskFilter = {}): Promise<HubApiTask[]> {
+    const q = taskQuery(filter);
+    return (await this.request<{ tasks: HubApiTask[] }>('GET', `/tasks${q ? `?${q}` : ''}`)).tasks;
+  }
+
+  getTask(wsId: string, taskId: string): Promise<HubApiTask> {
+    return this.request<HubApiTask>(
+      'GET',
+      `/workspaces/${encodeURIComponent(wsId)}/tasks/${encodeURIComponent(taskId)}`,
+    );
+  }
+
+  addTask(wsId: string, body: HubApiTaskCreate): Promise<HubApiTask> {
+    return this.request<HubApiTask>('POST', `/workspaces/${encodeURIComponent(wsId)}/tasks`, body);
+  }
+
+  updateTask(wsId: string, taskId: string, body: HubApiTaskUpdate): Promise<HubApiTask> {
+    return this.request<HubApiTask>(
+      'POST',
+      `/workspaces/${encodeURIComponent(wsId)}/tasks/${encodeURIComponent(taskId)}`,
+      body,
+    );
+  }
+
+  completeTask(wsId: string, taskId: string): Promise<HubApiTask> {
+    return this.request<HubApiTask>(
+      'POST',
+      `/workspaces/${encodeURIComponent(wsId)}/tasks/${encodeURIComponent(taskId)}/done`,
+    );
+  }
+
+  async removeTask(wsId: string, taskId: string): Promise<void> {
+    await this.request<{ ok: true }>(
+      'DELETE',
+      `/workspaces/${encodeURIComponent(wsId)}/tasks/${encodeURIComponent(taskId)}`,
+    );
+  }
+
+  /** Point tasks at a box (or the create job that will become one). */
+  async assignTasks(
+    wsId: string,
+    ids: string[],
+    target: HubApiAssignTarget,
+    opts: { note?: string } = {},
+  ): Promise<HubApiTask[]> {
+    const path = `/workspaces/${encodeURIComponent(wsId)}/tasks/assign`;
+    const body = { ids, ...target, ...(opts.note ? { note: opts.note } : {}) };
+    return (await this.request<{ tasks: HubApiTask[] }>('POST', path, body)).tasks;
+  }
+
+  unassignTask(wsId: string, taskId: string): Promise<HubApiTask> {
+    return this.request<HubApiTask>(
+      'POST',
+      `/workspaces/${encodeURIComponent(wsId)}/tasks/${encodeURIComponent(taskId)}/unassign`,
+    );
+  }
+
+  /** `ids` must be an exact permutation of the workspace's tasks. */
+  async reorderTasks(
+    wsId: string,
+    ids: string[],
+    opts: { note?: string } = {},
+  ): Promise<HubApiTask[]> {
+    const path = `/workspaces/${encodeURIComponent(wsId)}/tasks/reorder`;
+    const body = { ids, ...(opts.note ? { note: opts.note } : {}) };
+    return (await this.request<{ tasks: HubApiTask[] }>('POST', path, body)).tasks;
+  }
+
+  /** Record a note on the workspace timeline, stamped with the manager's current turn. */
+  addManagerNote(
+    id: string,
+    body: { text: string; kind?: 'note' | 'replan' | 'plan' },
+  ): Promise<HubApiTimelineEvent> {
+    return this.request<HubApiTimelineEvent>(
+      'POST',
+      `/managers/${encodeURIComponent(id)}/notes`,
+      body,
+    );
+  }
+
+  /** Register (or refresh) the host agent session this CLI runs inside. */
+  detectManager(
+    body: HubApiManagerDetect,
+  ): Promise<{ manager: HubApiManager; workspace: HubApiWorkspace }> {
+    return this.request('POST', '/managers/detect', body);
+  }
+
+  async listManagers(filter: HubApiManagerFilter = {}): Promise<HubApiManager[]> {
+    const q = new URLSearchParams();
+    if (filter.workspaceId) q.set('workspaceId', filter.workspaceId);
+    if (filter.status) q.set('status', filter.status);
+    const suffix = q.toString() ? `?${q.toString()}` : '';
+    return (await this.request<{ managers: HubApiManager[] }>('GET', `/managers${suffix}`))
+      .managers;
+  }
+
+  getManager(id: string): Promise<HubApiManager> {
+    return this.request<HubApiManager>('GET', `/managers/${encodeURIComponent(id)}`);
+  }
+
+  async listWorkspaceManagers(wsId: string): Promise<HubApiManager[]> {
+    const path = `/workspaces/${encodeURIComponent(wsId)}/managers`;
+    return (await this.request<{ managers: HubApiManager[] }>('GET', path)).managers;
+  }
+
+  /** Start a manager agent in a tmux session ON THE HUB'S machine. */
+  startManager(wsId: string, body: HubApiManagerStart): Promise<HubApiManager> {
+    return this.request<HubApiManager>(
+      'POST',
+      `/workspaces/${encodeURIComponent(wsId)}/managers/start`,
+      body,
+    );
+  }
+
+  /** Reopen a stopped manager's session in the hub's tmux. */
+  resumeManager(id: string): Promise<HubApiManager> {
+    return this.request<HubApiManager>('POST', `/managers/${encodeURIComponent(id)}/resume`);
+  }
+
+  /** Open a claude manager's Claude background session in a hub tmux session. */
+  attachManager(id: string): Promise<HubApiManager> {
+    return this.request<HubApiManager>('POST', `/managers/${encodeURIComponent(id)}/attach`);
+  }
+
+  stopManager(id: string): Promise<HubApiManager> {
+    return this.request<HubApiManager>('POST', `/managers/${encodeURIComponent(id)}/stop`);
+  }
+
+  async removeManager(id: string, opts: { force?: boolean } = {}): Promise<void> {
+    const q = opts.force ? '?force=1' : '';
+    await this.request<{ ok: true }>('DELETE', `/managers/${encodeURIComponent(id)}${q}`);
+  }
+
+  listManagerSessions(wsId: string, agent?: string): Promise<HubApiManagerSessions> {
+    const q = agent ? `?agent=${encodeURIComponent(agent)}` : '';
+    return this.request<HubApiManagerSessions>(
+      'GET',
+      `/workspaces/${encodeURIComponent(wsId)}/managers/sessions${q}`,
+    );
+  }
+}
+
+/** Shared task filter query string (`?status=&projectId=&boxId=&workspaceId=`). */
+function taskQuery(filter: HubApiTaskFilter): string {
+  const q = new URLSearchParams();
+  if (filter.workspaceId) q.set('workspaceId', filter.workspaceId);
+  if (filter.projectId) q.set('projectId', filter.projectId);
+  if (filter.boxId) q.set('boxId', filter.boxId);
+  if (filter.status) q.set('status', filter.status);
+  if (filter.managerId) q.set('managerId', filter.managerId);
+  return q.toString();
 }
 
 /** Build the shared `/boxes/:id/logs` query string (service/tail/daemon/follow). */

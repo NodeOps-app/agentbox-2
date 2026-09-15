@@ -28,6 +28,13 @@
         "negate": false
       },
       {
+        "flags": "--tasks <ids>",
+        "description": "comma-separated workspace task ids to assign to this box (e.g. T-11,T-12)",
+        "defaultValue": null,
+        "mandatory": false,
+        "negate": false
+      },
+      {
         "flags": "--host-snapshot",
         "description": "APFS-clone the host workspace into a per-box scratch dir before seeding /workspace (stabilizes the tar-pipe source)",
         "defaultValue": null,
@@ -491,6 +498,13 @@
       {
         "flags": "-n, --name <name>",
         "description": "friendly box name (default: <workspace-basename>-<id>)",
+        "defaultValue": null,
+        "mandatory": false,
+        "negate": false
+      },
+      {
+        "flags": "--tasks <ids>",
+        "description": "comma-separated workspace task ids to assign to this box (e.g. T-11,T-12)",
         "defaultValue": null,
         "mandatory": false,
         "negate": false
@@ -1206,6 +1220,13 @@
         "negate": false
       },
       {
+        "flags": "--tasks <ids>",
+        "description": "comma-separated workspace task ids to assign to this box (e.g. T-11,T-12)",
+        "defaultValue": null,
+        "mandatory": false,
+        "negate": false
+      },
+      {
         "flags": "--host-snapshot",
         "description": "APFS-clone the host workspace into a per-box scratch dir before seeding /workspace (stabilizes the tar-pipe source)",
         "defaultValue": null,
@@ -1641,6 +1662,13 @@
       {
         "flags": "-n, --name <name>",
         "description": "friendly box name (default: <workspace-basename>-<id>)",
+        "defaultValue": null,
+        "mandatory": false,
+        "negate": false
+      },
+      {
+        "flags": "--tasks <ids>",
+        "description": "comma-separated workspace task ids to assign to this box (e.g. T-11,T-12)",
         "defaultValue": null,
         "mandatory": false,
         "negate": false

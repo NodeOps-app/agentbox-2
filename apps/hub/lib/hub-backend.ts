@@ -41,6 +41,13 @@ import {
   type Provider,
 } from '@agentbox/core';
 import type { BoxStatus as CtlBoxStatus, StatusReply } from '@agentbox/ctl';
+import { createBoxFactSeams } from './backend/box-facts';
+import { createBoxPrLookup } from './backend/box-prs';
+import { createGithubPrSync } from './backend/github-prs';
+import { createManagerBackend } from './backend/managers';
+import { createTimelineBackend, withBoxTimeline } from './backend/timeline';
+import { createWorkspaceBackend } from './backend/workspaces';
+import type { BackendDeps } from './backend/deps';
 import {
   deleteJob,
   enqueuePrepareJob,
@@ -50,6 +57,7 @@ import {
   isValidBoxStatus,
   loadQueue,
   queueLogPath,
+  readCurrentBranch,
   readJob,
   registrationToBoxRecord,
   writeQueueLoginCode,
@@ -73,6 +81,7 @@ import {
   BOX_WORKSPACE,
   autoWriteSshConfig,
   boxGitCheckout,
+  boxGitCurrentBranch,
   boxGitNewBranch,
   boxGitPull,
   boxGitPush,
@@ -208,6 +217,7 @@ import type {
   Approval,
   Box,
   BoxStatus,
+  BoxTaskSummary,
   GithubState,
   HubState,
   Project,
@@ -2074,6 +2084,40 @@ export function createHubBackend(handle: RelayServerHandle): HubBackend {
   // demand. Threaded into every provider-driven path below.
   const hydrate: HydrateFn = (bid) => hydrateRegisteredBox(handle, bid);
 
+  // Domain slices (see lib/backend/). Each gets only the seams it needs, so it
+  // is testable without a relay handle and reviewable without this file.
+  const backendDeps: BackendDeps = {
+    notify: () => handle.hubNotifier.notify(),
+    async liveBoxIds() {
+      // Local records UNION Store registrations: on a control box a PC's cloud
+      // box has a registration and no local record, and treating it as gone
+      // would unassign its tasks on every dashboard poll.
+      const [local, registered] = await Promise.all([
+        listBoxes().catch(() => []),
+        handle.store.listBoxes().catch(() => []),
+      ]);
+      return new Set([...local.map((b) => b.id), ...registered.map((r) => r.boxId)]);
+    },
+    jobs: () => loadQueue().catch(() => []),
+    ...createBoxFactSeams({
+      listBoxes: () => listBoxes(),
+      readBoxRecord: async (id) => (await readState()).boxes.find((b) => b.id === id),
+      providerForBox,
+    }),
+    pendingApprovalBoxIds: () => handle.prompts.all().map((p) => p.boxId),
+    async projectBranch(projectId) {
+      const root = await resolveProjectPath(projectId);
+      return root ? readCurrentBranch(root) : undefined;
+    },
+  };
+  const workspaces = createWorkspaceBackend(backendDeps);
+  const prSync = createGithubPrSync(backendDeps);
+  const timeline = createTimelineBackend(backendDeps, { sync: prSync });
+  const boxPrs = createBoxPrLookup({ sync: prSync });
+  const managers = createManagerBackend(backendDeps, {
+    workspaceView: (id) => workspaces.getWorkspace(id),
+  });
+
   /**
    * The repo a project's boxes are cloned from. A control box's projects ARE
    * repos — it holds no working copy — so the origin comes from a box
@@ -2135,11 +2179,26 @@ export function createHubBackend(handle: RelayServerHandle): HubBackend {
     });
     return { ok: true, jobId: id };
   }
-  return {
+  const hub: HubBackend = {
+    ...workspaces,
+    ...managers,
+    ...timeline,
     // authMode is layered on by source.ts (an env-derived concern), so the host
     // backend produces everything else.
     async getData(opts): Promise<Omit<HubState, 'authMode'>> {
       const [listed, jobs] = await Promise.all([listBoxes(), loadQueue()]);
+      // Workspace facts for the two payload fields they own. Read once here so
+      // the mapping below stays synchronous.
+      const [workspaceViews, wsByProject, taskSummaries, managerByBox] = await Promise.all([
+        workspaces.listWorkspaces().catch(() => []),
+        workspaces.workspaceIdByProject().catch(() => new Map<string, string>()),
+        workspaces.taskSummaries().catch(() => ({
+          byBox: new Map<string, BoxTaskSummary>(),
+          byJob: new Map<string, BoxTaskSummary>(),
+        })),
+        managers.managerByBox().catch(() => new Map<string, string>()),
+      ]);
+      const prOf = await boxPrs.resolver(wsByProject);
       // `?live=1` (opt-in, expensive — mirrors providers' `?freshness=1`): refresh
       // each cloud box's `state` with an authoritative SDK probe before mapping.
       // Off the default path — a plain listing shows the fast persisted state.
@@ -2157,9 +2216,16 @@ export function createHubBackend(handle: RelayServerHandle): HubBackend {
         // surfaces in the box list (its progress is provider status instead).
         if (j.kind === 'prepare') continue;
         if (j.boxId && liveIds.has(j.boxId)) continue;
+        const jobTasks = taskSummaries.byJob.get(j.id);
+        const jobManager = managerByBox.get(j.id);
+        const withTasks = (box: Box): Box => ({
+          ...box,
+          ...(jobTasks ? { tasks: jobTasks } : {}),
+          ...(jobManager ? { managerId: jobManager } : {}),
+        });
         if (j.status === 'queued' || j.status === 'running')
-          jobBoxes.push(mapJobToBox(j, 'creating'));
-        else if (j.status === 'failed') jobBoxes.push(mapJobToBox(j, 'error'));
+          jobBoxes.push(withTasks(mapJobToBox(j, 'creating')));
+        else if (j.status === 'failed') jobBoxes.push(withTasks(mapJobToBox(j, 'error')));
       }
       const allRegistrations = await handle.store.listBoxes().catch(() => []);
       // Boxes the Store holds but this VPS's local state doesn't — i.e.
@@ -2227,16 +2293,33 @@ export function createHubBackend(handle: RelayServerHandle): HubBackend {
       // filesystem probe; the resolver caches per project root, so a fleet of
       // boxes over three projects costs three stats, not one per box.
       const hasGitOf = boxHasGitResolver();
+      const withTasks = (box: Box): Box => {
+        const summary = taskSummaries.byBox.get(box.id);
+        const managerId = managerByBox.get(box.id);
+        const pr = prOf(box);
+        return {
+          ...box,
+          ...(summary ? { tasks: summary } : {}),
+          ...(managerId ? { managerId } : {}),
+          ...(pr ? { pr } : {}),
+        };
+      };
       const listedBoxes = await Promise.all(
         listed.map(async (b) =>
-          mapBox(b, repoGrouped.get(b.id), regByBoxId.get(b.id)?.originUrl, await hasGitOf(b)),
+          withTasks(
+            mapBox(b, repoGrouped.get(b.id), regByBoxId.get(b.id)?.originUrl, await hasGitOf(b)),
+          ),
         ),
       );
       return {
         user: currentUser(),
         github: LOCAL_GITHUB,
-        projects,
-        boxes: [...jobBoxes, ...listedBoxes, ...registeredBoxes],
+        projects: projects.map((p) => {
+          const wsId = wsByProject.get(p.id);
+          return wsId ? { ...p, workspaceId: wsId } : p;
+        }),
+        workspaces: workspaceViews,
+        boxes: [...jobBoxes, ...listedBoxes, ...registeredBoxes.map(withTasks)],
         // Block-mode approvals live in-process on the relay handle, not the Store.
         approvals: handle.prompts.all().map(mapApproval),
         providers: await withRemoteProviders(listProviders(jobs)),
@@ -2924,7 +3007,12 @@ export function createHubBackend(handle: RelayServerHandle): HubBackend {
         id,
         async (box, provider) => {
           const r = await boxGitCheckout(provider, box, branch, args);
-          if (r.exitCode === 0) await sanctionBranch(box, branch);
+          // Only a real switch: a checkout with args restores paths, and a SHA,
+          // tag or remote ref leaves HEAD detached on no branch to push.
+          if (r.exitCode === 0 && !args?.length) {
+            const head = await boxGitCurrentBranch(provider, box);
+            if (head) await sanctionBranch(box, head);
+          }
           return r;
         },
         hydrate,
@@ -3799,4 +3887,23 @@ export function createHubBackend(handle: RelayServerHandle): HubBackend {
       }
     },
   };
+  // A create that came from a manager session groups under it: the job id is
+  // recorded now and promoted to the box id once the worker writes it back.
+  // Wrapped here rather than threaded through create()'s many return paths, and
+  // best-effort — a bookkeeping miss must never fail a create that succeeded.
+  const createBox = hub.create;
+  hub.create = async (input, meta) => {
+    const res = await createBox(input, meta);
+    if (res.ok && input.managerId) {
+      const attached = await managers
+        .attachJob(input.managerId, res.jobId)
+        .catch((e: unknown) => ({ ok: false as const, error: String(e) }));
+      if (!attached.ok) console.warn(`[hub] create ${res.jobId}: ${attached.error}`);
+    }
+    return res;
+  };
+  return withBoxTimeline(hub, {
+    deps: backendDeps,
+    stampFor: (ref, wsId) => managers.timelineStamp(ref, wsId),
+  });
 }

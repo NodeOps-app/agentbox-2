@@ -16,6 +16,8 @@
 
 import { execa } from 'execa';
 import { toHttpsUrl } from './git-pat.js';
+import { recordBoxGhResult, recordBoxGitPush, type BoxTimelineContext } from './timeline-hooks.js';
+import { pushedRef, readRefTip, type PushStatInput } from './workspaces/push-stat.js';
 import { existsSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -382,7 +384,23 @@ export async function executeCloudAction(
     };
   }
   if (action.method === 'git.push' || action.method === 'git.fetch') {
-    return runGitRpc(action, deps);
+    const push: GitPushTrace = { hostInitiated: false };
+    return runGitRpc(action, deps, push).then((result) => {
+      if (action.method === 'git.push' && result.exitCode === 0) {
+        const hostOnly = Boolean((action.params as GitRpcParams | undefined)?.hostOnly);
+        void cloudTimelineContext(deps).then((ctx) =>
+          ctx
+            ? recordBoxGitPush(
+                ctx,
+                { hostInitiated: push.hostInitiated, hostOnly },
+                result,
+                push.stat,
+              )
+            : undefined,
+        );
+      }
+      return result;
+    });
   }
   if (action.method === 'cp.toHost' || action.method === 'cp.fromHost') {
     return runCpRpc(action, deps);
@@ -402,7 +420,18 @@ export async function executeCloudAction(
     return runBrowserOpenMirror(action, deps);
   }
   if (action.method === 'gh.exec') {
-    return runGhExecRpc(action, deps);
+    return runGhExecRpc(action, deps).then((result) => {
+      if (result.exitCode === 0) {
+        const raw = (action.params as GhExecRpcParams | undefined)?.args;
+        const args = Array.isArray(raw)
+          ? raw.filter((a): a is string => typeof a === 'string')
+          : [];
+        void cloudTimelineContext(deps).then((ctx) =>
+          ctx ? recordBoxGhResult(ctx, args, result) : undefined,
+        );
+      }
+      return result;
+    });
   }
   if (action.method.startsWith('tool.')) {
     return runToolRpc(action, deps);
@@ -720,6 +749,24 @@ export function cloudHandleOf(
     sandboxId: lookup.cloudSandboxId,
     ...(lookup.sandboxClass ? { sandboxClass: lookup.sandboxClass } : {}),
   };
+}
+
+/** What the timeline hooks need about a cloud box; null when its record is unreadable. */
+async function cloudTimelineContext(
+  deps: CloudActionExecutorDeps,
+): Promise<BoxTimelineContext | null> {
+  try {
+    const lookup = await lookupCloudBox(deps.boxId);
+    return {
+      boxId: deps.boxId,
+      ...(deps.boxName ? { boxName: deps.boxName } : {}),
+      hostPath: lookup.workspacePath,
+      ...(lookup.sanctionedBranch ? { branch: lookup.sanctionedBranch } : {}),
+      ...(deps.originUrl ? { originUrl: deps.originUrl } : {}),
+    };
+  } catch {
+    return null;
+  }
 }
 
 async function lookupCloudBox(boxId: string): Promise<BoxLookup> {
@@ -1230,9 +1277,18 @@ export async function resolveHostGitRepo(
   };
 }
 
+/** What a push learned on its way, for the timeline hook that runs after it. */
+interface GitPushTrace {
+  /** Set once the push's host-initiated token is checked. */
+  hostInitiated: boolean;
+  /** Where the push's +/- lines can be read; set only for a real host checkout. */
+  stat?: PushStatInput;
+}
+
 async function runGitRpc(
   action: HostAction,
   deps: CloudActionExecutorDeps,
+  trace: GitPushTrace = { hostInitiated: false },
 ): Promise<HostActionResult> {
   const params = (action.params ?? {}) as GitRpcParams;
   const lookup = await lookupCloudBox(deps.boxId);
@@ -1371,6 +1427,7 @@ async function runGitRpc(
       incomingHashGit,
     ) ??
       false);
+  trace.hostInitiated = hostInitiatedOk;
   if (action.method === 'git.push' && !bypassPushGate && tokenClaimedGit && !hostInitiatedOk) {
     return {
       exitCode: 10,
@@ -1473,6 +1530,13 @@ async function runGitRpc(
           stdout: '',
           stderr: `bundle create failed: ${make.stderr || make.stdout}`,
         };
+      }
+      // A scratch repo is deleted after the push, so there is nothing to read
+      // the diff from later. The old tip must be read before step 4 moves it.
+      if (!repo.scratch && !trace.hostInitiated) {
+        const ref = pushedRef(branch, { remote: remoteName });
+        const before = await readRefTip(repo.dir, ref);
+        trace.stat = { repo: repo.dir, ref, branch, ...(before ? { before } : {}) };
       }
       // 2b. Download to host tmp.
       await backend.downloadFile(handle, remoteBundle, hostBundle);

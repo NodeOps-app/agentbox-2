@@ -44,6 +44,7 @@ import { startCodexSession, ensureCodexInstalled } from '@agentbox/agent-codex';
 import {
   readJob,
   takeQueueLoginCode,
+  recordCreateJobTimeline,
   writeJob,
   type QueueAgentKind,
   type QueueJob,
@@ -256,6 +257,7 @@ export const runQueuedJobCommand = new Command('_run-queued-job')
         login: persisted?.login,
       };
       await writeJob(done);
+      await recordCreateJobTimeline(done);
       log.write(`done`);
       log.close();
       process.exit(0);
@@ -274,6 +276,7 @@ export const runQueuedJobCommand = new Command('_run-queued-job')
             login: persisted?.login,
           };
           await writeJob(failed);
+          await recordCreateJobTimeline(failed);
         } catch {
           /* best-effort */
         }

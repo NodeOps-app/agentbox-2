@@ -176,15 +176,31 @@ function checkMacfuse(): CheckResult {
       };
 }
 
+// tmux is where `agentbox manager` runs the workspace's local agent — the hub
+// starts a detached session and every client attaches to it. Nothing else needs
+// tmux on the HOST, so a miss is `warn`.
+async function checkTmux(): Promise<CheckResult> {
+  const v = await probeVersion('tmux', ['-V']);
+  return v
+    ? { label: 'tmux', status: 'ok', detail: v }
+    : {
+        label: 'tmux',
+        status: 'warn',
+        detail: 'not found',
+        hint: 'optional: `brew install tmux` — needed for `agentbox manager` (the workspace agent runs in a tmux session)',
+      };
+}
+
 export async function runSystemChecks(): Promise<CheckResult[]> {
-  const [git, gh, ssh, sshfs, config] = await Promise.all([
+  const [git, gh, ssh, sshfs, tmux, config] = await Promise.all([
     checkGit(),
     checkGh(),
     checkSsh(),
     checkSshfs(),
+    checkTmux(),
     checkConfig(),
   ]);
-  const results = [checkNode(), checkPlatform(), checkAgentboxHome(), git, gh, ssh, sshfs];
+  const results = [checkNode(), checkPlatform(), checkAgentboxHome(), git, gh, ssh, sshfs, tmux];
   results.push(...(await checkBoxesOnStaleRelayPort()));
   // macFUSE is a macOS concept; on Linux FUSE is a kernel module and sshfs alone
   // is the signal, so don't show a spurious row.

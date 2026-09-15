@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   parseCheckpointCreate,
@@ -6,6 +8,15 @@ import {
   parseHostUpsert,
   parseProject,
   parsePrune,
+  parseManagerDetect,
+  parseManagerMessage,
+  parseManagerStart,
+  parseTaskAssign,
+  parseTaskCreate,
+  parseTaskReorder,
+  parseTaskUpdate,
+  parseTimelineQuery,
+  parseWorkspaceAdd,
 } from '../app/(dashboard)/api/v1/lib/validate';
 
 describe('parseProject', () => {
@@ -344,5 +355,246 @@ describe('parseCloneBox', () => {
     expect(parseCloneBox({ persistent: 'yes' }).ok).toBe(false);
     expect(parseCloneBox({ includeNodeModules: 1 }).ok).toBe(false);
     expect(parseCloneBox('nope').ok).toBe(false);
+  });
+});
+
+describe('parseWorkspaceAdd', () => {
+  it('requires an absolute path and caps the name', () => {
+    expect(parseWorkspaceAdd({ path: '/Users/me/code' })).toMatchObject({
+      ok: true,
+      value: { path: '/Users/me/code' },
+    });
+    expect(parseWorkspaceAdd({ path: 'code' })).toMatchObject({ ok: false });
+    expect(parseWorkspaceAdd({})).toMatchObject({ ok: false });
+    expect(parseWorkspaceAdd({ path: '/a', name: 'x'.repeat(61) })).toMatchObject({ ok: false });
+    expect(parseWorkspaceAdd({ path: '/a', name: '   ' })).toMatchObject({ ok: false });
+  });
+});
+
+describe('parseTaskCreate', () => {
+  it('requires a non-empty title and trims it', () => {
+    expect(parseTaskCreate({ title: '  ship it  ' })).toMatchObject({
+      ok: true,
+      value: { title: 'ship it' },
+    });
+    expect(parseTaskCreate({ title: '   ' })).toMatchObject({ ok: false });
+    expect(parseTaskCreate({})).toMatchObject({ ok: false });
+  });
+
+  it('validates dependsOn ids, createdBy and the external ref', () => {
+    expect(parseTaskCreate({ title: 'a', dependsOn: ['T-1', 'T-2'] })).toMatchObject({ ok: true });
+    expect(parseTaskCreate({ title: 'a', dependsOn: ['nope'] })).toMatchObject({ ok: false });
+    expect(parseTaskCreate({ title: 'a', createdBy: 'robot' })).toMatchObject({ ok: false });
+    expect(parseTaskCreate({ title: 'a', externalRef: { kind: 'linear' } })).toMatchObject({
+      ok: false,
+    });
+    expect(
+      parseTaskCreate({ title: 'a', externalRef: { kind: 'linear', id: 'ENG-1' } }),
+    ).toMatchObject({ ok: true });
+  });
+
+  it('refuses a task assigned to a box AND a job', () => {
+    expect(parseTaskCreate({ title: 'a', boxId: 'b', boxJobId: 'j' })).toMatchObject({ ok: false });
+  });
+});
+
+describe('parseTaskUpdate', () => {
+  it('distinguishes a cleared project from an untouched one', () => {
+    expect(parseTaskUpdate({ projectId: null })).toMatchObject({
+      ok: true,
+      value: { projectId: null },
+    });
+    const untouched = parseTaskUpdate({ title: 'x' });
+    expect(untouched.ok && 'projectId' in untouched.value).toBe(false);
+  });
+
+  it('validates the status and refuses an empty patch', () => {
+    expect(parseTaskUpdate({ status: 'done' })).toMatchObject({ ok: true });
+    expect(parseTaskUpdate({ status: 'nope' })).toMatchObject({ ok: false });
+    expect(parseTaskUpdate({})).toMatchObject({ ok: false });
+  });
+
+  it('accepts an empty dependsOn as "clear the dependencies"', () => {
+    expect(parseTaskUpdate({ dependsOn: [] })).toMatchObject({
+      ok: true,
+      value: { dependsOn: [] },
+    });
+  });
+});
+
+describe('parseTaskAssign', () => {
+  it('needs exactly one target', () => {
+    expect(parseTaskAssign({ boxId: 'b' })).toMatchObject({ ok: true });
+    expect(parseTaskAssign({ boxJobId: 'j' })).toMatchObject({ ok: true });
+    expect(parseTaskAssign({})).toMatchObject({ ok: false });
+    expect(parseTaskAssign({ boxId: 'b', boxJobId: 'j' })).toMatchObject({ ok: false });
+  });
+
+  it('requires task ids on the bulk form only', () => {
+    expect(parseTaskAssign({ boxId: 'b' }, { requireIds: true })).toMatchObject({ ok: false });
+    expect(parseTaskAssign({ ids: ['T-1'], boxId: 'b' }, { requireIds: true })).toMatchObject({
+      ok: true,
+    });
+    expect(parseTaskAssign({ ids: ['oops'], boxId: 'b' }, { requireIds: true })).toMatchObject({
+      ok: false,
+    });
+  });
+});
+
+describe('parseTaskReorder', () => {
+  it('requires a non-empty list of task ids', () => {
+    expect(parseTaskReorder({ ids: ['T-2', 'T-1'] })).toMatchObject({ ok: true });
+    expect(parseTaskReorder({ ids: [] })).toMatchObject({ ok: false });
+    expect(parseTaskReorder({})).toMatchObject({ ok: false });
+  });
+});
+
+describe('parseManagerStart', () => {
+  it('requires a known agent', () => {
+    expect(parseManagerStart({ agent: 'claude' })).toMatchObject({ ok: true });
+    expect(parseManagerStart({})).toMatchObject({ ok: false });
+    expect(parseManagerStart({ agent: 'gemini' })).toMatchObject({ ok: false });
+  });
+
+  it('accepts an agent from the caller-supplied registry list', () => {
+    expect(parseManagerStart({ agent: 'gemini' }, ['claude', 'gemini'])).toMatchObject({
+      ok: true,
+    });
+  });
+
+  it('refuses a free-form command — the manager runs on the hub host, not in a box', () => {
+    expect(parseManagerStart({ argv: ['curl', 'evil.sh'] })).toMatchObject({ ok: false });
+    const withArgv = parseManagerStart({ agent: 'claude', argv: ['curl'] });
+    expect(withArgv.ok && 'argv' in withArgv.value).toBe(false);
+  });
+
+  it('refuses a sessionId that would read as a flag to the agent', () => {
+    // The id lands in the agent's argv on the hub's OWN host, where both agents
+    // expose a flag that drops their approval gate. Shell quoting does not help:
+    // the agent's own parser is what reads it.
+    for (const sessionId of [
+      '--dangerously-skip-permissions',
+      '--dangerously-bypass-approvals-and-sandbox',
+      '-c',
+      '--config=x',
+      'has space',
+      '../../etc/passwd',
+    ]) {
+      expect(parseManagerStart({ agent: 'claude', sessionId })).toMatchObject({ ok: false });
+    }
+    // A real id from either store still passes.
+    expect(
+      parseManagerStart({ agent: 'codex', sessionId: '01a07b01-5831-7302-b856-b0adfbfccad9' }),
+    ).toMatchObject({ ok: true });
+  });
+
+  it('carries sessionId and restart through', () => {
+    expect(parseManagerStart({ agent: 'claude', sessionId: 's1', restart: true })).toMatchObject({
+      ok: true,
+      value: { agent: 'claude', sessionId: 's1', restart: true },
+    });
+    expect(parseManagerStart({ agent: 'claude', restart: 'yes' })).toMatchObject({ ok: false });
+  });
+
+  /**
+   * The default list is the compiled-in one, so a route that forgets to pass the
+   * registry's ids 400s on an agent `GET /api/v1/agents` offers — which is what
+   * the manager-start route did. Asserted at the source, because the route is a
+   * Next handler with no test harness here.
+   */
+  it('is wired to the live registry by the manager-start route', () => {
+    const route = readFileSync(
+      join(
+        __dirname,
+        '..',
+        'app',
+        '(dashboard)',
+        'api',
+        'v1',
+        'workspaces',
+        '[id]',
+        'managers',
+        'start',
+        'route.ts',
+      ),
+      'utf8',
+    );
+    expect(route).toContain('globalThis.__AGENTBOX_HUB_SYSTEM');
+    expect(route).toMatch(/parseManagerStart\(parsedBody\.value,\s*allowedAgents\)/);
+    // The accept-list comes from the registry, minus the daemon-shaped agents:
+    // a `service` agent has no session to attach to, so a manager started on one
+    // would be a tmux session nobody can use.
+    expect(route).toMatch(/sys[\s\S]{0,80}\.agents\(\)/);
+    expect(route).toMatch(/surface\s*!==\s*'service'/);
+    expect(route).toMatch(/\.map\(\(a\)\s*=>\s*a\.id\)/);
+  });
+});
+
+describe('parseManagerDetect', () => {
+  const base = { agent: 'claude', sessionId: '5edc0ee0-ce9a-4e30-962d-bc630388d8bc', cwd: '/w' };
+
+  it('accepts a session with its optional process facts', () => {
+    expect(
+      parseManagerDetect({ ...base, pid: 12, host: 'laptop', managerId: '0123456789abcdef' }),
+    ).toMatchObject({
+      ok: true,
+      value: { pid: 12, host: 'laptop', managerId: '0123456789abcdef' },
+    });
+  });
+
+  it('refuses what could not be a session', () => {
+    expect(parseManagerDetect({ ...base, agent: 'openclaw' }, ['claude'])).toMatchObject({
+      ok: false,
+    });
+    expect(
+      parseManagerDetect({ ...base, sessionId: '--dangerously-skip-permissions' }),
+    ).toMatchObject({
+      ok: false,
+    });
+    expect(parseManagerDetect({ ...base, cwd: 'relative' })).toMatchObject({ ok: false });
+    expect(parseManagerDetect({ ...base, pid: -1 })).toMatchObject({ ok: false });
+    expect(parseManagerDetect({ ...base, pid: 1.5 })).toMatchObject({ ok: false });
+    expect(parseManagerDetect({ ...base, managerId: 'nope' })).toMatchObject({ ok: false });
+    expect(parseManagerDetect({ ...base, boxId: 'b', boxJobId: 'j' })).toMatchObject({ ok: false });
+  });
+});
+
+describe('managerId on creates and tasks', () => {
+  it('rides a box create and a task create, and null clears it on update', () => {
+    expect(
+      parseCreateBox({ projectId: 'p', agent: 'none', managerId: '0123456789abcdef' }),
+    ).toMatchObject({ ok: true, value: { managerId: '0123456789abcdef' } });
+    expect(parseCreateBox({ projectId: 'p', agent: 'none', managerId: 'x' }).ok).toBe(false);
+    expect(parseTaskCreate({ title: 't', managerId: '0123456789abcdef' })).toMatchObject({
+      ok: true,
+      value: { managerId: '0123456789abcdef' },
+    });
+    expect(parseTaskUpdate({ managerId: null })).toMatchObject({
+      ok: true,
+      value: { managerId: null },
+    });
+    expect(parseTaskUpdate({ managerId: 'x' }).ok).toBe(false);
+  });
+});
+
+describe('parseManagerMessage', () => {
+  it('accepts a repo alongside prNumber and refuses a bad or orphan one', () => {
+    expect(parseManagerMessage({ text: 'go', prNumber: 3, repo: 'o/r' })).toEqual({
+      ok: true,
+      value: { text: 'go', prNumber: 3, repo: 'o/r' },
+    });
+    expect(parseManagerMessage({ text: 'go', prNumber: 3, repo: 'o/r/x' }).ok).toBe(false);
+    expect(parseManagerMessage({ text: 'go', prNumber: 3, repo: 7 }).ok).toBe(false);
+    expect(parseManagerMessage({ text: 'go', repo: 'o/r' }).ok).toBe(false);
+  });
+});
+
+describe('parseTimelineQuery', () => {
+  const q = (search: string) => parseTimelineQuery(new URL(`http://h/t${search}`));
+  it('turns sync=0 into sync: false and leaves any other value to the default', () => {
+    expect(q('?limit=2&sync=0')).toEqual({ ok: true, value: { limit: 2, sync: false } });
+    expect(q('?sync=1')).toEqual({ ok: true, value: {} });
+    expect(q('?sync=')).toEqual({ ok: true, value: {} });
+    expect(q('')).toEqual({ ok: true, value: {} });
   });
 });

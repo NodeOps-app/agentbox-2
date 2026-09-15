@@ -46,6 +46,7 @@ import { withHubClient } from '../control-plane/with-hub.js';
 import { dockerProviderRefusal, remoteHubConfigured } from '../control-plane/remote-hub.js';
 import { attachRelayOptions } from '../control-plane/box-plane.js';
 import { resolveBoxOrExit } from '../box-ref.js';
+import { assignTasksBestEffort, parseTaskIdsOrExit, preflightOrExit } from '../lib/tasks-assign.js';
 import {
   assertSourceBoxNotRunning,
   resolveRestoreRequest,
@@ -53,10 +54,13 @@ import {
   stageRestoreWorkspace,
   type RestoreRequest,
 } from './_restore.js';
+import { registerCurrentSession } from '../lib/host-session.js';
 
 interface CreateOptions {
   workspace: string;
   name?: string;
+  /** --tasks T-1,T-2: assign these workspace tasks to the box being created. */
+  tasks?: string;
   /** Override the sandbox backend. Resolved via the provider registry. */
   provider?: string;
   hostSnapshot?: boolean; // commander: --host-snapshot / --no-host-snapshot => true / false / undefined
@@ -251,7 +255,9 @@ async function runCreateViaHubApi(
     ...(opts.credentialSync === false ? { credentialSync: false } : {}),
   };
   const outcome = await withHubClient({ url: opts.url }, async (client) => {
+    const manager = await registerCurrentSession(client);
     const { jobId } = await client.createBox({
+      ...(manager ? { managerId: manager.managerId } : {}),
       repoUrl: target.repoUrl,
       provider: providerSpecFor(providerName, remoteHost),
       agent: 'none',
@@ -291,6 +297,10 @@ export const createCommand = new Command('create')
   )
   .option('-w, --workspace <path>', 'host workspace to mount', process.cwd())
   .option('-n, --name <name>', 'friendly box name (default: <workspace-basename>-<id>)')
+  .option(
+    '--tasks <ids>',
+    'comma-separated workspace task ids to assign to this box (e.g. T-11,T-12)',
+  )
   .option(
     '--provider <name>',
     "sandbox backend: docker (default), daytona, hetzner, digitalocean, vercel, e2b, remote-docker. `docker:<host>` runs the box on that machine's docker engine over SSH.",
@@ -778,8 +788,16 @@ export const createCommand = new Command('create')
     s.start('creating box');
     // `agentbox create` builds a PLAIN box (no agent). The worker seeds the box
     // from the local workspace tree, so untracked/.env arrive as they always did.
+    const taskIds = opts.tasks ? parseTaskIdsOrExit(opts.tasks) : [];
     const outcome = await withHubClient({ preferLocal: true }, async (client) => {
+      // Validate the task ids BEFORE anything is provisioned: a typo should cost
+      // nothing, not leave a box nobody wanted.
+      const taskWorkspace =
+        taskIds.length > 0 ? await preflightOrExit(client, projectRoot, taskIds) : null;
+      // Inside a claude/codex session the box groups under that session.
+      const manager = await registerCurrentSession(client);
       const { jobId } = await client.createBox({
+        ...(manager ? { managerId: manager.managerId } : {}),
         projectId: hashProjectPath(projectRoot),
         provider: opts.provider ?? providerName,
         agent: 'none',
@@ -820,6 +838,10 @@ export const createCommand = new Command('create')
         },
       });
       cmdLog.write(`enqueued: job ${jobId}`);
+      // The box does not exist yet; the hub promotes this job id to the box id
+      // once the worker records it.
+      if (taskWorkspace)
+        await assignTasksBestEffort(client, taskWorkspace, taskIds, { boxJobId: jobId });
       return await streamJobToCompletion(client, jobId, {
         onLine: (line) => {
           s.message(line);

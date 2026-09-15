@@ -57,7 +57,7 @@ export function parseCreateBox(
 ): Parsed<CreateBoxInput> {
   if (!isObject(body)) return { ok: false, message: 'body must be a JSON object' };
   const { projectId, repoUrl, agent, provider, name, prompt, fromBranch, setupWizard } = body;
-  const { agentArgs, startAgent, foreground, opts } = body;
+  const { agentArgs, startAgent, foreground, opts, managerId } = body;
   // Exactly one of projectId / repoUrl: projectId → a registered project on the
   // hub's machine (local file queue); repoUrl → the origin the control-plane
   // worker clones (no local checkout).
@@ -123,9 +123,12 @@ export function parseCreateBox(
   if (!fg.ok) return fg;
   const po = parseCreateBoxOpts(opts);
   if (!po.ok) return po;
+  const mid = optionalManagerId(managerId, 'managerId');
+  if (!mid.ok) return mid;
   return {
     ok: true,
     value: {
+      ...(mid.value ? { managerId: mid.value } : {}),
       projectId: hasProject ? (projectId as string) : undefined,
       repoUrl: hasRepo ? (repoUrl as string) : undefined,
       agent: agent as CreateBoxInput['agent'],
@@ -912,4 +915,527 @@ export async function readJson(req: Request): Promise<Parsed<unknown>> {
   } catch {
     return { ok: false, message: 'body is not valid JSON' };
   }
+}
+
+// ── workspaces / tasks / manager ──
+
+export const TASK_STATUSES = ['todo', 'in_progress', 'blocked', 'done'] as const;
+export type TaskStatusValue = (typeof TASK_STATUSES)[number];
+
+/** Task ids are minted server-side as `T-<n>`; a client only ever echoes one back. */
+export const TASK_ID_RE = /^T-\d+$/;
+
+// Mirrors MANAGER_AGENTS in @agentbox/relay, hardcoded here for the same reason
+// AGENTS/PROVIDERS above are: importing @agentbox/* would pull it into the Next
+// bundle.
+export const MANAGER_AGENT_NAMES = ['claude', 'codex', 'opencode', 'pi'] as const;
+
+/** A timeline note or a message to a manager. */
+export const NOTE_MAX = 2000;
+export const NOTE_KINDS = ['note', 'replan', 'plan'] as const;
+export type NoteKindValue = (typeof NOTE_KINDS)[number];
+
+function optionalNote(v: unknown, field = 'note'): Parsed<string | undefined> {
+  if (v === undefined) return { ok: true, value: undefined };
+  if (typeof v !== 'string') return { ok: false, message: `${field} must be a string` };
+  if (v.length > NOTE_MAX) {
+    return { ok: false, message: `${field} too long (max ${String(NOTE_MAX)} chars)` };
+  }
+  const trimmed = v.trim();
+  return { ok: true, value: trimmed.length > 0 ? trimmed : undefined };
+}
+
+function requiredText(v: unknown): Parsed<string> {
+  const parsed = optionalNote(v, 'text');
+  if (!parsed.ok) return parsed;
+  if (!parsed.value) return { ok: false, message: 'text is required (non-empty string)' };
+  return { ok: true, value: parsed.value };
+}
+
+export function parseManagerNote(body: unknown): Parsed<{ text: string; kind?: NoteKindValue }> {
+  if (!isObject(body)) return { ok: false, message: 'body must be a JSON object' };
+  const text = requiredText(body['text']);
+  if (!text.ok) return text;
+  const { kind } = body;
+  if (kind !== undefined && !(NOTE_KINDS as readonly unknown[]).includes(kind)) {
+    return { ok: false, message: `kind must be one of ${NOTE_KINDS.join(', ')}` };
+  }
+  return {
+    ok: true,
+    value: { text: text.value, ...(kind ? { kind: kind as NoteKindValue } : {}) },
+  };
+}
+
+const PR_REPO_RE = /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/;
+
+export function parseManagerMessage(
+  body: unknown,
+): Parsed<{ text: string; prNumber?: number; repo?: string }> {
+  if (!isObject(body)) return { ok: false, message: 'body must be a JSON object' };
+  const text = requiredText(body['text']);
+  if (!text.ok) return text;
+  const { prNumber, repo } = body;
+  if (
+    prNumber !== undefined &&
+    (typeof prNumber !== 'number' || !Number.isInteger(prNumber) || prNumber <= 0)
+  ) {
+    return { ok: false, message: 'prNumber must be a positive integer' };
+  }
+  if (repo !== undefined) {
+    if (typeof repo !== 'string' || !PR_REPO_RE.test(repo)) {
+      return { ok: false, message: 'repo must be owner/name' };
+    }
+    if (prNumber === undefined) return { ok: false, message: 'repo needs prNumber' };
+  }
+  return {
+    ok: true,
+    value: {
+      text: text.value,
+      ...(prNumber !== undefined ? { prNumber: prNumber as number } : {}),
+      ...(repo !== undefined ? { repo: repo as string } : {}),
+    },
+  };
+}
+
+export const TIMELINE_LIMIT_MAX = 500;
+
+/** `?before=&since=` are ISO times (normalized, so they compare with stored ones); `?limit=` 1–500. */
+export function parseTimelineQuery(
+  url: URL,
+): Parsed<{ before?: string; since?: string; limit?: number; sync?: boolean }> {
+  const out: { before?: string; since?: string; limit?: number; sync?: boolean } = {};
+  if (url.searchParams.get('sync') === '0') out.sync = false;
+  for (const field of ['before', 'since'] as const) {
+    const raw = url.searchParams.get(field);
+    if (raw === null || raw === '') continue;
+    const ms = Date.parse(raw);
+    if (Number.isNaN(ms)) return { ok: false, message: `${field} must be an ISO date-time` };
+    out[field] = new Date(ms).toISOString();
+  }
+  const limit = url.searchParams.get('limit');
+  if (limit !== null && limit !== '') {
+    const n = Number(limit);
+    if (!Number.isInteger(n) || n < 1 || n > TIMELINE_LIMIT_MAX) {
+      return {
+        ok: false,
+        message: `limit must be an integer from 1 to ${String(TIMELINE_LIMIT_MAX)}`,
+      };
+    }
+    out.limit = n;
+  }
+  return { ok: true, value: out };
+}
+
+export function isTaskStatus(v: unknown): v is TaskStatusValue {
+  return typeof v === 'string' && (TASK_STATUSES as readonly string[]).includes(v);
+}
+
+export interface WorkspaceAddInput {
+  path: string;
+  name?: string;
+}
+
+export function parseWorkspaceAdd(body: unknown): Parsed<WorkspaceAddInput> {
+  if (!isObject(body)) return { ok: false, message: 'body must be a JSON object' };
+  const { path, name } = body;
+  if (typeof path !== 'string' || path.length === 0) {
+    return { ok: false, message: 'path is required (absolute path on the hub host)' };
+  }
+  if (!path.startsWith('/')) return { ok: false, message: 'path must be absolute' };
+  const parsedName = optionalString(name, 'name');
+  if (!parsedName.ok) return parsedName;
+  if (parsedName.value !== undefined && parsedName.value.trim().length === 0) {
+    return { ok: false, message: 'name must not be empty' };
+  }
+  if ((parsedName.value?.length ?? 0) > 60) {
+    return { ok: false, message: 'name too long (max 60 chars)' };
+  }
+  return { ok: true, value: { path, ...(parsedName.value ? { name: parsedName.value } : {}) } };
+}
+
+export function parseWorkspaceRename(body: unknown): Parsed<{ name: string }> {
+  if (!isObject(body)) return { ok: false, message: 'body must be a JSON object' };
+  const { name } = body;
+  if (typeof name !== 'string' || name.trim().length === 0) {
+    return { ok: false, message: 'name is required (non-empty string)' };
+  }
+  if (name.length > 60) return { ok: false, message: 'name too long (max 60 chars)' };
+  return { ok: true, value: { name } };
+}
+
+function parseExternalRef(
+  v: unknown,
+): Parsed<{ kind: string; id: string; url?: string } | undefined> {
+  if (v === undefined) return { ok: true, value: undefined };
+  if (!isObject(v)) return { ok: false, message: 'externalRef must be an object' };
+  const { kind, id, url } = v;
+  if (typeof kind !== 'string' || kind.length === 0) {
+    return { ok: false, message: 'externalRef.kind is required (string)' };
+  }
+  if (typeof id !== 'string' || id.length === 0) {
+    return { ok: false, message: 'externalRef.id is required (string)' };
+  }
+  const parsedUrl = optionalString(url, 'externalRef.url');
+  if (!parsedUrl.ok) return parsedUrl;
+  return { ok: true, value: { kind, id, ...(parsedUrl.value ? { url: parsedUrl.value } : {}) } };
+}
+
+function parseTaskIdArray(v: unknown, field: string): Parsed<string[]> {
+  if (!Array.isArray(v) || v.length === 0) {
+    return { ok: false, message: `${field} is required (non-empty array of task ids)` };
+  }
+  for (const el of v) {
+    if (typeof el !== 'string' || !TASK_ID_RE.test(el)) {
+      return { ok: false, message: `${field} entries must be task ids like T-1` };
+    }
+  }
+  return { ok: true, value: v as string[] };
+}
+
+export interface TaskCreateInput {
+  title: string;
+  description?: string;
+  projectId?: string;
+  dependsOn?: string[];
+  createdBy?: 'human' | 'manager' | 'api';
+  externalRef?: { kind: string; id: string; url?: string };
+  boxId?: string;
+  boxJobId?: string;
+  managerId?: string;
+  /** Recorded on the timeline as a note next to the create. */
+  note?: string;
+}
+
+export function parseTaskCreate(body: unknown): Parsed<TaskCreateInput> {
+  if (!isObject(body)) return { ok: false, message: 'body must be a JSON object' };
+  const { title, description, projectId, dependsOn, createdBy, externalRef, boxId, boxJobId } =
+    body;
+  const parsedManager = optionalManagerId(body['managerId'], 'managerId');
+  if (!parsedManager.ok) return parsedManager;
+  const parsedNote = optionalNote(body['note']);
+  if (!parsedNote.ok) return parsedNote;
+  if (typeof title !== 'string' || title.trim().length === 0) {
+    return { ok: false, message: 'title is required (non-empty string)' };
+  }
+  if (title.length > 300) return { ok: false, message: 'title too long (max 300 chars)' };
+  const parsedDesc = optionalString(description, 'description');
+  if (!parsedDesc.ok) return parsedDesc;
+  const parsedProject = optionalString(projectId, 'projectId');
+  if (!parsedProject.ok) return parsedProject;
+  const parsedRef = parseExternalRef(externalRef);
+  if (!parsedRef.ok) return parsedRef;
+  const parsedBox = optionalString(boxId, 'boxId');
+  if (!parsedBox.ok) return parsedBox;
+  const parsedJob = optionalString(boxJobId, 'boxJobId');
+  if (!parsedJob.ok) return parsedJob;
+  // A task is worked in ONE place; sending both leaves the reconciler to pick,
+  // and it would pick the box — silently dropping the caller's job assignment.
+  if (parsedBox.value && parsedJob.value) {
+    return { ok: false, message: 'send either boxId or boxJobId, not both' };
+  }
+  if (
+    createdBy !== undefined &&
+    createdBy !== 'human' &&
+    createdBy !== 'manager' &&
+    createdBy !== 'api'
+  ) {
+    return { ok: false, message: 'createdBy must be one of human, manager, api' };
+  }
+  let deps: string[] | undefined;
+  if (dependsOn !== undefined) {
+    const parsedDeps = parseTaskIdArray(dependsOn, 'dependsOn');
+    if (!parsedDeps.ok) return parsedDeps;
+    deps = parsedDeps.value;
+  }
+  return {
+    ok: true,
+    value: {
+      title: title.trim(),
+      ...(parsedDesc.value ? { description: parsedDesc.value } : {}),
+      ...(parsedProject.value ? { projectId: parsedProject.value } : {}),
+      ...(deps ? { dependsOn: deps } : {}),
+      ...(createdBy ? { createdBy } : {}),
+      ...(parsedRef.value ? { externalRef: parsedRef.value } : {}),
+      ...(parsedBox.value ? { boxId: parsedBox.value } : {}),
+      ...(parsedJob.value ? { boxJobId: parsedJob.value } : {}),
+      ...(parsedManager.value ? { managerId: parsedManager.value } : {}),
+      ...(parsedNote.value ? { note: parsedNote.value } : {}),
+    },
+  };
+}
+
+export interface TaskUpdateInput {
+  title?: string;
+  description?: string;
+  status?: TaskStatusValue;
+  projectId?: string | null;
+  dependsOn?: string[];
+  externalRef?: { kind: string; id: string; url?: string };
+  managerId?: string | null;
+  note?: string;
+}
+
+export function parseTaskUpdate(body: unknown): Parsed<TaskUpdateInput> {
+  if (!isObject(body)) return { ok: false, message: 'body must be a JSON object' };
+  const { title, description, status, projectId, dependsOn, externalRef, managerId } = body;
+  const out: TaskUpdateInput = {};
+  if (title !== undefined) {
+    if (typeof title !== 'string' || title.trim().length === 0) {
+      return { ok: false, message: 'title must be a non-empty string' };
+    }
+    if (title.length > 300) return { ok: false, message: 'title too long (max 300 chars)' };
+    out.title = title.trim();
+  }
+  const parsedDesc = optionalString(description, 'description');
+  if (!parsedDesc.ok) return parsedDesc;
+  if (parsedDesc.value !== undefined) out.description = parsedDesc.value;
+  if (status !== undefined) {
+    if (!isTaskStatus(status)) {
+      return { ok: false, message: `status must be one of ${TASK_STATUSES.join(', ')}` };
+    }
+    out.status = status;
+  }
+  // `null` clears the project scope; omitted leaves it alone.
+  if (projectId !== undefined) {
+    if (projectId !== null && typeof projectId !== 'string') {
+      return { ok: false, message: 'projectId must be a string or null' };
+    }
+    out.projectId = projectId;
+  }
+  if (dependsOn !== undefined) {
+    if (Array.isArray(dependsOn) && dependsOn.length === 0) out.dependsOn = [];
+    else {
+      const parsedDeps = parseTaskIdArray(dependsOn, 'dependsOn');
+      if (!parsedDeps.ok) return parsedDeps;
+      out.dependsOn = parsedDeps.value;
+    }
+  }
+  const parsedRef = parseExternalRef(externalRef);
+  if (!parsedRef.ok) return parsedRef;
+  if (parsedRef.value) out.externalRef = parsedRef.value;
+  // `null` clears the manager; omitted leaves it alone.
+  if (managerId !== undefined) {
+    if (managerId === null) out.managerId = null;
+    else {
+      const parsedManager = optionalManagerId(managerId, 'managerId');
+      if (!parsedManager.ok) return parsedManager;
+      out.managerId = parsedManager.value ?? null;
+    }
+  }
+  if (Object.keys(out).length === 0) {
+    return { ok: false, message: 'no updatable field in body' };
+  }
+  const parsedNote = optionalNote(body['note']);
+  if (!parsedNote.ok) return parsedNote;
+  if (parsedNote.value) out.note = parsedNote.value;
+  return { ok: true, value: out };
+}
+
+export interface TaskAssignInput {
+  /** Absent on the single-task route, where the id is in the path. */
+  ids?: string[];
+  boxId?: string;
+  boxJobId?: string;
+  note?: string;
+}
+
+export function parseTaskAssign(
+  body: unknown,
+  opts: { requireIds?: boolean } = {},
+): Parsed<TaskAssignInput> {
+  if (!isObject(body)) return { ok: false, message: 'body must be a JSON object' };
+  const { ids, boxId, boxJobId } = body;
+  let parsedIds: string[] | undefined;
+  if (opts.requireIds || ids !== undefined) {
+    const parsed = parseTaskIdArray(ids, 'ids');
+    if (!parsed.ok) return parsed;
+    parsedIds = parsed.value;
+  }
+  const parsedBox = optionalString(boxId, 'boxId');
+  if (!parsedBox.ok) return parsedBox;
+  const parsedJob = optionalString(boxJobId, 'boxJobId');
+  if (!parsedJob.ok) return parsedJob;
+  if (!parsedBox.value && !parsedJob.value) {
+    return { ok: false, message: 'boxId or boxJobId is required' };
+  }
+  if (parsedBox.value && parsedJob.value) {
+    return { ok: false, message: 'send either boxId or boxJobId, not both' };
+  }
+  const parsedNote = optionalNote(body['note']);
+  if (!parsedNote.ok) return parsedNote;
+  return {
+    ok: true,
+    value: {
+      ...(parsedIds ? { ids: parsedIds } : {}),
+      ...(parsedBox.value ? { boxId: parsedBox.value } : {}),
+      ...(parsedJob.value ? { boxJobId: parsedJob.value } : {}),
+      ...(parsedNote.value ? { note: parsedNote.value } : {}),
+    },
+  };
+}
+
+export function parseTaskReorder(body: unknown): Parsed<{ ids: string[]; note?: string }> {
+  if (!isObject(body)) return { ok: false, message: 'body must be a JSON object' };
+  const parsed = parseTaskIdArray(body['ids'], 'ids');
+  if (!parsed.ok) return parsed;
+  const parsedNote = optionalNote(body['note']);
+  if (!parsedNote.ok) return parsedNote;
+  return {
+    ok: true,
+    value: { ids: parsed.value, ...(parsedNote.value ? { note: parsedNote.value } : {}) },
+  };
+}
+
+export interface ManagerStartInput {
+  agent: string;
+  sessionId?: string;
+  restart?: boolean;
+}
+
+/**
+ * `allowedAgents` is the accept-list for `agent`, defaulting to the built-ins so
+ * this stays a pure, import-free function; the route passes the live registry ids.
+ *
+ * There is deliberately NO free-form `argv`: the manager runs as a login-shell
+ * command on the HUB'S OWN machine, so accepting one would turn an API token into
+ * a shell on the control box — every other exec this API exposes runs inside a
+ * box. An agent the hub already knows is the only thing it will start.
+ */
+/** A session id as both agent stores write it: a UUID. Never a flag. */
+export const SESSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+
+export function parseManagerStart(
+  body: unknown,
+  allowedAgents: readonly string[] = MANAGER_AGENT_NAMES,
+): Parsed<ManagerStartInput> {
+  if (!isObject(body)) return { ok: false, message: 'body must be a JSON object' };
+  const { agent, sessionId, restart } = body;
+  if (typeof agent !== 'string' || !allowedAgents.includes(agent)) {
+    return { ok: false, message: `agent must be one of ${allowedAgents.join(', ')}` };
+  }
+  const parsedSession = optionalString(sessionId, 'sessionId');
+  if (!parsedSession.ok) return parsedSession;
+  // A session id goes into the agent's argv on the HUB'S OWN machine, so it must
+  // not be able to look like a flag: `sessionId: '--dangerously-skip-permissions'`
+  // would otherwise start the manager with its approval gate off, which is the
+  // same escalation the absent `argv` field exists to prevent. Both stores use
+  // UUIDs, so anything outside this shape is already not a session.
+  if (parsedSession.value !== undefined && !SESSION_ID_RE.test(parsedSession.value)) {
+    return { ok: false, message: 'sessionId must be alphanumeric with - or _' };
+  }
+  const parsedRestart = optionalBool(restart, 'restart');
+  if (!parsedRestart.ok) return parsedRestart;
+  return {
+    ok: true,
+    value: {
+      agent,
+      ...(parsedSession.value ? { sessionId: parsedSession.value } : {}),
+      ...(parsedRestart.value !== undefined ? { restart: parsedRestart.value } : {}),
+    },
+  };
+}
+
+/** A manager id as the store mints it: 16 lowercase hex. */
+export const MANAGER_ID_RE = /^[0-9a-f]{16}$/;
+
+export function isManagerId(v: unknown): v is string {
+  return typeof v === 'string' && MANAGER_ID_RE.test(v);
+}
+
+function optionalManagerId(v: unknown, field: string): Parsed<string | undefined> {
+  if (v === undefined) return { ok: true, value: undefined };
+  if (!isManagerId(v)) return { ok: false, message: `${field} must be a manager id (16 hex)` };
+  return { ok: true, value: v };
+}
+
+export const MANAGER_STATUSES = ['running', 'stopped'] as const;
+
+export function isManagerStatus(v: unknown): v is (typeof MANAGER_STATUSES)[number] {
+  return typeof v === 'string' && (MANAGER_STATUSES as readonly string[]).includes(v);
+}
+
+export interface ManagerDetectInput {
+  agent: string;
+  sessionId: string;
+  cwd: string;
+  pid?: number;
+  host?: string;
+  managerId?: string;
+  tmuxPane?: string;
+  tmuxSession?: string;
+  boxId?: string;
+  boxJobId?: string;
+}
+
+/**
+ * The body the CLI sends from inside a host agent session.
+ *
+ * `allowedAgents` is the accept-list for `agent`; the route passes the live
+ * registry minus service agents. Nothing here is executed — a detect only
+ * records a session — but `sessionId` is held to the same id shape as a start,
+ * because a later resume puts it into the agent's argv on this machine.
+ */
+export function parseManagerDetect(
+  body: unknown,
+  allowedAgents: readonly string[] = MANAGER_AGENT_NAMES,
+): Parsed<ManagerDetectInput> {
+  if (!isObject(body)) return { ok: false, message: 'body must be a JSON object' };
+  const { agent, sessionId, cwd, pid, host, managerId, boxId, boxJobId, tmuxPane, tmuxSession } =
+    body;
+  if (tmuxPane !== undefined && (typeof tmuxPane !== 'string' || !/^%\d+$/.test(tmuxPane))) {
+    return { ok: false, message: 'tmuxPane must be a tmux pane id like %3' };
+  }
+  if (
+    tmuxSession !== undefined &&
+    (typeof tmuxSession !== 'string' || !/^agentbox-manager-[0-9a-f]{16}$/.test(tmuxSession))
+  ) {
+    return { ok: false, message: 'tmuxSession must be an agentbox-manager-<16 hex> session name' };
+  }
+  if (typeof agent !== 'string' || !allowedAgents.includes(agent)) {
+    return { ok: false, message: `agent must be one of ${allowedAgents.join(', ')}` };
+  }
+  if (typeof sessionId !== 'string' || !SESSION_ID_RE.test(sessionId)) {
+    return { ok: false, message: 'sessionId is required (alphanumeric with - or _)' };
+  }
+  if (typeof cwd !== 'string' || !cwd.startsWith('/') || cwd.length > 4096) {
+    return { ok: false, message: 'cwd must be an absolute path' };
+  }
+  if (pid !== undefined && (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0)) {
+    return { ok: false, message: 'pid must be a positive integer' };
+  }
+  const parsedHost = optionalString(host, 'host');
+  if (!parsedHost.ok) return parsedHost;
+  if (parsedHost.value !== undefined && parsedHost.value.length > 255) {
+    return { ok: false, message: 'host too long (max 255 chars)' };
+  }
+  const parsedManager = optionalManagerId(managerId, 'managerId');
+  if (!parsedManager.ok) return parsedManager;
+  const parsedBox = optionalString(boxId, 'boxId');
+  if (!parsedBox.ok) return parsedBox;
+  const parsedJob = optionalString(boxJobId, 'boxJobId');
+  if (!parsedJob.ok) return parsedJob;
+  if (parsedBox.value && parsedJob.value) {
+    return { ok: false, message: 'send either boxId or boxJobId, not both' };
+  }
+  return {
+    ok: true,
+    value: {
+      agent,
+      sessionId,
+      cwd,
+      ...(pid !== undefined ? { pid: pid as number } : {}),
+      ...(parsedHost.value ? { host: parsedHost.value } : {}),
+      ...(parsedManager.value ? { managerId: parsedManager.value } : {}),
+      ...(typeof tmuxPane === 'string' ? { tmuxPane } : {}),
+      ...(typeof tmuxSession === 'string' ? { tmuxSession } : {}),
+      ...(parsedBox.value ? { boxId: parsedBox.value } : {}),
+      ...(parsedJob.value ? { boxJobId: parsedJob.value } : {}),
+    },
+  };
+}
+
+/** `?force=1` (or `true`) on a DELETE that is otherwise refused while something runs. */
+export function isForce(req: Request): boolean {
+  const v = new URL(req.url).searchParams.get('force');
+  return v === '1' || v === 'true';
 }

@@ -87,6 +87,7 @@ export {
 export {
   BOX_WORKSPACE,
   boxGitCheckout,
+  boxGitCurrentBranch,
   boxGitNewBranch,
   boxGitPull,
   boxGitPush,
@@ -287,3 +288,4 @@ export {
   type AvailableSource,
   type ModelAuthGateArgs,
 } from './prompts/model-auth-gate.js';
+export { AGENT_SESSION_ENV_VARS, scrubAgentSessionEnv } from './agent-session-env.js';

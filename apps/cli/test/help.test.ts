@@ -44,6 +44,9 @@ import { pluginCommand } from '../src/commands/plugin.js';
 import { prepareCommand } from '../src/commands/prepare.js';
 import { pruneCommand } from '../src/commands/prune.js';
 import { queueCommand } from '../src/commands/queue.js';
+import { workspaceCommand } from '../src/commands/workspace.js';
+import { tasksCommand } from '../src/commands/tasks.js';
+import { managerCommand } from '../src/commands/manager.js';
 import { recoverCommand } from '../src/commands/recover.js';
 import { relayCommand } from '../src/commands/relay.js';
 import { runQueuedJobCommand } from '../src/commands/_run-queued-job.js';
@@ -100,6 +103,9 @@ function buildProgram(): Command {
     checkpointCommand,
     configCommand,
     queueCommand,
+    workspaceCommand,
+    tasksCommand,
+    managerCommand,
     relayCommand,
     hubCommand,
     daytonaCommand,

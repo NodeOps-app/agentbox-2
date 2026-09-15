@@ -164,6 +164,37 @@ export async function withHubClient<T>(
 }
 
 /**
+ * `withHubClient` for bookkeeping around a command that does not otherwise need
+ * the hub (registering the session a create ran in): it never prints, never sets
+ * `process.exitCode`, and never auto-starts a local hub. The caller decides what
+ * a failure is worth — at most a warning.
+ */
+export async function withHubClientQuiet<T>(
+  opts: Pick<WithHubOptions, 'url' | 'preferLocal'>,
+  fn: (client: HubApiClient) => Promise<T>,
+): Promise<{ ok: true; value: T } | { ok: false; error: string }> {
+  try {
+    const { resolveHubApiTarget } = await import('../commands/control-plane.js');
+    const target = await resolveHubApiTarget(opts.url, {
+      quiet: true,
+      preferLocal: opts.preferLocal,
+    });
+    if (!target) return { ok: false, error: 'no hub is configured or running' };
+    const client = new HubApiClient(target);
+    const health = await client.health();
+    if (!isSupportedApiVersion(health.apiVersion)) {
+      return {
+        ok: false,
+        error: `the hub at ${target.url} serves an API this CLI does not support`,
+      };
+    }
+    return { ok: true, value: await fn(client) };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/**
  * Whether the hub that OWNS this box runs on THIS machine — the `preferLocal`
  * answer for any box op. **The one ownership predicate**: a lifecycle/destroy op
  * can only be served by the hub that owns the box, and getting this wrong sends

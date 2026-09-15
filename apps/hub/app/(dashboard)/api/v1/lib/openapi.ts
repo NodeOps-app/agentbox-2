@@ -12,6 +12,129 @@ const errorResponse = {
   },
 };
 
+const managerIdParam = {
+  name: 'id',
+  in: 'path',
+  required: true,
+  schema: { type: 'string', pattern: '^[0-9a-f]{16}$' },
+  description: 'Manager id.',
+};
+
+const workspaceIdParam = {
+  name: 'id',
+  in: 'path',
+  required: true,
+  schema: { type: 'string' },
+  description: 'Workspace id.',
+};
+
+const detectSchema = {
+  type: 'object',
+  properties: {
+    manager: { $ref: '#/components/schemas/Manager' },
+    workspace: { $ref: '#/components/schemas/Workspace' },
+  },
+  required: ['manager', 'workspace'],
+};
+
+const NOTE_DESCRIPTION =
+  "Why: recorded on the workspace timeline as a `manager.note` next to this change (stamped with the caller's manager and turn when the CLI sends `X-AgentBox-Session`).";
+
+const timelineEventTypes = [
+  'task.created',
+  'task.status',
+  'task.assigned',
+  'task.unassigned',
+  'task.removed',
+  'manager.joined',
+  'manager.started',
+  'manager.resumed',
+  'manager.stopped',
+  'manager.note',
+  'manager.message',
+  'box.created',
+  'box.ready',
+  'box.failed',
+  'box.started',
+  'box.stopped',
+  'box.destroyed',
+  'box.branch',
+  'git.push',
+  'pr.opened',
+  'pr.ready',
+  'pr.merged',
+  'pr.closed',
+];
+
+const taskStatusEnum = { type: 'string', enum: ['todo', 'in_progress', 'blocked', 'done'] };
+
+const timelineEventProperties = {
+  id: {
+    type: 'string',
+    description: 'Time-sortable: zero-padded base-36 ms, then a random suffix.',
+  },
+  at: { type: 'string', description: 'ISO time.' },
+  type: { type: 'string', enum: timelineEventTypes },
+  actor: { type: 'string', enum: ['human', 'manager', 'box', 'hub', 'github'] },
+  managerId: { type: 'string' },
+  turn: {
+    type: 'number',
+    description:
+      "The manager session's turn when this happened; only when its transcript is on the hub's disk.",
+  },
+  prompt: { type: 'string', description: "That turn's prompt, as a one-line title." },
+  boxId: { type: 'string' },
+  boxName: { type: 'string' },
+  agent: { type: 'string' },
+  branch: {
+    type: 'string',
+    description:
+      '`box.branch`: the branch the box is on after the switch, as the hub sanctioned it.',
+  },
+  base: {
+    type: 'string',
+    description:
+      "`box.created`: the branch the box forked from (the create's `fromBranch`, else the branch the project's host checkout was on; absent when unknown). `box.ready`: the create's `fromBranch`, only when it had one. `box.branch`: the branch it switched away from.",
+  },
+  projectId: { type: 'string' },
+  taskIds: {
+    type: 'array',
+    items: { type: 'string' },
+    description: 'Captured when the event was written (a task later leaves its box).',
+  },
+  task: {
+    type: 'object',
+    properties: {
+      id: { type: 'string' },
+      title: { type: 'string' },
+      from: taskStatusEnum,
+      to: taskStatusEnum,
+    },
+    required: ['id', 'title'],
+  },
+  pr: { $ref: '#/components/schemas/TimelinePr' },
+  text: { type: 'string', description: 'A note, or the message sent to a manager.' },
+  noteKind: { type: 'string', enum: ['note', 'replan', 'plan'] },
+  boxRunning: {
+    type: 'boolean',
+    description: '`task.assigned`: the box was already running (it was given more work).',
+  },
+  additions: {
+    type: 'number',
+    description:
+      '`git.push`: lines the push added, read from the host repo when it was recorded (the old tip to the new, or the merge base with the default branch for a first push or a force-push that rewrote the old tip). Absent when it could not be read.',
+  },
+  deletions: {
+    type: 'number',
+    description: '`git.push`: lines the push removed (see `additions`).',
+  },
+  key: {
+    type: 'string',
+    description:
+      'Dedupe key (`pr:<repo>#<n>:merged`, `job:<jobId>:ready`); an event whose key is already logged is not appended again.',
+  },
+};
+
 export function buildOpenApi(): Record<string, unknown> {
   return {
     openapi: '3.1.0',
@@ -51,6 +174,20 @@ export function buildOpenApi(): Record<string, unknown> {
       {
         name: 'Custody',
         description: 'What the control box holds in custody (metadata only — never values).',
+      },
+      {
+        name: 'Workspaces',
+        description:
+          'Folders grouping one or more projects, each owning a task list and its manager sessions.',
+      },
+      {
+        name: 'Tasks',
+        description: 'Units of work, prioritized by list order and assigned to boxes.',
+      },
+      {
+        name: 'Managers',
+        description:
+          'Host agent sessions that create and watch boxes: detected from your terminal, or run by the hub in tmux.',
       },
     ],
     paths: {
@@ -819,6 +956,1148 @@ export function buildOpenApi(): Record<string, unknown> {
                 },
               },
             },
+            '401': errorResponse,
+          },
+        },
+      },
+      '/workspaces': {
+        get: {
+          tags: ['Workspaces'],
+          summary: 'List registered workspaces',
+          description:
+            'A workspace is a folder on the hub host grouping one or more projects; it owns a task list and its manager sessions. One is created automatically when a manager session is detected in a folder no workspace contains. Empty on a hosted hub, which holds no host folders.',
+          responses: {
+            '200': {
+              description: 'Workspaces',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    properties: {
+                      workspaces: {
+                        type: 'array',
+                        items: { $ref: '#/components/schemas/Workspace' },
+                      },
+                    },
+                    required: ['workspaces'],
+                  },
+                },
+              },
+            },
+            '401': errorResponse,
+          },
+        },
+        post: {
+          tags: ['Workspaces'],
+          summary: 'Register a folder as a workspace',
+          description:
+            'Scans the folder and its immediate subfolders for projects (a `.git` or an `agentbox.yaml`) and registers each one, so they appear in `GET /projects` too. Idempotent: re-posting a registered root rescans it.',
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    path: { type: 'string', description: 'Absolute path on the hub host.' },
+                    name: {
+                      type: 'string',
+                      description: 'Display name (default: folder basename).',
+                    },
+                  },
+                  required: ['path'],
+                },
+              },
+            },
+          },
+          responses: {
+            '200': {
+              description: 'The workspace',
+              content: {
+                'application/json': { schema: { $ref: '#/components/schemas/Workspace' } },
+              },
+            },
+            '400': errorResponse,
+            '401': errorResponse,
+            '503': errorResponse,
+          },
+        },
+      },
+      '/workspaces/{id}': {
+        get: {
+          tags: ['Workspaces'],
+          summary: 'Get one workspace',
+          parameters: [
+            {
+              name: 'id',
+              in: 'path',
+              required: true,
+              schema: { type: 'string' },
+              description: 'Workspace id.',
+            },
+          ],
+          responses: {
+            '200': {
+              description: 'The workspace',
+              content: {
+                'application/json': { schema: { $ref: '#/components/schemas/Workspace' } },
+              },
+            },
+            '401': errorResponse,
+            '404': errorResponse,
+          },
+        },
+        delete: {
+          tags: ['Workspaces'],
+          summary: 'Unregister a workspace',
+          description:
+            'Drops the workspace record, its tasks and its managers. The folder, its projects and their boxes are untouched. Refused (409) while any of its managers is running, unless `force=1`.',
+          parameters: [
+            {
+              name: 'id',
+              in: 'path',
+              required: true,
+              schema: { type: 'string' },
+              description: 'Workspace id.',
+            },
+            {
+              name: 'force',
+              in: 'query',
+              schema: { type: 'string', enum: ['1', 'true'] },
+              description: 'Remove it even while one of its managers reads as running.',
+            },
+          ],
+          responses: {
+            '200': {
+              description: 'Done',
+              content: {
+                'application/json': {
+                  schema: { type: 'object', properties: { ok: { const: true } }, required: ['ok'] },
+                },
+              },
+            },
+            '401': errorResponse,
+            '404': errorResponse,
+            '409': errorResponse,
+            '503': errorResponse,
+          },
+        },
+      },
+      '/workspaces/{id}/rename': {
+        post: {
+          tags: ['Workspaces'],
+          summary: 'Rename a workspace',
+          parameters: [
+            {
+              name: 'id',
+              in: 'path',
+              required: true,
+              schema: { type: 'string' },
+              description: 'Workspace id.',
+            },
+          ],
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: { name: { type: 'string', maxLength: 60 } },
+                  required: ['name'],
+                },
+              },
+            },
+          },
+          responses: {
+            '200': {
+              description: 'The workspace',
+              content: {
+                'application/json': { schema: { $ref: '#/components/schemas/Workspace' } },
+              },
+            },
+            '400': errorResponse,
+            '401': errorResponse,
+            '404': errorResponse,
+            '503': errorResponse,
+          },
+        },
+      },
+      '/workspaces/{id}/rescan': {
+        post: {
+          tags: ['Workspaces'],
+          summary: 'Re-discover the projects under a workspace',
+          description:
+            'A repo cloned into the folder after registration is invisible until this runs.',
+          parameters: [
+            {
+              name: 'id',
+              in: 'path',
+              required: true,
+              schema: { type: 'string' },
+              description: 'Workspace id.',
+            },
+          ],
+          responses: {
+            '200': {
+              description: 'The workspace',
+              content: {
+                'application/json': { schema: { $ref: '#/components/schemas/Workspace' } },
+              },
+            },
+            '401': errorResponse,
+            '404': errorResponse,
+            '503': errorResponse,
+          },
+        },
+      },
+      '/workspaces/{id}/tasks': {
+        get: {
+          tags: ['Tasks'],
+          summary: "List a workspace's tasks",
+          description:
+            'In priority order (the list order IS the priority). Assignments are healed on read: a task pointed at a create job moves to the box id once the worker records it, and a task whose box is gone returns to the backlog.',
+          parameters: [
+            {
+              name: 'id',
+              in: 'path',
+              required: true,
+              schema: { type: 'string' },
+              description: 'Workspace id.',
+            },
+            {
+              name: 'status',
+              in: 'query',
+              schema: { type: 'string', enum: ['todo', 'in_progress', 'blocked', 'done'] },
+            },
+            { name: 'projectId', in: 'query', schema: { type: 'string' } },
+            { name: 'boxId', in: 'query', schema: { type: 'string' } },
+            { name: 'managerId', in: 'query', schema: { type: 'string' } },
+          ],
+          responses: {
+            '200': {
+              description: 'Tasks',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    properties: {
+                      tasks: { type: 'array', items: { $ref: '#/components/schemas/WorkTask' } },
+                    },
+                    required: ['tasks'],
+                  },
+                },
+              },
+            },
+            '400': errorResponse,
+            '401': errorResponse,
+            '404': errorResponse,
+          },
+        },
+        post: {
+          tags: ['Tasks'],
+          summary: 'Add a task',
+          parameters: [
+            {
+              name: 'id',
+              in: 'path',
+              required: true,
+              schema: { type: 'string' },
+              description: 'Workspace id.',
+            },
+          ],
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    title: { type: 'string', maxLength: 300 },
+                    description: { type: 'string' },
+                    projectId: { type: 'string', description: 'Scope the task to one project.' },
+                    dependsOn: { type: 'array', items: { type: 'string', pattern: '^T-\\d+$' } },
+                    createdBy: { type: 'string', enum: ['human', 'manager', 'api'] },
+                    externalRef: { $ref: '#/components/schemas/WorkTaskExternalRef' },
+                    boxId: { type: 'string', description: 'Assign to this box immediately.' },
+                    boxJobId: {
+                      type: 'string',
+                      description: 'Assign to the box this create job will produce.',
+                    },
+                    managerId: {
+                      type: 'string',
+                      pattern: '^[0-9a-f]{16}$',
+                      description:
+                        "The manager session this task belongs to; 400 when it belongs to another workspace (or is unknown). Omitted with a box: the box's manager, when it is this workspace's.",
+                    },
+                    note: {
+                      type: 'string',
+                      maxLength: 2000,
+                      description: NOTE_DESCRIPTION,
+                    },
+                  },
+                  required: ['title'],
+                },
+              },
+            },
+          },
+          responses: {
+            '201': {
+              description: 'The task',
+              content: {
+                'application/json': { schema: { $ref: '#/components/schemas/WorkTask' } },
+              },
+            },
+            '400': errorResponse,
+            '401': errorResponse,
+            '404': errorResponse,
+            '409': errorResponse,
+            '503': errorResponse,
+          },
+        },
+      },
+      '/workspaces/{id}/tasks/reorder': {
+        post: {
+          tags: ['Tasks'],
+          summary: 'Set the whole task order',
+          description:
+            "`ids` must be an exact permutation of the workspace's tasks — a partial list would silently renumber the rest, and this order is the priority the manager reads.",
+          parameters: [
+            {
+              name: 'id',
+              in: 'path',
+              required: true,
+              schema: { type: 'string' },
+              description: 'Workspace id.',
+            },
+          ],
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    ids: { type: 'array', items: { type: 'string', pattern: '^T-\\d+$' } },
+                    note: {
+                      type: 'string',
+                      maxLength: 2000,
+                      description: NOTE_DESCRIPTION,
+                    },
+                  },
+                  required: ['ids'],
+                },
+              },
+            },
+          },
+          responses: {
+            '200': {
+              description: 'Tasks',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    properties: {
+                      tasks: { type: 'array', items: { $ref: '#/components/schemas/WorkTask' } },
+                    },
+                    required: ['tasks'],
+                  },
+                },
+              },
+            },
+            '400': errorResponse,
+            '401': errorResponse,
+            '404': errorResponse,
+            '503': errorResponse,
+          },
+        },
+      },
+      '/workspaces/{id}/tasks/assign': {
+        post: {
+          tags: ['Tasks'],
+          summary: 'Assign several tasks to one box',
+          description:
+            'The bulk form the manager uses when it groups tasks that touch the same files into one box. Exactly one of `boxId` / `boxJobId`; a `todo` task becomes `in_progress`.',
+          parameters: [
+            {
+              name: 'id',
+              in: 'path',
+              required: true,
+              schema: { type: 'string' },
+              description: 'Workspace id.',
+            },
+          ],
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    ids: { type: 'array', items: { type: 'string', pattern: '^T-\\d+$' } },
+                    boxId: { type: 'string' },
+                    boxJobId: { type: 'string' },
+                    note: {
+                      type: 'string',
+                      maxLength: 2000,
+                      description: NOTE_DESCRIPTION,
+                    },
+                  },
+                  required: ['ids'],
+                },
+              },
+            },
+          },
+          responses: {
+            '200': {
+              description: 'Tasks',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    properties: {
+                      tasks: { type: 'array', items: { $ref: '#/components/schemas/WorkTask' } },
+                    },
+                    required: ['tasks'],
+                  },
+                },
+              },
+            },
+            '400': errorResponse,
+            '401': errorResponse,
+            '404': errorResponse,
+            '409': errorResponse,
+            '503': errorResponse,
+          },
+        },
+      },
+      '/workspaces/{id}/tasks/{taskId}': {
+        get: {
+          tags: ['Tasks'],
+          summary: 'Get one task',
+          parameters: [
+            {
+              name: 'id',
+              in: 'path',
+              required: true,
+              schema: { type: 'string' },
+              description: 'Workspace id.',
+            },
+            {
+              name: 'taskId',
+              in: 'path',
+              required: true,
+              schema: { type: 'string', pattern: '^T-\\d+$' },
+            },
+          ],
+          responses: {
+            '200': {
+              description: 'The task',
+              content: {
+                'application/json': { schema: { $ref: '#/components/schemas/WorkTask' } },
+              },
+            },
+            '401': errorResponse,
+            '404': errorResponse,
+          },
+        },
+        post: {
+          tags: ['Tasks'],
+          summary: 'Update a task',
+          description:
+            'Partial update (this API has no PATCH). `projectId: null` clears the project scope and `managerId: null` the manager; an omitted field is left alone.',
+          parameters: [
+            {
+              name: 'id',
+              in: 'path',
+              required: true,
+              schema: { type: 'string' },
+              description: 'Workspace id.',
+            },
+            {
+              name: 'taskId',
+              in: 'path',
+              required: true,
+              schema: { type: 'string', pattern: '^T-\\d+$' },
+            },
+          ],
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    title: { type: 'string', maxLength: 300 },
+                    description: { type: 'string' },
+                    status: { type: 'string', enum: ['todo', 'in_progress', 'blocked', 'done'] },
+                    projectId: { type: 'string', nullable: true },
+                    dependsOn: { type: 'array', items: { type: 'string', pattern: '^T-\\d+$' } },
+                    externalRef: { $ref: '#/components/schemas/WorkTaskExternalRef' },
+                    managerId: {
+                      type: 'string',
+                      nullable: true,
+                      description:
+                        '`null` clears the manager; 400 for a manager of another workspace (or an unknown one).',
+                    },
+                    note: {
+                      type: 'string',
+                      maxLength: 2000,
+                      description: NOTE_DESCRIPTION,
+                    },
+                  },
+                },
+              },
+            },
+          },
+          responses: {
+            '200': {
+              description: 'The task',
+              content: {
+                'application/json': { schema: { $ref: '#/components/schemas/WorkTask' } },
+              },
+            },
+            '400': errorResponse,
+            '401': errorResponse,
+            '404': errorResponse,
+            '409': errorResponse,
+            '503': errorResponse,
+          },
+        },
+        delete: {
+          tags: ['Tasks'],
+          summary: 'Remove a task',
+          description: "Also drops the id from every other task's dependsOn.",
+          parameters: [
+            {
+              name: 'id',
+              in: 'path',
+              required: true,
+              schema: { type: 'string' },
+              description: 'Workspace id.',
+            },
+            {
+              name: 'taskId',
+              in: 'path',
+              required: true,
+              schema: { type: 'string', pattern: '^T-\\d+$' },
+            },
+          ],
+          responses: {
+            '200': {
+              description: 'Done',
+              content: {
+                'application/json': {
+                  schema: { type: 'object', properties: { ok: { const: true } }, required: ['ok'] },
+                },
+              },
+            },
+            '401': errorResponse,
+            '404': errorResponse,
+            '503': errorResponse,
+          },
+        },
+      },
+      '/workspaces/{id}/tasks/{taskId}/done': {
+        post: {
+          tags: ['Tasks'],
+          summary: 'Mark a task done',
+          parameters: [
+            {
+              name: 'id',
+              in: 'path',
+              required: true,
+              schema: { type: 'string' },
+              description: 'Workspace id.',
+            },
+            {
+              name: 'taskId',
+              in: 'path',
+              required: true,
+              schema: { type: 'string', pattern: '^T-\\d+$' },
+            },
+          ],
+          responses: {
+            '200': {
+              description: 'The task',
+              content: {
+                'application/json': { schema: { $ref: '#/components/schemas/WorkTask' } },
+              },
+            },
+            '401': errorResponse,
+            '404': errorResponse,
+            '503': errorResponse,
+          },
+        },
+      },
+      '/workspaces/{id}/tasks/{taskId}/assign': {
+        post: {
+          tags: ['Tasks'],
+          summary: 'Assign one task to a box',
+          description: 'Exactly one of `boxId` / `boxJobId`.',
+          parameters: [
+            {
+              name: 'id',
+              in: 'path',
+              required: true,
+              schema: { type: 'string' },
+              description: 'Workspace id.',
+            },
+            {
+              name: 'taskId',
+              in: 'path',
+              required: true,
+              schema: { type: 'string', pattern: '^T-\\d+$' },
+            },
+          ],
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    boxId: { type: 'string' },
+                    boxJobId: { type: 'string' },
+                    note: { type: 'string', maxLength: 2000, description: NOTE_DESCRIPTION },
+                  },
+                },
+              },
+            },
+          },
+          responses: {
+            '200': {
+              description: 'The task',
+              content: {
+                'application/json': { schema: { $ref: '#/components/schemas/WorkTask' } },
+              },
+            },
+            '400': errorResponse,
+            '401': errorResponse,
+            '404': errorResponse,
+            '409': errorResponse,
+            '503': errorResponse,
+          },
+        },
+      },
+      '/workspaces/{id}/tasks/{taskId}/unassign': {
+        post: {
+          tags: ['Tasks'],
+          summary: 'Return a task to the backlog',
+          description: 'Finished work stays finished; only an in-progress task reverts to todo.',
+          parameters: [
+            {
+              name: 'id',
+              in: 'path',
+              required: true,
+              schema: { type: 'string' },
+              description: 'Workspace id.',
+            },
+            {
+              name: 'taskId',
+              in: 'path',
+              required: true,
+              schema: { type: 'string', pattern: '^T-\\d+$' },
+            },
+          ],
+          responses: {
+            '200': {
+              description: 'The task',
+              content: {
+                'application/json': { schema: { $ref: '#/components/schemas/WorkTask' } },
+              },
+            },
+            '401': errorResponse,
+            '404': errorResponse,
+            '503': errorResponse,
+          },
+        },
+      },
+      '/managers': {
+        get: {
+          tags: ['Managers'],
+          summary: 'List manager sessions across every workspace',
+          description:
+            'A manager is a host agent session that creates and watches boxes: `external` (a claude/codex session in your own terminal, registered when the `agentbox` CLI runs inside it) or `hub` (one this hub started in tmux). Running first, then the most recently seen. `status` is derived from the process — the tmux session for a hub manager, the pid for an external one reported from this host, else a 30-minute last-seen window. Empty on a hosted hub.',
+          parameters: [
+            { name: 'workspaceId', in: 'query', schema: { type: 'string' } },
+            {
+              name: 'status',
+              in: 'query',
+              schema: { type: 'string', enum: ['running', 'stopped'] },
+            },
+          ],
+          responses: {
+            '200': {
+              description: 'Managers',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    properties: {
+                      managers: { type: 'array', items: { $ref: '#/components/schemas/Manager' } },
+                    },
+                    required: ['managers'],
+                  },
+                },
+              },
+            },
+            '400': errorResponse,
+            '401': errorResponse,
+          },
+        },
+      },
+      '/managers/detect': {
+        post: {
+          tags: ['Managers'],
+          summary: 'Register the host session a CLI call came from',
+          description:
+            "Matched by `(agent, sessionId)`, so repeating it refreshes one record (`lastSeenAt`, `pid`). A `managerId` (the caller's `$AGENTBOX_MANAGER`) joins the session to the hub-run manager it runs in. When no workspace contains `cwd`, one is created there, named after the folder — except at `/`, the hub user's home folder or a folder above it, or a `cwd` that is not a folder on this hub, which answer 400. A session already registered stays in its workspace. `boxId` / `boxJobId` attaches a box this session just made in the same call. 201 when a manager or workspace was created, 200 when an existing one was refreshed.",
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    agent: {
+                      type: 'string',
+                      description:
+                        'An agent this hub knows with a session surface (not a service agent).',
+                    },
+                    sessionId: {
+                      type: 'string',
+                      description: 'Claude session uuid / codex thread uuid.',
+                    },
+                    cwd: { type: 'string', description: 'Absolute folder the session runs in.' },
+                    pid: {
+                      type: 'integer',
+                      description:
+                        "The agent process, probed for liveness when `host` is this hub's; its start time is recorded then too, so a reused pid does not read as running.",
+                    },
+                    host: {
+                      type: 'string',
+                      description: 'Hostname of the machine the session runs on.',
+                    },
+                    managerId: { type: 'string', pattern: '^[0-9a-f]{16}$' },
+                    tmuxPane: {
+                      type: 'string',
+                      pattern: '^%\\d+$',
+                      description:
+                        "`$TMUX_PANE` of the session's terminal, so POST /managers/{id}/message can type into it.",
+                    },
+                    tmuxSession: {
+                      type: 'string',
+                      pattern: '^agentbox-manager-[0-9a-f]{16}$',
+                      description:
+                        "The AgentBox manager tmux session that pane belongs to. When it exists on the hub's machine and started in `cwd`, the manager is recorded as `hub`-run from it (a session from before managers were detected is adopted). A session hosted by Claude's background daemon never sends it: the daemon drops TMUX.",
+                    },
+                    boxId: { type: 'string' },
+                    boxJobId: { type: 'string' },
+                  },
+                  required: ['agent', 'sessionId', 'cwd'],
+                },
+              },
+            },
+          },
+          responses: {
+            '200': {
+              description: 'Refreshed',
+              content: { 'application/json': { schema: detectSchema } },
+            },
+            '201': {
+              description: 'Created',
+              content: { 'application/json': { schema: detectSchema } },
+            },
+            '400': errorResponse,
+            '401': errorResponse,
+            '503': errorResponse,
+          },
+        },
+      },
+      '/managers/{id}': {
+        get: {
+          tags: ['Managers'],
+          summary: 'Get one manager',
+          parameters: [managerIdParam],
+          responses: {
+            '200': {
+              description: 'Manager',
+              content: { 'application/json': { schema: { $ref: '#/components/schemas/Manager' } } },
+            },
+            '401': errorResponse,
+            '404': errorResponse,
+          },
+        },
+        delete: {
+          tags: ['Managers'],
+          summary: 'Forget a manager',
+          description:
+            'Drops the record. Its boxes and tasks are untouched (tasks keep a `managerId` nothing resolves). Refused (409) while it runs, unless `force=1` — which forgets it regardless of status and leaves its process (a tmux session, a terminal) alone.',
+          parameters: [
+            managerIdParam,
+            {
+              name: 'force',
+              in: 'query',
+              schema: { type: 'string', enum: ['1', 'true'] },
+              description: 'Forget it regardless of status.',
+            },
+          ],
+          responses: {
+            '200': {
+              description: 'Forgotten',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    properties: { ok: { type: 'boolean' } },
+                    required: ['ok'],
+                  },
+                },
+              },
+            },
+            '401': errorResponse,
+            '404': errorResponse,
+            '409': errorResponse,
+            '503': errorResponse,
+          },
+        },
+      },
+      '/managers/{id}/stop': {
+        post: {
+          tags: ['Managers'],
+          summary: 'Stop a hub-run manager',
+          description:
+            "Kills its tmux session. Idempotent; the record is kept so it can be resumed. An external manager is your own terminal process, which the hub never signals: 409 while it runs, a no-op once it has exited. A claude manager whose session runs in Claude's background daemon is never ended by this: only the hub's attach session (POST /managers/{id}/attach) is closed, and the answer carries `notice` saying the session keeps running (end it with `claude stop <id>`).",
+          parameters: [managerIdParam],
+          responses: {
+            '200': {
+              description:
+                "Manager, plus `notice` (string) when the agent session was left running in Claude's background daemon.",
+              content: { 'application/json': { schema: { $ref: '#/components/schemas/Manager' } } },
+            },
+            '401': errorResponse,
+            '404': errorResponse,
+            '409': errorResponse,
+            '503': errorResponse,
+          },
+        },
+      },
+      '/managers/{id}/resume': {
+        post: {
+          tags: ['Managers'],
+          summary: "Resume a manager's session in the hub",
+          description:
+            "Reopens the session in a tmux session the hub owns (`claude --resume <id>` / `codex resume <id>`, run in the manager's `cwd`), and the manager becomes `hub`-run. 409 while the session still runs anywhere (two processes writing one transcript corrupt it), for a manager with no session id, for an agent whose sessions cannot be resumed, and for an external session reported from another host (its transcript is not on this machine); 503 when the hub host has no tmux.",
+          parameters: [managerIdParam],
+          responses: {
+            '200': {
+              description: 'Manager',
+              content: { 'application/json': { schema: { $ref: '#/components/schemas/Manager' } } },
+            },
+            '401': errorResponse,
+            '404': errorResponse,
+            '409': errorResponse,
+            '503': errorResponse,
+          },
+        },
+      },
+      '/managers/{id}/attach': {
+        post: {
+          tags: ['Managers'],
+          summary: "Open a manager's Claude background session in the hub",
+          description:
+            "For a claude manager whose session is a detached Claude Code background session (`background` on the manager): starts, or reuses, the tmux session `agentbox-manager-<managerId>` on the hub user's default tmux server running `claude attach <background.id>` in the manager's `cwd`, and answers the manager with `attachCommand` for it. The record keeps its kind, session id and pid. The session keeps running in Claude's daemon when that tmux session ends, and the manager stays `running`. 409 when the manager has no running background session, or when something the hub can see may already show it (an AgentBox tmux session starting in its folder, or a `claude attach` client); 503 when the hub host has no tmux.",
+          parameters: [managerIdParam],
+          responses: {
+            '200': {
+              description: 'Manager',
+              content: { 'application/json': { schema: { $ref: '#/components/schemas/Manager' } } },
+            },
+            '401': errorResponse,
+            '404': errorResponse,
+            '409': errorResponse,
+            '503': errorResponse,
+          },
+        },
+      },
+      '/managers/{id}/notes': {
+        post: {
+          tags: ['Managers', 'Timeline'],
+          summary: 'Record a manager note on the timeline',
+          description:
+            "A note explaining what the manager decided (`kind`: `note`, `replan` when it re-planned, `plan` when it made one). Stamped with the manager's current turn and that turn's prompt when its transcript is on this hub's disk.",
+          parameters: [managerIdParam],
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    text: { type: 'string', maxLength: 2000 },
+                    kind: { type: 'string', enum: ['note', 'replan', 'plan'] },
+                  },
+                  required: ['text'],
+                },
+              },
+            },
+          },
+          responses: {
+            '201': {
+              description: 'The recorded event',
+              content: {
+                'application/json': { schema: { $ref: '#/components/schemas/TimelineEvent' } },
+              },
+            },
+            '400': errorResponse,
+            '401': errorResponse,
+            '404': errorResponse,
+            '409': errorResponse,
+            '503': errorResponse,
+          },
+        },
+      },
+      '/managers/{id}/message': {
+        post: {
+          tags: ['Managers', 'Timeline'],
+          summary: "Type a message into a manager's session",
+          description:
+            "Types `text` into the session and submits it (newlines are flattened to spaces). A running hub-run manager gets it in its tmux session (`delivered: session`); a running external manager in the tmux pane it reported at detect (`pane`, only when it runs on this hub's machine); a stopped manager with a session is resumed in the hub's tmux with the text as its prompt (`resumed`). A running external manager outside tmux answers 409 with code `manager_unreachable` — a client offers the text to paste instead. `prNumber` (with `repo`, `owner/name`, when the workspace spans several repos) ties the message to a PR, which is how a later merge shows `approvedByYou`; without `repo` the PR is matched only when one repo in the log has that number. Records `manager.message` on success.",
+          parameters: [managerIdParam],
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    text: { type: 'string', maxLength: 2000 },
+                    prNumber: { type: 'integer', minimum: 1 },
+                    repo: {
+                      type: 'string',
+                      pattern: '^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$',
+                      description: '`owner/name` of the PR; requires `prNumber`.',
+                    },
+                  },
+                  required: ['text'],
+                },
+              },
+            },
+          },
+          responses: {
+            '200': {
+              description: 'Delivered',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    properties: {
+                      delivered: { type: 'string', enum: ['session', 'pane', 'resumed'] },
+                      manager: { $ref: '#/components/schemas/Manager' },
+                      event: {
+                        oneOf: [{ $ref: '#/components/schemas/TimelineEvent' }, { type: 'null' }],
+                      },
+                    },
+                    required: ['delivered', 'manager', 'event'],
+                  },
+                },
+              },
+            },
+            '400': errorResponse,
+            '401': errorResponse,
+            '404': errorResponse,
+            '409': errorResponse,
+            '503': errorResponse,
+          },
+        },
+      },
+      '/workspaces/{id}/timeline': {
+        get: {
+          tags: ['Timeline'],
+          summary: "A workspace's timeline",
+          description:
+            "What happened in the workspace, newest first: task, manager, box, push and PR events from its append-only log, with 3+ task creates from one manager turn (within 10 minutes) collapsed into one `plan` item. `live` holds the rows true right now, never stored: a box working an in-progress task (with its uncommitted diff when running) and a ready PR nobody merged yet (`awaiting`, `approved` once a message about it was sent). `?since=` adds a `summary` of what changed since then. A GitHub sync (`gh pr list` on the repos behind the workspace's projects) starts in the background when the last one is over a minute old; `github` reports it, and rows it adds fire the usual change event.",
+          parameters: [
+            workspaceIdParam,
+            {
+              name: 'before',
+              in: 'query',
+              schema: { type: 'string' },
+              description: 'Only items strictly older than this ISO time (paging).',
+            },
+            {
+              name: 'limit',
+              in: 'query',
+              schema: { type: 'integer', minimum: 1, maximum: 500, default: 100 },
+            },
+            {
+              name: 'since',
+              in: 'query',
+              schema: { type: 'string' },
+              description: 'ISO time the summary counts from; items are not filtered by it.',
+            },
+            {
+              name: 'sync',
+              in: 'query',
+              schema: { type: 'string', enum: ['0'] },
+              description:
+                '`0`: do not start a GitHub sync; `github` reports the last one (`syncing` before any). For a small read on every refresh. Any other value, or none, keeps the default.',
+            },
+          ],
+          responses: {
+            '200': {
+              description: 'Timeline',
+              content: {
+                'application/json': { schema: { $ref: '#/components/schemas/Timeline' } },
+              },
+            },
+            '400': errorResponse,
+            '401': errorResponse,
+            '404': errorResponse,
+          },
+        },
+      },
+      '/workspaces/{id}/managers': {
+        get: {
+          tags: ['Managers'],
+          summary: "List a workspace's managers",
+          parameters: [workspaceIdParam],
+          responses: {
+            '200': {
+              description: 'Managers',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    properties: {
+                      managers: { type: 'array', items: { $ref: '#/components/schemas/Manager' } },
+                    },
+                    required: ['managers'],
+                  },
+                },
+              },
+            },
+            '401': errorResponse,
+            '404': errorResponse,
+          },
+        },
+      },
+      '/workspaces/{id}/managers/start': {
+        post: {
+          tags: ['Managers'],
+          summary: 'Start a manager agent in the workspace folder',
+          description:
+            'Runs a coding agent LOCALLY in the workspace folder, in a detached tmux session the hub owns, with AGENTBOX_WORKSPACE and AGENTBOX_MANAGER set. Clients attach to that session rather than the hub proxying a terminal. Send `agent` — one this hub knows, has installed, and can attach to (a `service` agent is a daemon and is refused) — optionally with a `sessionId` to resume (claude and codex only). A `sessionId` some manager already holds resumes that manager rather than creating a second one (409 while it runs, unless `restart` and it is hub-run). There is deliberately no free-form command, and `sessionId` must look like an id: this runs on the hub host, not in a box. 503 when the hub host has no tmux.',
+          parameters: [workspaceIdParam],
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    agent: {
+                      type: 'string',
+                      description:
+                        'An agent this hub knows (GET /agents); the built-ins are claude, codex, opencode and pi.',
+                    },
+                    sessionId: {
+                      type: 'string',
+                      description:
+                        'Resume this session (claude and codex only; refused for any other agent).',
+                    },
+                    restart: {
+                      type: 'boolean',
+                      description:
+                        'With a `sessionId` whose hub-run manager is running: restart it instead of refusing.',
+                    },
+                  },
+                  required: ['agent'],
+                },
+              },
+            },
+          },
+          responses: {
+            '200': {
+              description: 'Manager',
+              content: { 'application/json': { schema: { $ref: '#/components/schemas/Manager' } } },
+            },
+            '400': errorResponse,
+            '401': errorResponse,
+            '404': errorResponse,
+            '409': errorResponse,
+            '503': errorResponse,
+          },
+        },
+      },
+      '/workspaces/{id}/managers/sessions': {
+        get: {
+          tags: ['Managers'],
+          summary: 'Resumable agent sessions for the workspace folder',
+          description:
+            'Read from the agent\'s own on-disk store, for the "resume a session" picker, newest first. Only claude and codex are readable today; for anything else `supported: false` means that agent\'s session format is not one we can resume — not an error.',
+          parameters: [
+            workspaceIdParam,
+            { name: 'agent', in: 'query', schema: { type: 'string', default: 'claude' } },
+          ],
+          responses: {
+            '200': {
+              description: 'Sessions',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    properties: {
+                      agent: { type: 'string' },
+                      supported: { type: 'boolean' },
+                      sessions: {
+                        type: 'array',
+                        items: { $ref: '#/components/schemas/HostSession' },
+                      },
+                    },
+                    required: ['agent', 'supported', 'sessions'],
+                  },
+                },
+              },
+            },
+            '401': errorResponse,
+            '404': errorResponse,
+          },
+        },
+      },
+      '/tasks': {
+        get: {
+          tags: ['Tasks'],
+          summary: 'List tasks across every workspace',
+          description:
+            'The cross-workspace read a fleet view needs: answers "what is assigned to this box" without knowing which workspace owns it.',
+          parameters: [
+            { name: 'workspaceId', in: 'query', schema: { type: 'string' } },
+            { name: 'projectId', in: 'query', schema: { type: 'string' } },
+            { name: 'boxId', in: 'query', schema: { type: 'string' } },
+            { name: 'managerId', in: 'query', schema: { type: 'string' } },
+            {
+              name: 'status',
+              in: 'query',
+              schema: { type: 'string', enum: ['todo', 'in_progress', 'blocked', 'done'] },
+            },
+          ],
+          responses: {
+            '200': {
+              description: 'Tasks',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    properties: {
+                      tasks: { type: 'array', items: { $ref: '#/components/schemas/WorkTask' } },
+                    },
+                    required: ['tasks'],
+                  },
+                },
+              },
+            },
+            '400': errorResponse,
             '401': errorResponse,
           },
         },
@@ -2172,6 +3451,11 @@ export function buildOpenApi(): Record<string, unknown> {
           type: 'object',
           properties: {
             id: { type: 'string' },
+            managerId: {
+              type: 'string',
+              description:
+                'The manager session that created this box. Absent for a box made from the web UI or the tray, and on a hosted hub.',
+            },
             projectId: { type: 'string' },
             repo: { type: 'string' },
             branch: { type: 'string' },
@@ -2231,6 +3515,18 @@ export function buildOpenApi(): Record<string, unknown> {
               type: 'boolean',
               description:
                 "The box's agent declares a state backup, so `POST /boxes/{id}/backup` captures its IDENTITY (gateway token, pairings, history) and not just a workspace. Present for a service bot (openclaw); absent for a coding-agent box.",
+            },
+            pr: {
+              type: 'object',
+              description:
+                "The box's pull request: matched in its workspace timeline by box id, else by the box branch against the PR head; the newest wins, an open one over a merged or closed one. `state` is the last GitHub sync's when the hub has one, else the log's. ABSENT means no data: no known PR, no workspace, or the hosted plane.",
+              properties: {
+                repo: { type: 'string', description: '`owner/name`.' },
+                number: { type: 'number' },
+                url: { type: 'string' },
+                state: { type: 'string', enum: ['open', 'ready', 'merged', 'closed'] },
+              },
+              required: ['repo', 'number', 'state'],
             },
             agentStatus: {
               type: 'object',
@@ -2302,6 +3598,339 @@ export function buildOpenApi(): Record<string, unknown> {
             },
           },
           required: ['id', 'projectId', 'status', 'agent'],
+        },
+        Workspace: {
+          type: 'object',
+          description:
+            'A folder on the hub host grouping one or more projects, owning a task list and a manager.',
+          properties: {
+            id: {
+              type: 'string',
+              description: 'Hash of the canonical root (same key space as a project id).',
+            },
+            name: { type: 'string' },
+            root: { type: 'string', description: 'Absolute folder path on the hub host.' },
+            projectIds: { type: 'array', items: { type: 'string' } },
+            taskCounts: {
+              type: 'object',
+              properties: { open: { type: 'number' }, done: { type: 'number' } },
+              required: ['open', 'done'],
+            },
+            managers: {
+              type: 'object',
+              description: 'How many manager sessions this workspace has, and how many run now.',
+              properties: { running: { type: 'number' }, total: { type: 'number' } },
+              required: ['running', 'total'],
+            },
+            createdAt: { type: 'string' },
+            updatedAt: { type: 'string' },
+          },
+          required: ['id', 'name', 'root', 'projectIds', 'createdAt', 'updatedAt'],
+        },
+        WorkTaskExternalRef: {
+          type: 'object',
+          description:
+            'Back-reference to an external tracker. One ticket routinely becomes several tasks.',
+          properties: {
+            kind: { type: 'string', example: 'linear' },
+            id: { type: 'string' },
+            url: { type: 'string' },
+          },
+          required: ['kind', 'id'],
+        },
+        TimelinePr: {
+          type: 'object',
+          properties: {
+            repo: { type: 'string', description: '`owner/name`.' },
+            number: { type: 'number' },
+            title: { type: 'string' },
+            url: { type: 'string' },
+            base: { type: 'string' },
+            head: { type: 'string' },
+            additions: { type: 'number' },
+            deletions: { type: 'number' },
+            checks: { type: 'string', enum: ['pass', 'fail', 'pending', 'none'] },
+            mergeState: { type: 'string' },
+            autoMerge: { type: 'boolean' },
+            mergedBy: { type: 'string' },
+          },
+          required: ['repo', 'number', 'title', 'url', 'base', 'head'],
+        },
+        TimelineEvent: {
+          type: 'object',
+          description: "One line of a workspace's append-only timeline log.",
+          properties: timelineEventProperties,
+          required: ['id', 'at', 'type', 'actor'],
+        },
+        TimelineBranchUrl: {
+          type: 'string',
+          description:
+            "The row's branch on the web, e.g. `https://github.com/acme/storefront-web/tree/feat/checkout-copy`, each branch segment URL-encoded. Added at read time, never stored. Present only when the row names a branch (`pr.head` on a PR row, else `branch`) and its repo is known: from `pr.url`, else a repo the GitHub sync resolved, else the row's project or box repo as the last sync cached it.",
+        },
+        TimelineLane: {
+          type: 'object',
+          description:
+            'Where a row sits when the timeline is drawn as a branch graph. Assigned at read time over the whole log before paging, so a lane keeps its id on every page; set on every item and live row.',
+          properties: {
+            id: {
+              type: 'string',
+              description:
+                '`trunk`, `box:<boxId>`, or `branch:<head>` for a pull request no box is known to own.',
+            },
+            kind: { type: 'string', enum: ['trunk', 'box', 'branch'] },
+            from: {
+              type: 'string',
+              description:
+                "On the lane's oldest row: the lane it forked from (the box lane that last carried its `base`, else `trunk`). Absent on a page that does not reach the fork.",
+            },
+            into: {
+              type: 'string',
+              description:
+                '`pr.merged`: the lane it merged into (the box lane carrying `pr.base`, else `trunk`). The row stays on its own lane.',
+            },
+            branch: {
+              type: 'string',
+              description: "The lane's branch, on its first row and on every row where it changes.",
+            },
+            open: {
+              type: 'boolean',
+              description:
+                "On the lane's live rows and its newest item when the lane goes on: a live row exists, or the box still exists and is running or has unmerged work.",
+            },
+          },
+          required: ['id', 'kind'],
+        },
+        TimelineItem: {
+          type: 'object',
+          description:
+            'A timeline row: an event, or a `plan` that 3+ `task.created` events from one manager turn collapsed into.',
+          properties: {
+            ...timelineEventProperties,
+            type: { type: 'string', enum: [...timelineEventTypes, 'plan'] },
+            count: { type: 'number', description: '`plan`: how many tasks it created.' },
+            approvedByYou: {
+              type: 'boolean',
+              description: '`pr.merged`: a message about this PR was sent before it merged.',
+            },
+            branchUrl: { $ref: '#/components/schemas/TimelineBranchUrl' },
+            lane: { $ref: '#/components/schemas/TimelineLane' },
+          },
+          required: ['id', 'at', 'type', 'actor'],
+        },
+        TimelineLiveItem: {
+          type: 'object',
+          description: 'A row true right now, built at read time.',
+          properties: {
+            id: { type: 'string' },
+            type: { type: 'string', enum: ['task.in_progress', 'pr.ready'] },
+            at: { type: 'string' },
+            boxId: { type: 'string' },
+            boxName: { type: 'string' },
+            agent: { type: 'string' },
+            branch: { type: 'string' },
+            branchUrl: { $ref: '#/components/schemas/TimelineBranchUrl' },
+            managerId: { type: 'string' },
+            task: {
+              type: 'object',
+              properties: { id: { type: 'string' }, title: { type: 'string' } },
+              required: ['id', 'title'],
+            },
+            taskIds: { type: 'array', items: { type: 'string' } },
+            filesChanged: { type: 'number' },
+            additions: { type: 'number' },
+            deletions: { type: 'number' },
+            pr: { $ref: '#/components/schemas/TimelinePr' },
+            awaiting: { type: 'boolean' },
+            approved: { type: 'boolean' },
+            lane: { $ref: '#/components/schemas/TimelineLane' },
+          },
+          required: ['id', 'type', 'at'],
+        },
+        TimelineSummary: {
+          type: 'object',
+          properties: {
+            since: { type: 'string' },
+            merged: { type: 'number' },
+            additions: { type: 'number' },
+            deletions: { type: 'number' },
+            tasksDone: { type: 'number' },
+            awaiting: {
+              type: 'number',
+              description:
+                "Ready PRs not approved yet, plus pending approvals on the workspace's boxes.",
+            },
+          },
+          required: ['since', 'merged', 'additions', 'deletions', 'tasksDone', 'awaiting'],
+        },
+        Timeline: {
+          type: 'object',
+          properties: {
+            items: { type: 'array', items: { $ref: '#/components/schemas/TimelineItem' } },
+            live: { type: 'array', items: { $ref: '#/components/schemas/TimelineLiveItem' } },
+            summary: { $ref: '#/components/schemas/TimelineSummary' },
+            github: {
+              type: 'string',
+              enum: ['ok', 'syncing', 'unavailable'],
+              description:
+                '`unavailable`: no gh, not logged in, or no GitHub repo behind the workspace.',
+            },
+          },
+          required: ['items', 'live', 'github'],
+        },
+        WorkTask: {
+          type: 'object',
+          properties: {
+            id: { type: 'string', pattern: '^T-\\d+$' },
+            workspaceId: { type: 'string' },
+            projectId: { type: 'string' },
+            title: { type: 'string' },
+            description: { type: 'string' },
+            status: { type: 'string', enum: ['todo', 'in_progress', 'blocked', 'done'] },
+            order: {
+              type: 'number',
+              description: 'Position in the list; the order IS the priority.',
+            },
+            boxId: { type: 'string' },
+            boxJobId: {
+              type: 'string',
+              description: 'A create job that has not produced a box yet; healed to boxId on read.',
+            },
+            managerId: {
+              type: 'string',
+              description:
+                'The manager session this task belongs to. Set by `agentbox tasks add` inside a session, and inherited from the box on assignment.',
+            },
+            dependsOn: { type: 'array', items: { type: 'string' } },
+            createdBy: { type: 'string', enum: ['human', 'manager', 'api'] },
+            externalRef: { $ref: '#/components/schemas/WorkTaskExternalRef' },
+            createdAt: { type: 'string' },
+            updatedAt: { type: 'string' },
+            doneAt: { type: 'string' },
+          },
+          required: [
+            'id',
+            'workspaceId',
+            'title',
+            'status',
+            'order',
+            'createdBy',
+            'createdAt',
+            'updatedAt',
+          ],
+        },
+        Manager: {
+          type: 'object',
+          description: 'A host agent session that creates and watches boxes. Many per workspace.',
+          properties: {
+            id: { type: 'string', pattern: '^[0-9a-f]{16}$' },
+            workspaceId: { type: 'string' },
+            workspaceName: { type: 'string' },
+            agent: { type: 'string' },
+            kind: {
+              type: 'string',
+              enum: ['external', 'hub'],
+              description:
+                '`external`: a session in your own terminal the hub only observes. `hub`: one the hub runs in tmux, which can be attached to and stopped.',
+            },
+            status: { type: 'string', enum: ['running', 'stopped'] },
+            resumable: {
+              type: 'boolean',
+              description:
+                'Whether POST /managers/{id}/resume would be accepted now: false while it runs, without a session id, for an agent whose sessions cannot be resumed, and for an external session that ran on another machine (its transcript is not on this hub). A GUI disables Resume on false.',
+            },
+            resumeBlockedBy: {
+              type: 'string',
+              enum: ['running', 'other-host', 'unsupported-agent', 'no-session'],
+              description:
+                'Why `resumable` is false, in the order a resume checks: `other-host` (an external session reported from another machine), `running`, `no-session` (no session id yet), `unsupported-agent`. Absent when `resumable` is true.',
+            },
+            cwd: {
+              type: 'string',
+              description: 'Folder the session runs in; a resume runs there.',
+            },
+            sessionId: { type: 'string' },
+            title: { type: 'string', description: "The session's first user turn, when readable." },
+            host: { type: 'string' },
+            pid: { type: 'number' },
+            pidStartedAt: {
+              type: 'string',
+              description:
+                "The pid's start time (`ps -o lstart=`), recorded when the session reported the hub's own host. A live pid with a different start time is a reused pid, and the manager reads as stopped.",
+            },
+            tmuxSession: { type: 'string' },
+            tmuxPane: {
+              type: 'string',
+              description:
+                "External only: the tmux pane the session's terminal reported, where a message can be typed.",
+            },
+            attachCommand: {
+              type: 'string',
+              description:
+                "Ready-to-run tmux attach command: a running hub-run manager's session, or the hub's attach session for a Claude background session while it is up.",
+            },
+            background: {
+              type: 'object',
+              description:
+                "A claude manager whose session is a detached Claude Code background session (`claude --bg`, listed by `claude agents`): running in Claude's daemon and shown by nothing the hub can see. POST /managers/{id}/attach opens it. The manager is `running` while the session is, whatever else is attached. Read from `claude agents --json --all` at most every 15 s.",
+              properties: {
+                id: { type: 'string', description: 'The short id `claude attach` takes.' },
+                status: { type: 'string', description: '`busy`, `idle`, `waiting`, …' },
+                state: { type: 'string', description: '`working`, `done`, …' },
+                name: { type: 'string' },
+              },
+              required: ['id'],
+            },
+            terminalSession: {
+              type: 'string',
+              description:
+                "A running external manager's likely terminal: the one AgentBox tmux session (`agentbox-manager-*`) that started in its folder and no manager owns, such as a session from before managers were detected. A guess, never adopted: a client may offer to open it (`tmux attach -t =<name>`).",
+            },
+            boxIds: { type: 'array', items: { type: 'string' } },
+            boxJobIds: {
+              type: 'array',
+              items: { type: 'string' },
+              description:
+                'Create jobs that have not produced a box yet; healed to boxIds on read.',
+            },
+            taskCounts: {
+              type: 'object',
+              properties: { open: { type: 'number' }, done: { type: 'number' } },
+              required: ['open', 'done'],
+            },
+            createdAt: { type: 'string' },
+            lastSeenAt: { type: 'string' },
+            startedAt: { type: 'string' },
+            stoppedAt: { type: 'string' },
+            lastExit: {
+              type: 'number',
+              description: "A hub-run agent's own exit code, when it ended on its own.",
+            },
+          },
+          required: [
+            'id',
+            'workspaceId',
+            'workspaceName',
+            'agent',
+            'kind',
+            'status',
+            'resumable',
+            'cwd',
+            'boxIds',
+            'boxJobIds',
+            'taskCounts',
+            'createdAt',
+            'lastSeenAt',
+          ],
+        },
+        HostSession: {
+          type: 'object',
+          properties: {
+            id: { type: 'string' },
+            agent: { type: 'string' },
+            title: { type: 'string', description: 'First user turn of the transcript.' },
+            updatedAt: { type: 'string' },
+          },
+          required: ['id', 'agent', 'title', 'updatedAt'],
         },
         Project: {
           type: 'object',
@@ -2740,6 +4369,12 @@ export function buildOpenApi(): Record<string, unknown> {
               type: 'boolean',
               description:
                 "An interactive create — the hub runs it in the ungated foreground lane so it doesn't queue behind background jobs.",
+            },
+            managerId: {
+              type: 'string',
+              pattern: '^[0-9a-f]{16}$',
+              description:
+                'The manager session this create came from (`POST /managers/detect` returns it). The job is attached to it, so the box reports that `managerId`.',
             },
             opts: {
               type: 'object',

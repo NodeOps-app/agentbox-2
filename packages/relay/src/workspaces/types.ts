@@ -1,0 +1,324 @@
+import { join } from 'node:path';
+import { STATE_DIR } from '@agentbox/sandbox-core';
+import type { AgentId } from '@agentbox/core';
+
+/** Root of the workspace registry: one directory per workspace, keyed by its id. */
+export const WORKSPACES_DIR = join(STATE_DIR, 'workspaces');
+
+/**
+ * A workspace is a host FOLDER that groups one or more projects and owns a task
+ * list plus (optionally) a manager agent session. It is deliberately not a
+ * project: a project is one repo/agentbox.yaml root a box is built from, while a
+ * workspace is the unit a human (and its managers) plan across.
+ *
+ * `id` is `hashProjectPath(root)` — the same key space as the project registry,
+ * so a single-project folder registered as both shares one id and a client can
+ * join the two without a lookup table.
+ */
+export interface WorkspaceRecord {
+  id: string;
+  name: string;
+  /** Absolute, realpath'd folder. */
+  root: string;
+  /** Project ids (`hashProjectPath`) discovered under `root` and registered. */
+  projectIds: string[];
+  /**
+   * Monotonic counter behind `T-<n>` task ids. Never decremented, so a deleted
+   * task's id is not handed to a later one — stale references in a manager
+   * transcript or a PR body must not silently resolve to different work.
+   */
+  taskCounter: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** API view of a workspace: the record minus its internal id counter. */
+export type Workspace = Omit<WorkspaceRecord, 'taskCounter'>;
+
+export type WorkTaskStatus = 'todo' | 'in_progress' | 'blocked' | 'done';
+
+export const WORK_TASK_STATUSES: readonly WorkTaskStatus[] = [
+  'todo',
+  'in_progress',
+  'blocked',
+  'done',
+];
+
+export type WorkTaskCreatedBy = 'human' | 'manager' | 'api';
+
+/**
+ * Where this task came from in an external tracker. One ticket routinely becomes
+ * several local tasks, so this is a back-reference, never an identity.
+ */
+export interface WorkTaskExternalRef {
+  kind: 'linear' | (string & {});
+  id: string;
+  url?: string;
+}
+
+/**
+ * A unit of work. Owned by a workspace; optionally scoped to one project and
+ * assigned to one box. Many tasks map to a single box on purpose — the manager
+ * groups tasks that touch the same files so they share a branch instead of
+ * racing for it.
+ */
+export interface WorkTask {
+  /** `T-<n>`, unique within the workspace. */
+  id: string;
+  workspaceId: string;
+  projectId?: string;
+  title: string;
+  description?: string;
+  status: WorkTaskStatus;
+  /** Position in the list. The list order IS the priority. */
+  order: number;
+  boxId?: string;
+  /**
+   * A create job that has not produced a box id yet. Mutually exclusive with
+   * `boxId`: reconciliation promotes one to the other once the worker records
+   * the box, so a task assigned at create time is never orphaned by the gap.
+   */
+  boxJobId?: string;
+  /** The manager session this task belongs to. Inherited from its box on assignment. */
+  managerId?: string;
+  dependsOn?: string[];
+  createdBy: WorkTaskCreatedBy;
+  externalRef?: WorkTaskExternalRef;
+  createdAt: string;
+  updatedAt: string;
+  doneAt?: string;
+}
+
+/** On-disk shape of `tasks.json`. */
+export interface TaskFile {
+  version: 1;
+  tasks: WorkTask[];
+}
+
+/**
+ * The agent a manager runs. Open (`AgentId`), not an enumeration: which agents
+ * exist is a runtime fact — `agentbox agent add` registers more — and the API's
+ * accept-list is the hub's request validator, not this type.
+ */
+export type ManagerAgent = AgentId;
+
+/**
+ * `external` is a session the user runs in their own terminal — the hub only
+ * observes it, through detection. `hub` is one the hub started (or resumed) in a
+ * tmux session it owns, so it can also be attached to and stopped.
+ */
+export type ManagerKind = 'external' | 'hub';
+
+/**
+ * A manager is a HOST agent session that orchestrates boxes: many per workspace.
+ * It is registered when the `agentbox` CLI runs inside it (detection), or when
+ * the hub starts one.
+ */
+export interface ManagerRecord {
+  /** 16 hex, random: a hub-run manager has no session id until it is detected. */
+  id: string;
+  workspaceId: string;
+  agent: ManagerAgent;
+  kind: ManagerKind;
+  /** Realpath of the folder the session runs in — where a resume must run. */
+  cwd: string;
+  /** Claude session uuid / codex thread uuid. */
+  sessionId?: string;
+  /** Cached first-turn title, scraped lazily from the agent's own store. */
+  title?: string;
+  /** `os.hostname()` of the process; a pid is only probed when this matches the hub's. */
+  host?: string;
+  /** External only. */
+  pid?: number;
+  /**
+   * External only: the pid's start time, recorded when the detect came from the
+   * hub's own machine. A live pid with a different start time is a reused pid.
+   */
+  pidStartedAt?: string;
+  /**
+   * External only: `$TMUX_PANE` of the session's terminal when it runs inside
+   * tmux. The only way the hub can type into a session it did not start.
+   */
+  tmuxPane?: string;
+  /** Hub only. */
+  tmuxSession?: string;
+  /** Hub only: what was started, so a restart can reuse it. */
+  argv?: string[];
+  /** Boxes this session created. Reconciled on read: dropped when the box is gone. */
+  boxIds: string[];
+  /** Create jobs that have not produced a box yet; promoted to `boxIds` on read. */
+  boxJobIds: string[];
+  createdAt: string;
+  lastSeenAt: string;
+  startedAt?: string;
+  stoppedAt?: string;
+  lastExit?: number;
+}
+
+/** On-disk shape of `managers.json`. */
+export interface ManagerFile {
+  version: 1;
+  managers: ManagerRecord[];
+}
+
+/** Derived from the process (tmux session or pid), never stored. */
+export type ManagerStatus = 'running' | 'stopped';
+
+/** Why a manager cannot be resumed right now. */
+export type ManagerResumeBlock = 'running' | 'other-host' | 'unsupported-agent' | 'no-session';
+
+export interface ManagerView extends Omit<ManagerRecord, 'argv'> {
+  status: ManagerStatus;
+  /**
+   * Whether a resume would be accepted now: false while it runs, without a
+   * session id, for an agent we cannot resume, and for a session that ran on
+   * another machine (its transcript is not on the hub's disk).
+   */
+  resumable: boolean;
+  /** Why `resumable` is false; absent when it is true. */
+  resumeBlockedBy?: ManagerResumeBlock;
+  /**
+   * Ready-to-run attach command: a running hub-run manager's tmux session, or the
+   * hub's attach session for a Claude background session while that session is up.
+   */
+  attachCommand?: string;
+  /**
+   * Set when this claude manager's session is a live Claude Code background session
+   * (`claude --bg`, listed by `claude agents`). `POST /managers/{id}/attach` opens it
+   * in a hub tmux session; the session itself runs in Claude's own daemon.
+   */
+  background?: ManagerBackground;
+  /**
+   * A running external manager's likely terminal: the one AgentBox tmux session
+   * (`agentbox-manager-*`) that starts in its folder and no manager owns. Offered
+   * to open, never adopted — nothing ties the session to this manager for sure.
+   */
+  terminalSession?: string;
+  workspaceName: string;
+  /** Tasks whose `managerId` is this manager. */
+  taskCounts: { open: number; done: number };
+}
+
+/** A Claude Code background session, as `claude agents --json` reports it. */
+export interface ManagerBackground {
+  /** The short id `claude attach` takes. */
+  id: string;
+  /** `busy`, `idle`, `waiting`, … */
+  status?: string;
+  /** `working`, `done`, … */
+  state?: string;
+  name?: string;
+}
+
+/** One resumable agent session found in the host agent's own store. */
+export interface HostSession {
+  id: string;
+  agent: string;
+  title: string;
+  updatedAt: string;
+}
+
+// ── timeline ──
+
+export type TimelineEventType =
+  | 'task.created'
+  | 'task.status'
+  | 'task.assigned'
+  | 'task.unassigned'
+  | 'task.removed'
+  | 'manager.joined'
+  | 'manager.started'
+  | 'manager.resumed'
+  | 'manager.stopped'
+  | 'manager.note'
+  | 'manager.message'
+  | 'box.created'
+  | 'box.ready'
+  | 'box.failed'
+  | 'box.started'
+  | 'box.stopped'
+  | 'box.destroyed'
+  | 'box.branch'
+  | 'git.push'
+  | 'pr.opened'
+  | 'pr.ready'
+  | 'pr.merged'
+  | 'pr.closed';
+
+export type TimelineActor = 'human' | 'manager' | 'box' | 'hub' | 'github';
+
+export type TimelineNoteKind = 'note' | 'replan' | 'plan';
+
+export type TimelineChecks = 'pass' | 'fail' | 'pending' | 'none';
+
+export interface TimelinePr {
+  /** `owner/name`. */
+  repo: string;
+  number: number;
+  title: string;
+  url: string;
+  base: string;
+  head: string;
+  additions?: number;
+  deletions?: number;
+  checks?: TimelineChecks;
+  mergeState?: string;
+  autoMerge?: boolean;
+  mergedBy?: string;
+}
+
+/**
+ * One line of a workspace's append-only `timeline.jsonl`. Current state lives in
+ * tasks/managers/boxes and is overwritten; this is the only record of what
+ * happened, so every field is captured at write time rather than joined later.
+ */
+export interface TimelineEvent {
+  /** Time-sortable: zero-padded base-36 milliseconds, then a random suffix. */
+  id: string;
+  at: string;
+  type: TimelineEventType;
+  actor: TimelineActor;
+  managerId?: string;
+  turn?: number;
+  prompt?: string;
+  boxId?: string;
+  boxName?: string;
+  agent?: string;
+  branch?: string;
+  /**
+   * The branch the work started from: `box.created`/`box.ready`, the branch the
+   * box forked from; `box.branch`, the branch it switched away from.
+   */
+  base?: string;
+  projectId?: string;
+  /** Captured at write time: reconciliation later clears a task's box pointer. */
+  taskIds?: string[];
+  task?: { id: string; title: string; from?: WorkTaskStatus; to?: WorkTaskStatus };
+  pr?: TimelinePr;
+  /** A note's text, or the message sent to a manager. */
+  text?: string;
+  noteKind?: TimelineNoteKind;
+  /** `task.assigned`: the box was already running, i.e. it was given more work. */
+  boxRunning?: boolean;
+  /** `git.push`: lines the push added and removed, read from the host repo when it was recorded. */
+  additions?: number;
+  deletions?: number;
+  /** Dedupe key: an append carrying a key already in the log is a no-op. */
+  key?: string;
+}
+
+/** Who did something, as a mutation's caller knows it. */
+export interface TimelineStamp {
+  actor: TimelineActor;
+  managerId?: string;
+  turn?: number;
+  prompt?: string;
+}
+
+/** Roll-up of a box's assigned tasks, for a box row in a list. */
+export interface BoxTaskSummary {
+  total: number;
+  done: number;
+  /** The task the box is working now (or would work next); null when all done. */
+  current: { id: string; title: string } | null;
+}

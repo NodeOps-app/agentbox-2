@@ -316,3 +316,18 @@ export {
   type WorkingAgentState,
   type WorkingSlotEntry,
 } from './queue.js';
+
+// Workspaces: the folder that groups projects, its task list, and the host-local
+// manager agent session. Exported as one surface — the hub's workspace backend
+// slice is the only consumer and it needs all three together.
+export * from './workspaces/index.js';
+export {
+  prMergeRepo,
+  prMergeTarget,
+  prViewArgs,
+  recordBoxGhResult,
+  recordBoxGitPush,
+  recordCreateJobTimeline,
+  type BoxTimelineContext,
+  type GitPushOrigin,
+} from './timeline-hooks.js';

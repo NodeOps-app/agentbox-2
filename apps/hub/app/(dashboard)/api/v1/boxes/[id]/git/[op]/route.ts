@@ -3,6 +3,7 @@
 // Mutations need the in-process host backend; the Postgres/plane path 503s.
 import type { BoxOpResult } from '@/lib/boxes/backend-types';
 import { backendOrNull } from '../../../../lib/backend';
+import { timelineMeta } from '../../../../lib/actor';
 import { fail, failFromAction, ok } from '../../../../lib/envelope';
 import {
   GIT_OPS,
@@ -35,6 +36,7 @@ export async function POST(
   }
   const backend = backendOrNull();
   if (!backend) return fail('backend_unavailable', 'hub backend unavailable (run the hub server)');
+  const meta = await timelineMeta(req, backend);
 
   const parsedBody = await readJson(req);
   if (!parsedBody.ok) return fail('invalid_request', parsedBody.message);
@@ -45,13 +47,13 @@ export async function POST(
     case 'checkout': {
       const p = parseGitCheckout(body);
       if (!p.ok) return fail('invalid_request', p.message, p.details);
-      res = await backend.gitCheckout(id, p.value.branch, p.value.args);
+      res = await backend.gitCheckout(id, p.value.branch, p.value.args, meta);
       break;
     }
     case 'branch': {
       const p = parseGitBranch(body);
       if (!p.ok) return fail('invalid_request', p.message, p.details);
-      res = await backend.gitNewBranch(id, p.value);
+      res = await backend.gitNewBranch(id, p.value, meta);
       break;
     }
     case 'pull': {
@@ -63,13 +65,13 @@ export async function POST(
     case 'push': {
       const p = parseGitPush(body);
       if (!p.ok) return fail('invalid_request', p.message, p.details);
-      res = await backend.gitPush(id, p.value);
+      res = await backend.gitPush(id, p.value, meta);
       break;
     }
     case 'push-host': {
       const p = parseGitPushHost(body);
       if (!p.ok) return fail('invalid_request', p.message, p.details);
-      res = await backend.gitPushHost(id, p.value);
+      res = await backend.gitPushHost(id, p.value, meta);
       break;
     }
   }

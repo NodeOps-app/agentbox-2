@@ -1,5 +1,24 @@
-import type { HubState, ProviderOption, ProviderSizeCheck } from './types';
+import type {
+  HubState,
+  ManagerView,
+  ProviderOption,
+  ProviderSizeCheck,
+  WorkspaceView,
+} from './types';
 import type { AgentId } from '@agentbox/core';
+import type {
+  BoxTaskSummary,
+  HostSession,
+  ManagerStatus,
+  TimelineEvent,
+  TimelineEventType,
+  TimelineNoteKind,
+  TimelinePr,
+  TimelineStamp,
+  WorkTask,
+  WorkTaskExternalRef,
+  WorkTaskStatus,
+} from '@agentbox/relay';
 
 // Result of a lifecycle server action.
 export type ActionResult = { ok: true } | { ok: false; error: string };
@@ -293,6 +312,9 @@ export interface CreateBoxInput {
   setupWizard?: boolean;
   // Box-shaping knobs the CLI resolved (see CreateBoxOpts). Absent for a web-UI create.
   opts?: CreateBoxOpts;
+  // The manager session the create came from; the job is attached to it so the
+  // box groups under that manager. Absent for a web-UI / tray create.
+  managerId?: string;
 }
 
 // Branch listing for a project's create-box base-branch picker: the current
@@ -485,7 +507,7 @@ export type BoxLogAttachSpec =
 // actions.ts) reaches it ONLY through that global, so the heavy Node/docker
 // packages never enter Next's bundle. This is a pure-type module (no runtime
 // imports) so both the implementation and the ambient global can share it.
-export interface HubBackend {
+export interface HubBackend extends WorkspaceBackend, ManagerBackend, TimelineBackend {
   // authMode is an env-derived concern layered on by source.ts, not the host
   // backend — so the backend produces everything else. `live` (opt-in, expensive
   // — mirrors providers' `?freshness=1`) refreshes each cloud box's `state` with
@@ -496,13 +518,17 @@ export interface HubBackend {
   // IO (it reads the box's per-box session pointers and relaunches a detached
   // tmux over exec), which stays on the direct IO plane — the CLI layers it on
   // after this returns, the way it layers its own-machine ssh-config write.
-  start(id: string): Promise<ActionResult>;
-  pause(id: string): Promise<ActionResult>;
-  resume(id: string): Promise<ActionResult>;
-  stop(id: string): Promise<ActionResult>;
+  start(id: string, meta?: TimelineMeta): Promise<ActionResult>;
+  pause(id: string, meta?: TimelineMeta): Promise<ActionResult>;
+  resume(id: string, meta?: TimelineMeta): Promise<ActionResult>;
+  stop(id: string, meta?: TimelineMeta): Promise<ActionResult>;
   // `keepSnapshot` preserves a docker box's local snapshot dir (the CLI's
   // `--keep-snapshot`); default (false) deletes it, matching `agentbox destroy`.
-  destroy(id: string, opts?: { keepSnapshot?: boolean }): Promise<ActionResult>;
+  destroy(
+    id: string,
+    opts?: { keepSnapshot?: boolean },
+    meta?: TimelineMeta,
+  ): Promise<ActionResult>;
   // Set (or clear, when displayName is empty) a box's cosmetic display label.
   // Pure state — does not touch the container, git branch, or URL.
   rename(id: string, displayName: string): Promise<ActionResult>;
@@ -543,7 +569,7 @@ export interface HubBackend {
   // remote-docker entry with one `docker:<alias>` option per registered host.
   providersWithFreshness(opts?: { expandRemoteDockerHosts?: boolean }): Promise<ProviderOption[]>;
   // Enqueue a background create job for a registered project; returns the jobId.
-  create(input: CreateBoxInput): Promise<CreateBoxResult>;
+  create(input: CreateBoxInput, meta?: TimelineMeta): Promise<CreateBoxResult>;
   // What would a create for this project + agent ask the user? Runs the real
   // gates with a collecting asker, so the questions returned here are by
   // construction the questions `create` asks.
@@ -604,14 +630,24 @@ export interface HubBackend {
   // ── box git operations ──
   // Change the box's working branch (git checkout, local to the worktree).
   // `args` are extra flags forwarded to `git checkout` (e.g. a pathspec).
-  gitCheckout(id: string, branch: string, args?: string[]): Promise<BoxOpResult>;
+  gitCheckout(
+    id: string,
+    branch: string,
+    args?: string[],
+    meta?: TimelineMeta,
+  ): Promise<BoxOpResult>;
   // Create a fresh agentbox/* branch from HEAD (or `from`) and switch onto it.
-  gitNewBranch(id: string, input: { name: string; from?: string }): Promise<BoxOpResult>;
+  gitNewBranch(
+    id: string,
+    input: { name: string; from?: string },
+    meta?: TimelineMeta,
+  ): Promise<BoxOpResult>;
   // Push the box's branch to the remote via the host relay. `args` are extra
   // flags forwarded to the host-built `git push` (e.g. --tags, --force-with-lease).
   gitPush(
     id: string,
     input?: { remote?: string; force?: boolean; args?: string[] },
+    meta?: TimelineMeta,
   ): Promise<BoxOpResult>;
   // Fetch via the relay then merge locally in the box. `args` forward to the op.
   gitPull(
@@ -622,6 +658,7 @@ export interface HubBackend {
   gitPushHost(
     id: string,
     input?: { as?: string; force?: boolean; args?: string[] },
+    meta?: TimelineMeta,
   ): Promise<BoxOpResult>;
   // Live git summary (current branch + dirty/ahead/behind) for the detail panel.
   getGit(id: string): Promise<GitInfo>;
@@ -936,4 +973,312 @@ export interface RemoteDockerHostView {
    * shared with it rather than registered from its own `~/.ssh/config`.
    */
   managedKey?: boolean;
+}
+
+// ── workspaces / tasks / manager ──
+
+/** Who made a mutation (for the timeline), and the note explaining it, if any. */
+export interface TimelineMeta {
+  stamp?: TimelineStamp;
+  /**
+   * The caller's `X-AgentBox-Session`, not yet resolved: set instead of `stamp`
+   * when the route does not know the workspace, which the backend resolves it in.
+   */
+  session?: { agent: string; sessionId: string };
+  note?: string;
+}
+
+/**
+ * Where a row sits when the timeline is drawn as a branch graph. Added at read
+ * time over the whole log, so a lane keeps its id and fork on every page.
+ */
+export interface TimelineLane {
+  /** `trunk`, `box:<boxId>`, or `branch:<head>` for a pull request no box is known to own. */
+  id: string;
+  kind: 'trunk' | 'box' | 'branch';
+  /** On the lane's oldest row: the lane it forked from. */
+  from?: string;
+  /** `pr.merged`: the lane it merged into. The row itself stays on its own lane. */
+  into?: string;
+  /** The lane's branch, on its first row and on every row where it changes. */
+  branch?: string;
+  /** On the lane's newest item and on its live rows: the lane goes on past that row. */
+  open?: boolean;
+}
+
+/** A timeline row: an event, or a `plan` that several `task.created` events collapsed into. */
+export interface TimelineItem extends Omit<TimelineEvent, 'type'> {
+  type: TimelineEventType | 'plan';
+  /** `plan`: how many tasks it created. */
+  count?: number;
+  /** `pr.merged`: a message about this PR was sent to the manager before it merged. */
+  approvedByYou?: boolean;
+  /** The branch on the web (`…/tree/<branch>`); added at read time, only when its GitHub repo is known. */
+  branchUrl?: string;
+  lane?: TimelineLane;
+}
+
+/** A row that is true now, built at read time and never stored. */
+export interface TimelineLiveItem {
+  id: string;
+  type: 'task.in_progress' | 'pr.ready';
+  at: string;
+  boxId?: string;
+  boxName?: string;
+  agent?: string;
+  branch?: string;
+  /** As on {@link TimelineItem}. */
+  branchUrl?: string;
+  managerId?: string;
+  task?: { id: string; title: string };
+  taskIds?: string[];
+  /** `task.in_progress` on a running box: its uncommitted diff. */
+  filesChanged?: number;
+  additions?: number;
+  deletions?: number;
+  pr?: TimelinePr;
+  /** `pr.ready`: waiting for someone to approve the merge. */
+  awaiting?: boolean;
+  /** `pr.ready`: a message about it was already sent to the manager. */
+  approved?: boolean;
+  /** As on {@link TimelineItem}; always `open`. */
+  lane?: TimelineLane;
+}
+
+export interface TimelineSummary {
+  since: string;
+  merged: number;
+  additions: number;
+  deletions: number;
+  tasksDone: number;
+  /** Ready PRs nobody approved yet, plus pending approvals on the workspace's boxes. */
+  awaiting: number;
+}
+
+export interface TimelineResponse {
+  items: TimelineItem[];
+  live: TimelineLiveItem[];
+  summary?: TimelineSummary;
+  github: 'ok' | 'syncing' | 'unavailable';
+}
+
+export interface TimelineQuery {
+  before?: string;
+  since?: string;
+  limit?: number;
+  /** `false`: report the GitHub sync's last status without starting one (a frequent, cheap read). */
+  sync?: boolean;
+}
+
+export type ManagerNoteResult = { ok: true; event: TimelineEvent } | { ok: false; error: string };
+
+/** How a message reached the manager: its hub tmux session, its terminal's pane, or a resume. */
+export type ManagerMessageDelivery = 'session' | 'pane' | 'resumed';
+
+export type ManagerMessageResult =
+  | {
+      ok: true;
+      delivered: ManagerMessageDelivery;
+      manager: ManagerView;
+      event: TimelineEvent | null;
+    }
+  | { ok: false; error: string; code?: 'manager_unreachable' };
+
+/** The timeline domain slice (`lib/backend/timeline.ts`). */
+export interface TimelineBackend {
+  /** `null` = unknown workspace. */
+  getTimeline(wsId: string, q?: TimelineQuery): Promise<TimelineResponse | null>;
+}
+
+export type WorkspaceResult = { ok: true; workspace: WorkspaceView } | { ok: false; error: string };
+/** `invalid`: the request itself is wrong (400), not the resource's state (409). */
+export type TaskResult =
+  | { ok: true; task: WorkTask }
+  | { ok: false; error: string; invalid?: true };
+export type TasksResult = { ok: true; tasks: WorkTask[] } | { ok: false; error: string };
+export type ManagerResult =
+  | {
+      ok: true;
+      manager: ManagerView;
+      /** Said with a stop that left the agent's session running (Claude's background daemon). */
+      notice?: string;
+    }
+  | { ok: false; error: string };
+export type DetectManagerResult =
+  | { ok: true; manager: ManagerView; workspace: WorkspaceView; created: boolean }
+  | { ok: false; error: string; invalid?: true };
+
+/** What `listResumableHostSessions` answers: the picker's rows, plus whether this agent has any. */
+export interface ManagerSessionsResult {
+  agent: string;
+  /** False when this agent's on-disk session format is not one we can resume. */
+  supported: boolean;
+  sessions: HostSession[];
+}
+
+export interface TaskFilter {
+  projectId?: string;
+  boxId?: string;
+  status?: WorkTaskStatus;
+  managerId?: string;
+}
+
+export interface AddTaskInput {
+  title: string;
+  description?: string;
+  projectId?: string;
+  dependsOn?: string[];
+  createdBy?: WorkTask['createdBy'];
+  externalRef?: WorkTaskExternalRef;
+  boxId?: string;
+  boxJobId?: string;
+  managerId?: string;
+}
+
+export interface UpdateTaskInput {
+  title?: string;
+  description?: string;
+  status?: WorkTaskStatus;
+  /** `null` clears the project scope; `undefined` leaves it as it was. */
+  projectId?: string | null;
+  dependsOn?: string[];
+  externalRef?: WorkTaskExternalRef;
+  /** `null` clears the manager; `undefined` leaves it as it was. */
+  managerId?: string | null;
+}
+
+/** A box that exists, or the create job that will become one. */
+export type AssignTarget = { boxId: string } | { boxJobId: string };
+
+export interface StartManagerInput {
+  /** An agent the hub's registry knows. There is no free-form command: the
+   *  manager runs on the HUB'S machine, not inside a box. */
+  agent: string;
+  /** Resume this session. One an existing manager already holds resumes THAT manager. */
+  sessionId?: string;
+  /** With a `sessionId` whose hub-run manager is running: restart it instead of refusing. */
+  restart?: boolean;
+}
+
+/** What the CLI sends from inside a host agent session. */
+export interface DetectManagerInput {
+  agent: string;
+  sessionId: string;
+  /** Absolute folder the session runs in, on the caller's machine. */
+  cwd: string;
+  pid?: number;
+  host?: string;
+  /** `$AGENTBOX_MANAGER`: set inside a hub-run manager's own session. */
+  managerId?: string;
+  /** `$TMUX_PANE` of the session's terminal, so a message can be typed into it. */
+  tmuxPane?: string;
+  /**
+   * The AgentBox tmux session (`agentbox-manager-*`) the caller runs in. The hub
+   * checks it exists here and starts in `cwd`, then records the manager as run
+   * from it.
+   */
+  tmuxSession?: string;
+  /** A box (or create job) this session just made, attached in the same call. */
+  boxId?: string;
+  boxJobId?: string;
+}
+
+export interface ManagerFilter {
+  workspaceId?: string;
+  status?: ManagerStatus;
+}
+
+/**
+ * The manager domain slice (`lib/backend/managers.ts`): host agent sessions
+ * that orchestrate boxes, many per workspace.
+ */
+export interface ManagerBackend {
+  /** Register (or refresh) the session a CLI call came from, creating its workspace if none contains it. */
+  detectManager(input: DetectManagerInput): Promise<DetectManagerResult>;
+  listManagers(filter?: ManagerFilter): Promise<ManagerView[]>;
+  getManager(id: string): Promise<ManagerView | null>;
+  /** `null` = unknown workspace. */
+  listWorkspaceManagers(wsId: string): Promise<ManagerView[] | null>;
+  startManager(wsId: string, input: StartManagerInput, meta?: TimelineMeta): Promise<ManagerResult>;
+  resumeManager(id: string, meta?: TimelineMeta): Promise<ManagerResult>;
+  stopManager(id: string, meta?: TimelineMeta): Promise<ManagerResult>;
+  /**
+   * Open a claude manager's detached Claude background session in a hub tmux
+   * session (`claude attach`). The record's kind and session are unchanged.
+   */
+  attachManager(id: string): Promise<ManagerResult>;
+  /**
+   * The timeline stamp for a session (the CLI's `X-AgentBox-Session`) or a
+   * manager id: its manager, turn and that turn's prompt. With `wsId`, only a
+   * manager of that workspace. Never writes.
+   */
+  timelineStamp(
+    ref: { agent: string; sessionId: string } | { managerId: string },
+    wsId?: string,
+  ): Promise<TimelineStamp | undefined>;
+  /** Record a manager note, stamped with the manager's current turn. */
+  addManagerNote(
+    id: string,
+    input: { text: string; kind?: TimelineNoteKind },
+  ): Promise<ManagerNoteResult>;
+  /** Type a message into the manager's session (resuming a stopped one with it). */
+  sendManagerMessage(
+    id: string,
+    input: { text: string; prNumber?: number; repo?: string },
+    meta?: TimelineMeta,
+  ): Promise<ManagerMessageResult>;
+  /** Forget a manager record. Refused while it runs, unless `force`. */
+  removeManager(id: string, opts?: { force?: boolean }): Promise<ActionResult>;
+  listManagerSessions(wsId: string, agent?: string): Promise<ManagerSessionsResult | null>;
+  /** Record that a manager's create produced this job. Best-effort from `create()`. */
+  attachJob(managerId: string, jobId: string): Promise<ActionResult>;
+  /** boxId | create-job id -> managerId, for `Box.managerId` in getData(). */
+  managerByBox(): Promise<Map<string, string>>;
+}
+
+/**
+ * The workspace domain slice (`lib/backend/workspaces.ts`). Split out of the
+ * monolithic backend so new domains land in their own file; `HubBackend`
+ * extends it, so callers still see one object.
+ */
+export interface WorkspaceBackend {
+  listWorkspaces(): Promise<WorkspaceView[]>;
+  getWorkspace(id: string): Promise<WorkspaceView | null>;
+  /** Register a folder (absolute, on the hub's machine) and its projects. Idempotent. */
+  addWorkspace(input: { path: string; name?: string }): Promise<WorkspaceResult>;
+  rescanWorkspace(id: string): Promise<WorkspaceResult>;
+  renameWorkspace(id: string, name: string): Promise<WorkspaceResult>;
+  /** Unregister. The folder, its projects and their boxes are untouched. Refused while a manager runs, unless `force`. */
+  removeWorkspace(id: string, opts?: { force?: boolean }): Promise<ActionResult>;
+
+  /** `null` = unknown workspace (so a route can answer 404 rather than an empty list). */
+  listTasks(wsId: string, filter?: TaskFilter): Promise<WorkTask[] | null>;
+  listAllTasks(filter?: TaskFilter & { workspaceId?: string }): Promise<WorkTask[]>;
+  getTask(wsId: string, taskId: string): Promise<WorkTask | null>;
+  addTask(wsId: string, input: AddTaskInput, meta?: TimelineMeta): Promise<TaskResult>;
+  updateTask(
+    wsId: string,
+    taskId: string,
+    patch: UpdateTaskInput,
+    meta?: TimelineMeta,
+  ): Promise<TaskResult>;
+  completeTask(wsId: string, taskId: string, meta?: TimelineMeta): Promise<TaskResult>;
+  removeTask(wsId: string, taskId: string, meta?: TimelineMeta): Promise<ActionResult>;
+  assignTasks(
+    wsId: string,
+    ids: string[],
+    target: AssignTarget,
+    meta?: TimelineMeta,
+  ): Promise<TasksResult>;
+  unassignTasks(wsId: string, ids: string[], meta?: TimelineMeta): Promise<TasksResult>;
+  /** `ids` must be an exact permutation of the workspace's tasks. */
+  reorderTasks(wsId: string, ids: string[], meta?: TimelineMeta): Promise<TasksResult>;
+
+  /** projectId -> workspaceId, for `Project.workspaceId` in getData(). */
+  workspaceIdByProject(): Promise<Map<string, string>>;
+  /** Task roll-ups for `Box.tasks`, keyed by box id and by pending create-job id. */
+  taskSummaries(): Promise<{
+    byBox: Map<string, BoxTaskSummary>;
+    byJob: Map<string, BoxTaskSummary>;
+  }>;
 }

@@ -258,6 +258,9 @@ export async function getPostgresDashboardData(): Promise<Omit<HubState, 'authMo
 
   return {
     user: { login: 'hub', name: 'hub' },
+    // Workspaces (and their tasks) are host-machine state: the hosted DB view
+    // holds none, and an empty list is the honest answer, not a missing field.
+    workspaces: [],
     github: {
       available: false,
       installed: false,

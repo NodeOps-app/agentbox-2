@@ -32,6 +32,12 @@ import { warnCheckpointAgentMismatch } from '../../checkpoint-lookup.js';
 import { assertAgentCredsAvailable, MissingAgentCredsError } from '../../lib/queue/assert-creds.js';
 import { buildPromptArgs } from '../../lib/queue/build-prompt-args.js';
 import { cloudSizingProviderOptions } from '../../lib/cloud-sizing.js';
+import {
+  assignTasksBestEffort,
+  parseTaskIdsOrExit,
+  preflightOrExit,
+} from '../../lib/tasks-assign.js';
+import { withHubClient, withHubClientQuiet } from '../../control-plane/with-hub.js';
 import { parseMaxOption } from '../../lib/queue/parse-max-option.js';
 import { submitQueueJob } from '../../lib/queue/submit.js';
 import { captureOpenTerminalContext } from '../../terminal/queue-open.js';
@@ -73,6 +79,7 @@ import { isolateOptionKey, type AgentCreateOptions } from './options.js';
 import { RESUME_SEED } from '@agentbox/cli-kit';
 import type { AgentCliSpec, AgentCreateContext, AgentPreflight } from '@agentbox/cli-kit';
 import { makeHostServices } from './host-services.js';
+import { detectHostSession, registerHostManager } from '../../lib/host-session.js';
 
 /** Config overrides the create flags produce; the per-agent keys are delegated. */
 function buildCliOverrides(a: AgentCliSpec, opts: AgentCreateOptions): Partial<UserConfig> {
@@ -209,6 +216,44 @@ export async function runAgentCreate(
   });
   const cfg = cfgLoaded.effective;
   const projectRoot = (await findProjectRoot(opts.workspace)).root;
+  // `--tasks`: validated against the hub BEFORE any box work, so a typo costs
+  // nothing. `assignTasks` is called with whichever handle the chosen create
+  // path ends up holding — a job id (queued/hub create) or a box id (inline).
+  const taskIds = opts.tasks ? parseTaskIdsOrExit(opts.tasks) : [];
+  let taskWorkspaceId: string | null = null;
+  if (taskIds.length > 0) {
+    taskWorkspaceId =
+      (await withHubClient({ preferLocal: true }, (client) =>
+        preflightOrExit(client, projectRoot, taskIds),
+      )) ?? null;
+    if (!taskWorkspaceId) process.exit(process.exitCode || 1);
+  }
+  // Inside a claude/codex session, whatever this create produces groups under
+  // that session. Detected once, up front: the env it reads does not change.
+  const sessionHint = detectHostSession();
+  /**
+   * Record what the create produced: under the current session's manager, then
+   * against `--tasks` (in that order, so the tasks inherit the manager). Never
+   * fails the create.
+   */
+  const recordCreate = async (target: { boxId: string } | { boxJobId: string }): Promise<void> => {
+    if (sessionHint) {
+      // Quiet: a docker create never needed the hub, so an unreachable one must
+      // not print an error, set a failing exit code, or get auto-started here.
+      const registered = await withHubClientQuiet({ preferLocal: true }, (client) =>
+        registerHostManager(client, sessionHint, target),
+      );
+      if (!registered.ok) {
+        log.warn(
+          `could not register this ${sessionHint.agent} session as a manager: ${registered.error}`,
+        );
+      }
+    }
+    if (!taskWorkspaceId) return;
+    await withHubClient({ preferLocal: true }, (client) =>
+      assignTasksBestEffort(client, taskWorkspaceId!, taskIds, target),
+    );
+  };
   // Resolve provider. The cloud path skips docker-only steps (login offer,
   // Portless, createBox) and delegates to cloudAgentCreate.
   const { providerName, remoteHost } = resolveProviderChoice(cfg, { provider: opts.provider });
@@ -397,6 +442,7 @@ export async function runAgentCreate(
             1,
           );
         }
+        if (res.boxId) await recordCreate({ boxId: res.boxId });
         outro(`${a.id} is running on the control plane: box ${res.boxId ?? '(id pending)'}`);
         cmdLog.close();
         return;
@@ -442,6 +488,7 @@ export async function runAgentCreate(
       maxWorkingOverride,
       openTerminal: captureOpenTerminalContext(cfg.queue.openIn),
     });
+    await recordCreate({ boxJobId: result.job.id });
     outro(
       `job ${result.job.id} queued (${String(result.runningCount)}/${String(result.maxConcurrent)} running); log: ${result.job.logPath}`,
     );
@@ -635,6 +682,7 @@ export async function runAgentCreate(
         { verbose: opts.verbose === true },
       );
       if (adopted) {
+        await recordCreate({ boxId: adopted.id });
         await cloudAgentAttach({
           box: adopted,
           binary: a.spec.binary,
@@ -693,6 +741,7 @@ export async function runAgentCreate(
       binary: a.spec.binary,
       sessionName,
       mode: a.id,
+      onCreated: (box) => recordCreate({ boxId: box.id }),
       hasSeedPrompt: seedOwnsFirstTurn,
       extraArgs: effectiveArgs,
       verbose: opts.verbose === true,
@@ -772,6 +821,7 @@ export async function runAgentCreate(
       },
     });
     containerName = result.record.container;
+    await recordCreate({ boxId: result.record.id });
 
     // The agent is baked into the current base image, but a box built from a
     // checkpoint captured before that agent's support won't have it — install it

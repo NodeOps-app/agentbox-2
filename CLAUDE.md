@@ -78,14 +78,25 @@ the hub, open each box's Web/VNC, start/stop, per-box git ops (`pull`/`push`/`pu
 `checkout`/`branch`), restart services, and answer host-action approvals — without a terminal. It
 updates live over the hub's SSE stream and falls back to polling.
 
-It has **no build-time coupling** to this repo — it's a Swift Package Manager / AppKit app (Swift
-5.10, no Xcode, no external deps) that drives the two public surfaces:
+It has **no build-time coupling** to this repo — it's a Swift Package Manager / AppKit app (no
+Xcode) that drives the two public surfaces. Its one external dependency is `libghostty-spm`, the
+terminal engine embedded in the **Manager window** (the workspace's task list plus its manager's tmux
+session); building it needs a Swift 6 toolchain:
 
 - **Boxes + actions** via the local **Control Hub** REST API at `127.0.0.1:8787`: `GET /api/v1/boxes`
   (which carries the raw host-side fields — `state`, `projectRoot`, endpoint URLs, session titles —
   and the synthetic `creating`/`error` boxes for in-flight/failed creates) plus the lifecycle
   (`start`/`pause`/`resume`/`stop`/`destroy`), git, rename, and services routes. Approvals use
-  `/api/v1/approvals` (+ `…/{id}/answer`), live events the SSE `/api/events` stream. **Auth to
+  `/api/v1/approvals` (+ `…/{id}/answer`), live events the SSE `/api/events` stream.
+  The Manager window's Timeline reads `GET /api/v1/workspaces/{id}/timeline` (`{items, live, summary,
+  github}`; a row naming a branch with a known GitHub repo carries `branchUrl`, and every item and live row
+  carries `lane` — `{id: trunk|box:<id>|branch:<head>, kind, from?, into?, branch?, open?}` — for drawing the
+  timeline as a branch graph; `box.branch` rows mark a box's branch switch) and its Approve posts `POST /api/v1/managers/{id}/message` (`{text, prNumber?, repo?}`; `409`
+  `manager_unreachable` means copy the text for the user to paste). Boxes group under
+  their manager session in the menu: `Box.managerId` joins a box to a row of `GET /api/v1/managers`
+  (host claude/codex sessions, detected or hub-run; `…/{id}/resume` reopens one in the hub's tmux; `…/{id}/attach` opens a claude manager's detached Claude background session (`background` on the manager) in a hub tmux session, and a stop on one closes only that attach session), and
+  `Box.pr` (`{repo, number, url?, state: open|ready|merged|closed}`, from the workspace timeline) labels a
+  row with its pull request. **Auth to
   remember when changing the hub:** both `/api/v1/*` and `/api/events` go through the same gate
   (`apps/hub/proxy.ts`) and accept `Authorization: Bearer <token>` — a headless client (the tray
   against a remote control box) subscribes to events with the same Bearer key it uses for `/api/v1`.
@@ -125,6 +136,8 @@ Each topic has a dedicated file under [`docs/`](./docs). Read the relevant one b
 - [`docs/agents-remaining-work.md`](./docs/agents-remaining-work.md) — what is still open in the agent layer after the agents-as-packages work: the four claude-named files still in the shared packages and the one decision that blocks them (**does the hub load agent modules?** — it loads none today, so a registration seam would silently stop the hub's ssh-config prune), and the never-started bake-on-first-use UX. The live measure is `apps/cli/test/no-agent-named-exports.test.ts`, whose allowlist can only shrink.
 - [`docs/model-auth-sources-plan.md`](./docs/model-auth-sources-plan.md) — **model-auth sources**: which host model-provider credentials a box may be seeded with (`agent` — another agent's login file; `env` — a provider API key in the host env), the two ingest shapes and why a TUI agent's must run at the host's launch seam, the measured facts that decide it (a consumer CANNOT refresh a borrowed codex token, so a seeded box is renewed only by the credential fan-out; claude's OAuth blob stays non-borrowable), and the phase status.
 - [`docs/agent-settings-plan.md`](./docs/agent-settings-plan.md) — **agent settings**: an agent declares its own settings on its registry row, config generates `<agent>.<key>` keys from them (built-ins *and* `agentbox agent add` packages), and every call site carries one opaque `agentSettings` map — the agent's own recipe / `postInstall` / launch env is the only thing that knows what a setting means. `box.claudeInstall`/`box.claudeTui` are now `claude.install`/`claude.tui`.
+- [`docs/workspaces-tasks-manager-plan.md`](./docs/workspaces-tasks-manager-plan.md) — **workspaces, tasks and the manager**: a workspace is a host folder grouping several projects and owning a task list; a task is a unit of work (many map to one box, which is how the manager keeps colliding diffs on one branch); the manager is a coding agent the hub runs **locally** in that folder, in a tmux session every client attaches to. Also the home of the `apps/hub/lib/backend/<domain>.ts` split — a new backend domain goes in a slice taking a narrow `BackendDeps`, never appended to `hub-backend.ts`.
+- [`docs/workspaces-tasks-manager-backlog.md`](./docs/workspaces-tasks-manager-backlog.md) — the open items after the timeline, grouped into Phases 10a–10d (Plan dashboard, manager terminal in tmux, the compact pinnable window, push line counts + host skill), plus what was parked.
 - [`docs/bot-lifecycle-ui-plan.md`](./docs/bot-lifecycle-ui-plan.md) — **bot lifecycle in the GUIs**: bringing backup / restore / clone of a `surface: 'service'` bot to the hub web UI and the macOS tray, plus the `hasGit` / `supportsBackup` facts the box payload had to grow for them (and for hiding git UI on a box with no repo). Backup and restore move out of `apps/cli` and behind `/api/v1`; clone was already there and only needed a caller.
 - [`docs/host-tools.md`](./docs/host-tools.md) — the box→host CLI proxy: how any host CLI (`gh`, `terraform`, `aws`, `ntn`, `linear`) reaches a box through one generic shim, the request-vs-grant trust split, and the built-in credential deny list.
 - [`docs/provider-plugins.md`](./docs/provider-plugins.md) — external / community providers on the published `@madarco/agentbox-provider-sdk`, the `agentbox plugin add` registry, and the SDK-version gate.
