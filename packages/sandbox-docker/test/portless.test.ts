@@ -48,6 +48,7 @@ import {
   portlessUnalias,
   resetPortlessCache,
   resolvePortlessHostStateDir,
+  serviceLogShowsConflict,
   startPortlessProxy,
   PORTLESS_PROXY_PORT,
 } from '../src/portless.js';
@@ -361,6 +362,15 @@ describe('portlessDoctorRow', () => {
     expect(row.detail).toBe('running');
     expect(row.hint).toBeUndefined();
   });
+
+  it('warns when the startup service is installed but crash-looping', () => {
+    const row = portlessDoctorRow(
+      { installed: true, proxyRunning: true },
+      { installed: true, failing: true },
+    );
+    expect(row.status).toBe('warn');
+    expect(row.detail).toContain('startup service failing');
+  });
 });
 
 describe('portlessServiceStatus', () => {
@@ -396,6 +406,52 @@ describe('portlessServiceStatus', () => {
   it('never throws when the binary is missing', async () => {
     portlessResult = new Error('spawn portless ENOENT');
     await expect(portlessServiceStatus()).resolves.toBeDefined();
+  });
+
+  const conflict = [
+    'Proxy is already running on port 443 with a different config.',
+    '- requested HTTPS, but the running proxy is using HTTP',
+    'Stop it first, then restart with the desired settings:',
+    '  sudo portless proxy stop',
+    '  sudo portless proxy start --https',
+  ].join('\n');
+
+  const statusWith = (dir: string) =>
+    ok(['portless service', '  Installed: yes', `  State directory: ${dir}`].join('\n'));
+
+  it('reports a crash-looping service from its log', async () => {
+    await writeFile(join(stateDir, 'service.log'), conflict + '\n');
+    portlessResult = statusWith(stateDir);
+    expect(await portlessServiceStatus()).toEqual({ installed: true, failing: true });
+  });
+
+  it('ignores conflict lines older than the given moment', async () => {
+    await writeFile(join(stateDir, 'service.log'), conflict + '\n');
+    portlessResult = statusWith(stateDir);
+    const later = Date.now() + 1000;
+    expect(await portlessServiceStatus({ sinceMs: later })).toEqual({ installed: true });
+  });
+
+  it('is healthy when the log has no conflict', async () => {
+    await writeFile(join(stateDir, 'service.log'), 'proxy started on 443\n');
+    portlessResult = statusWith(stateDir);
+    expect(await portlessServiceStatus()).toEqual({ installed: true });
+  });
+});
+
+describe('serviceLogShowsConflict', () => {
+  const now = 1_000_000;
+  const line = 'Proxy is already running on port 443 with a different config.';
+
+  it('needs the conflict among the last lines of a recently written log', () => {
+    expect(serviceLogShowsConflict(line, now - 5_000, now)).toBe(true);
+    expect(serviceLogShowsConflict(line, now - 120_000, now)).toBe(false);
+    expect(serviceLogShowsConflict(`${line}\n` + 'ok\n'.repeat(10), now - 5_000, now)).toBe(false);
+  });
+
+  it('honors sinceMs', () => {
+    expect(serviceLogShowsConflict(line, now - 5_000, now, now - 1_000)).toBe(false);
+    expect(serviceLogShowsConflict(line, now - 500, now, now - 1_000)).toBe(true);
   });
 });
 

@@ -27,6 +27,7 @@ const probes = (over: {
   version?: string;
   proxyRunning?: boolean;
   serviceInstalled?: boolean;
+  serviceFailing?: boolean;
 }) => ({
   engine: () => Promise.resolve(over.engine ?? 'docker-desktop'),
   portless: () =>
@@ -35,7 +36,8 @@ const probes = (over: {
       version: over.version,
       proxyRunning: over.proxyRunning ?? true,
     }),
-  service: () => Promise.resolve({ installed: over.serviceInstalled ?? false }),
+  service: () =>
+    Promise.resolve({ installed: over.serviceInstalled ?? false, failing: over.serviceFailing }),
 });
 
 describe('buildDoctorReport', () => {
@@ -66,7 +68,17 @@ describe('buildDoctorReport', () => {
       version: '0.13.0',
       proxyRunning: true,
       serviceInstalled: false,
+      serviceFailing: false,
     });
+  });
+
+  it('flags an installed startup service that is crash-looping', async () => {
+    const report = await buildDoctorReport(
+      groups,
+      probes({ serviceInstalled: true, serviceFailing: true }),
+    );
+    expect(report.portless.serviceInstalled).toBe(true);
+    expect(report.portless.serviceFailing).toBe(true);
   });
 
   it('omits version when portless is not installed', async () => {
@@ -94,6 +106,7 @@ describe('buildDoctorReport', () => {
       installed: false,
       proxyRunning: false,
       serviceInstalled: false,
+      serviceFailing: false,
     });
   });
 });

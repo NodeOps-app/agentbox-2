@@ -475,6 +475,8 @@ export interface PortlessReport {
   version?: string;
   proxyRunning: boolean;
   serviceInstalled: boolean;
+  /** Installed but crash-looping (another proxy holds its port): it would not survive a reboot. */
+  serviceFailing: boolean;
 }
 
 /** The `agentbox doctor --json` envelope (consumed by the menu-bar app's setup wizard). */
@@ -497,7 +499,7 @@ export async function buildDoctorReport(
   probes: {
     engine: () => Promise<string>;
     portless: () => Promise<{ installed: boolean; version?: string; proxyRunning: boolean }>;
-    service: () => Promise<{ installed: boolean }>;
+    service: () => Promise<{ installed: boolean; failing?: boolean }>;
   } = {
     engine: () => detectEngine(),
     portless: () => detectPortless(),
@@ -508,7 +510,7 @@ export async function buildDoctorReport(
   const [engine, state, service] = await Promise.all([
     probes.engine().catch(() => 'other'),
     probes.portless().catch(() => noPortless),
-    probes.service().catch(() => ({ installed: false })),
+    probes.service().catch(() => ({ installed: false, failing: false })),
   ]);
   return {
     version: AGENTBOX_VERSION,
@@ -521,6 +523,7 @@ export async function buildDoctorReport(
       ...(state.version ? { version: state.version } : {}),
       proxyRunning: state.proxyRunning,
       serviceInstalled: service.installed,
+      serviceFailing: service.installed && service.failing === true,
     },
   };
 }

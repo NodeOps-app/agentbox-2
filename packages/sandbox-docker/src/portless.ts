@@ -1,5 +1,5 @@
 import { existsSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { connect } from 'node:net';
@@ -84,6 +84,34 @@ export interface PortlessState {
 export interface PortlessServiceState {
   /** A boot-time service is registered, so the proxy comes back after a reboot. */
   installed: boolean;
+  /**
+   * The registered service is crash-looping because another proxy already holds its
+   * port (Portless's own "already running on port … with a different config" exit),
+   * so it would NOT bring the proxy back after a reboot. Set only when detected.
+   */
+  failing?: boolean;
+}
+
+/** What the service writes, each launchd restart, when a proxy it did not start holds the port. */
+const SERVICE_PORT_CONFLICT = /Proxy is already running on port \d+/;
+
+/**
+ * Whether a service log shows the port-conflict crash loop: the conflict is the last
+ * thing written, and it was written recently (launchd's KeepAlive retries about every
+ * 10s, so a live loop keeps the file fresh). `sinceMs` narrows it further to lines
+ * written after a given moment — right after a re-install, an older loop's lines are
+ * still fresh and must not count. Exported for tests.
+ */
+export function serviceLogShowsConflict(
+  tail: string,
+  mtimeMs: number,
+  nowMs: number,
+  sinceMs = 0,
+): boolean {
+  if (mtimeMs < nowMs - 60_000 || mtimeMs <= sinceMs) return false;
+  const lines = tail.trimEnd().split('\n');
+  const recent = lines.slice(-6).join('\n');
+  return SERVICE_PORT_CONFLICT.test(recent);
 }
 
 let cached: PortlessState | null = null;
@@ -232,6 +260,14 @@ export function portlessDoctorRow(
     };
   }
   const running = state.version ? `running · v${state.version}` : 'running';
+  if (service?.failing === true) {
+    return {
+      label: 'portless',
+      status: 'warn',
+      detail: `${running} · startup service failing (another proxy holds its port)`,
+      hint: `repair it: \`${portlessServiceHint()}\` (stops the other proxy, asks for your password)`,
+    };
+  }
   if (service?.installed === false) {
     return {
       label: 'portless',
@@ -394,16 +430,40 @@ export async function startPortlessProxyRoot(): Promise<RootProxyStartResult> {
  * prints. Never throws — an unreadable status reads as "not installed", which
  * only costs the user an extra nudge.
  */
-export async function portlessServiceStatus(): Promise<PortlessServiceState> {
+export async function portlessServiceStatus(
+  opts: { sinceMs?: number } = {},
+): Promise<PortlessServiceState> {
   try {
     const r = await execa(PORTLESS_BIN, SUB_SERVICE_STATUS, { reject: false });
-    const m = /^\s*Installed:\s*(yes|no)\s*$/im.exec(r.stdout ?? '');
-    if (m) return { installed: m[1]?.toLowerCase() === 'yes' };
+    const stdout = r.stdout ?? '';
+    const m = /^\s*Installed:\s*(yes|no)\s*$/im.exec(stdout);
+    if (m) {
+      const installed = m[1]?.toLowerCase() === 'yes';
+      if (!installed) return { installed };
+      // "Installed: yes" plus "Proxy on 443: responding" can both be true while the
+      // service itself crash-loops: the responding proxy is one it did not start. The
+      // service log is the only place that says so.
+      const dir = /^\s*State directory:\s*(.+?)\s*$/im.exec(stdout)?.[1];
+      if (dir && (await serviceLogFailing(join(dir, 'service.log'), opts.sinceMs))) {
+        return { installed, failing: true };
+      }
+      return { installed };
+    }
   } catch {
     // fall through to the filesystem probe
   }
   if (process.platform === 'darwin') return { installed: existsSync(PORTLESS_LAUNCHD_PLIST) };
   return { installed: false };
+}
+
+async function serviceLogFailing(path: string, sinceMs?: number): Promise<boolean> {
+  try {
+    const st = await stat(path);
+    const text = await readFile(path, 'utf8');
+    return serviceLogShowsConflict(text.slice(-4000), st.mtimeMs, Date.now(), sinceMs);
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -418,27 +478,59 @@ export async function portlessServiceStatus(): Promise<PortlessServiceState> {
  * should say so before prompting.
  */
 export async function installPortlessService(): Promise<RootProxyStartResult> {
+  return (await installPortlessServiceDetailed()).result;
+}
+
+/**
+ * `installPortlessService` plus the elevated shell's error text on failure, which the
+ * bare result throws away — without it a failed install says nothing about why.
+ */
+export async function installPortlessServiceDetailed(): Promise<{
+  result: RootProxyStartResult;
+  detail?: string;
+}> {
   const bin = await resolvePortlessBin();
   try {
     if (process.platform === 'darwin') {
       const q = shellSingleQuote(bin);
-      const shellCmd = `${q} ${SUB_SERVICE_INSTALL.join(' ')} && ${q} trust`;
+      // A Portless proxy already on :443 that the service did not start (an older
+      // `proxy start`, or an orphan of a previous service) keeps the new service from
+      // binding: launchd then restarts it forever while that other proxy answers, so the
+      // install looks fine and is not. Portless's own pre-install stop can miss one with
+      // no pid file, so stop every Portless listener on the port first, as root, in the
+      // same prompt. Only processes whose command names portless are touched.
+      const stopListeners =
+        'for p in $(/usr/sbin/lsof -ti tcp:443 -sTCP:LISTEN); do ' +
+        '/bin/ps -o command= -p $p | /usr/bin/grep -q portless && /bin/kill $p; done; ' +
+        'sleep 1';
+      const shellCmd = `${stopListeners}; ${q} ${SUB_SERVICE_INSTALL.join(' ')} && ${q} trust`;
       const script =
         `do shell script "${escapeForAppleScript(shellCmd)}" ` +
         `with administrator privileges ` +
         `with prompt "AgentBox wants to start the Portless proxy at login."`;
       const r = await execa('osascript', ['-e', script], { reject: false });
-      if (r.exitCode === 0) return 'started';
-      if (/User canceled|-128/i.test(r.stderr ?? '')) return 'cancelled';
-      return 'failed';
+      if (r.exitCode === 0) return { result: 'started' };
+      if (/User canceled|-128/i.test(r.stderr ?? '')) return { result: 'cancelled' };
+      return { result: 'failed', detail: lastLine(r.stderr ?? '') };
     }
     const r = await execa(bin, SUB_SERVICE_INSTALL, { reject: false, stdio: 'inherit' });
-    if (r.exitCode !== 0) return 'failed';
+    if (r.exitCode !== 0) return { result: 'failed' };
     await execa(bin, ['trust'], { reject: false, stdio: 'inherit' });
-    return 'started';
-  } catch {
-    return 'failed';
+    return { result: 'started' };
+  } catch (err) {
+    return { result: 'failed', detail: err instanceof Error ? err.message : String(err) };
   }
+}
+
+function lastLine(text: string): string | undefined {
+  // osascript prefixes the shell's output with "0:12: execution error: ".
+  const line = text
+    .trim()
+    .split('\n')
+    .pop()
+    ?.replace(/^\d+:\d+: execution error: /, '')
+    .trim();
+  return line ? line : undefined;
 }
 
 /** Remove the OS-startup service. Never throws. */

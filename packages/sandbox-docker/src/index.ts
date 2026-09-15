@@ -286,6 +286,8 @@ export {
   ensurePortlessProxy,
   installPortless,
   installPortlessService,
+  installPortlessServiceDetailed,
+  serviceLogShowsConflict,
   portlessBrowserEnv,
   portlessAlias,
   portlessUnalias,

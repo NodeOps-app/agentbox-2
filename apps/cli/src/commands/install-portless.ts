@@ -21,7 +21,7 @@ import {
   detectPortless,
   ensurePortlessProxy,
   installPortless,
-  installPortlessService,
+  installPortlessServiceDetailed,
   portlessGetUrl,
   portlessInstallHint,
   portlessServiceStatus,
@@ -43,7 +43,7 @@ interface InstallPortlessOptions {
 export async function offerPortlessService(): Promise<void> {
   if (!process.stdin.isTTY) return;
   const service = await portlessServiceStatus();
-  if (service.installed) return;
+  if (service.installed && service.failing !== true) return;
 
   const yes = await confirm({
     message:
@@ -73,25 +73,35 @@ async function runServiceInstall(): Promise<boolean> {
       'you may be asked for your password. Box URLs become https://<box>.localhost ' +
       '(the same URL that works inside a box).',
   );
-  const res = await installPortlessService();
+  const startedAt = Date.now();
+  const { result: res, detail } = await installPortlessServiceDetailed();
   resetPortlessCache();
   if (res === 'cancelled') {
     log.warn('Password prompt dismissed — the proxy will not start at boot.');
     return false;
   }
-  if (res === 'failed') {
-    log.warn('Could not install the Portless startup service — run `portless service install`.');
-    return false;
+  // The exit code is not the verdict: an install whose last step exits non-zero can
+  // still leave a working service, and a clean exit can leave one crash-looping on a
+  // port another proxy holds. Give launchd a moment to start it, then read the state.
+  await new Promise((r) => setTimeout(r, 3000));
+  const service = await portlessServiceStatus({ sinceMs: startedAt });
+  if (service.installed && service.failing !== true) {
+    log.success('Portless starts at boot now.');
+    return true;
   }
-  const service = await portlessServiceStatus();
-  if (!service.installed) {
+  if (service.failing === true) {
     log.warn(
-      'Portless reported success but the service is not registered — check `portless service status`.',
+      'The Portless startup service is installed but keeps failing: another proxy holds port 443 — ' +
+        'check `portless service status` and ~/.portless/service.log.',
     );
     return false;
   }
-  log.success('Portless starts at boot now.');
-  return true;
+  log.warn(
+    'Could not install the Portless startup service' +
+      (detail ? ` (${detail})` : '') +
+      ' — run `portless service install`.',
+  );
+  return false;
 }
 
 export const installPortlessCommand = new Command('portless')
@@ -129,7 +139,7 @@ export const installPortlessCommand = new Command('portless')
     }
 
     const service = await portlessServiceStatus();
-    if (service.installed) {
+    if (service.installed && service.failing !== true) {
       log.info('Portless startup service already installed.');
     } else if (opts.yes === true) {
       await runServiceInstall();
